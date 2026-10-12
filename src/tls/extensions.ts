@@ -77,6 +77,12 @@ export const pskKeyExchangeModes = (modes = [1]): Extension => ({
 /** early_data indication (0-RTT) — empty body in a ClientHello. */
 export const earlyData = (): Extension => ({ type: Ext.early_data, body: empty });
 
+/** cookie — echoed back in the second ClientHello after a HelloRetryRequest. */
+export const cookie = (data: Uint8Array): Extension => ({
+	type: Ext.cookie,
+	body: () => new Writer().block(2, (w) => w.bytes(data)).build()
+});
+
 export const keyShare = (): Extension => ({
 	type: Ext.key_share,
 	body: (ctx) =>

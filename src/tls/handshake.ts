@@ -4,7 +4,7 @@
 // client Finished → app keys. Then writeApp/readApp use the app traffic keys.
 // Certificate verification is on by default (verify.ts); pass verify:false to skip.
 import { Reader, Writer, concat, hex } from '../core/bytes';
-import { Cipher, ContentType, HandshakeType, Ext } from '../core/consts';
+import { Cipher, ContentType, HandshakeType, Ext, Group } from '../core/consts';
 import {
 	Aead,
 	aesGcm,
@@ -12,6 +12,8 @@ import {
 	deriveHandshake,
 	finishedVerify,
 	HashAlg,
+	hashLen,
+	sha,
 	Schedule,
 	trafficKey,
 	ecdheShared,
@@ -145,7 +147,7 @@ export class TlsClient {
 	async handshake(): Promise<void> {
 		const resume = this.opts.resume;
 		// 1) ClientHello (+ pre_shared_key + early_data when resuming)
-		const ch = buildClientHello(this.opts.fingerprint, this.opts.host, resume);
+		let ch = buildClientHello(this.opts.fingerprint, this.opts.host, resume);
 		this.ja3 = ch.ja3;
 		this.ja3Hash = ch.ja3Hash;
 		this.ja3n = ch.ja3n;
@@ -170,12 +172,19 @@ export class TlsClient {
 			}
 		}
 
-		// 2) ServerHello (plaintext)
-		const sh = await this.nextHandshakeMsg(false);
+		// 2) ServerHello — may be a HelloRetryRequest asking for a different key-share group.
+		let sh = await this.nextHandshakeMsg(false);
 		if (!sh || sh.type !== HandshakeType.serverHello) throw new Error('expected ServerHello, got type ' + sh?.type);
+		let server = parseServerHello(sh.body);
+		if (server.isHRR) {
+			const retry = await this.doHelloRetry(ch, sh, server, resume);
+			ch = retry.ch;
+			sh = retry.sh;
+			server = retry.server;
+			sentEarly = false; // early data (if any was sent) is dropped across a retry
+			earlyWrite = null;
+		}
 		this.addTranscript(sh.raw);
-		const server = parseServerHello(sh.body);
-		if (server.isHRR) throw new Error('HelloRetryRequest not supported (try another group/cipher)');
 		this.suite = SUITES[server.cipher] ?? (() => { throw new Error('unsupported cipher: 0x' + server.cipher.toString(16)); })();
 		if (!server.keyShare) throw new Error('ServerHello without key_share');
 		// PSK accepted iff the server echoed pre_shared_key AND the suite hash matches
@@ -259,10 +268,36 @@ export class TlsClient {
 		this.resCipher = server.cipher;
 	}
 
+	/** HelloRetryRequest (RFC 8446 §4.1.4): the server advertised a group we listed but
+	 *  did not send a key_share for. Rewrite the transcript to message_hash(ClientHello1),
+	 *  then resend a ClientHello with a key_share for the requested group (+ cookie). */
+	private async doHelloRetry(
+		ch: ReturnType<typeof buildClientHello>,
+		hrr: { raw: Uint8Array },
+		server: ParsedSH,
+		resume: TlsOptions['resume']
+	): Promise<{ ch: ReturnType<typeof buildClientHello>; sh: { type: number; raw: Uint8Array; body: Reader }; server: ParsedSH }> {
+		const hash: HashAlg = SUITES[server.cipher]?.hash ?? 'sha256';
+		const synthetic = concat(Uint8Array.of(HandshakeType.messageHash, 0, 0, hashLen(hash)), sha(hash, ch.bytes));
+		this.transcript = [synthetic, hrr.raw];
+		const g = server.selectedGroup;
+		if (g == null || !(g === Group.x25519 || g === Group.secp256r1 || g === Group.secp384r1))
+			throw new Error('HelloRetryRequest asked for a group we cannot negotiate: ' + g);
+		const ch2 = buildClientHello({ ...this.opts.fingerprint, keyShareGroups: [g] }, this.opts.host, resume ? { ...resume, earlyData: false } : undefined, server.cookie);
+		this.addTranscript(ch2.bytes);
+		this.t.write(plaintextRecord(ContentType.handshake, ch2.bytes));
+		const sh = await this.nextHandshakeMsg(false);
+		if (!sh || sh.type !== HandshakeType.serverHello) throw new Error('expected ServerHello after HelloRetryRequest');
+		const server2 = parseServerHello(sh.body);
+		if (server2.isHRR) throw new Error('second HelloRetryRequest (would loop)');
+		return { ch: ch2, sh, server: server2 };
+	}
+
 	writeApp(data: Uint8Array): void {
 		if (!this.appMode) throw new Error('handshake not finished');
-		// TLSInnerPlaintext ≤ 2^14 (content + 1 type byte) → fragment at 16383 bytes of
-		// content. All records are encrypted into one buffer and sent with one write.
+		// TLSInnerPlaintext ≤ 2^14 (content + 1 type byte) → fragment at 16383 bytes/record.
+		// All records go into one buffer and one socket write: measured faster than batching
+		// into several writes (Bun's write path favours fewer, larger buffers).
 		if (data.length) this.t.write(this.appWrite.encryptMany(ContentType.applicationData, data, 16384 - 1));
 	}
 
@@ -312,6 +347,8 @@ interface ParsedSH {
 	isHRR: boolean;
 	keyShare: { group: number; pub: Uint8Array } | null;
 	selectedIdentity: number | null; // pre_shared_key index echoed by the server (PSK accepted)
+	selectedGroup: number | null; // HRR: the group the server wants a key_share for
+	cookie?: Uint8Array; // HRR: to echo in the next ClientHello
 }
 function parseServerHello(r: Reader): ParsedSH {
 	r.u16(); // legacy_version
@@ -319,21 +356,29 @@ function parseServerHello(r: Reader): ParsedSH {
 	r.block(1); // session_id echo
 	const cipher = r.u16();
 	r.u8(); // compression
+	const isHRR = hex(random) === HRR_RANDOM;
 	let keyShare: ParsedSH['keyShare'] = null;
 	let selectedIdentity: number | null = null;
+	let selectedGroup: number | null = null;
+	let cookie: Uint8Array | undefined;
 	const exts = r.block(2);
 	while (exts.rem >= 4) {
 		const t = exts.u16();
 		const eb = exts.block(2);
 		if (t === Ext.key_share) {
-			const group = eb.u16();
-			const pub = eb.block(2).buf;
-			keyShare = { group, pub };
+			if (isHRR) selectedGroup = eb.u16(); // HRR key_share = selected_group only (no pub)
+			else {
+				const group = eb.u16();
+				const pub = eb.block(2).buf;
+				keyShare = { group, pub };
+			}
 		} else if (t === Ext.pre_shared_key) {
 			selectedIdentity = eb.u16();
+		} else if (t === Ext.cookie) {
+			cookie = new Uint8Array(eb.block(2).buf);
 		}
 	}
-	return { cipher, isHRR: hex(random) === HRR_RANDOM, keyShare, selectedIdentity };
+	return { cipher, isHRR, keyShare, selectedIdentity, selectedGroup, cookie };
 }
 
 /** Parse a NewSessionTicket → a resumption Ticket (PSK derived from the resumption

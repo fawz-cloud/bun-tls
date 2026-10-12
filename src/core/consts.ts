@@ -12,6 +12,7 @@ export const HandshakeType = {
 	serverHello: 2,
 	newSessionTicket: 4,
 	endOfEarlyData: 5,
+	messageHash: 254,
 	encryptedExtensions: 8,
 	certificate: 11,
 	certificateRequest: 13,
@@ -33,6 +34,7 @@ export const Ext = {
 	early_data: 42,
 	pre_shared_key: 41,
 	supported_versions: 43,
+	cookie: 44,
 	psk_key_exchange_modes: 45,
 	key_share: 51,
 	application_settings: 17513, // ALPS (old codepoint, Chrome ≤132)

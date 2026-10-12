@@ -3,7 +3,7 @@
 import crypto from 'node:crypto';
 import { Reader, Writer } from '../core/bytes';
 import { Ext, GREASE, Group, TLS12, isGrease } from '../core/consts';
-import { grease as greaseExt, pskKeyExchangeModes, earlyData, type Extension, type ExtCtx } from './extensions';
+import { grease as greaseExt, pskKeyExchangeModes, earlyData, cookie as cookieExt, type Extension, type ExtCtx } from './extensions';
 import { x25519Keypair, earlySecret, binderKey, pskBinder } from '../core/crypto';
 import type { Ticket } from './resumption';
 
@@ -97,7 +97,7 @@ function genShare(group: number): { priv: crypto.KeyObject; pub: Uint8Array } {
 	throw new Error(`group ${group} not supported for key_share`);
 }
 
-export function buildClientHello(fp: Fingerprint, host: string, resume?: ResumeSpec): BuiltHello {
+export function buildClientHello(fp: Fingerprint, host: string, resume?: ResumeSpec, cookie?: Uint8Array): BuiltHello {
 	const privs = new Map<number, crypto.KeyObject>();
 	const shares = fp.keyShareGroups.map((group) => {
 		const { priv, pub } = genShare(group);
@@ -111,12 +111,16 @@ export function buildClientHello(fp: Fingerprint, host: string, resume?: ResumeS
 	const sessionId = new Uint8Array(crypto.randomBytes(32)); // TLS1.3 middlebox-compat
 
 	const ciphers = greaseA != null ? [greaseA, ...fp.ciphers] : fp.ciphers;
-	// Resumption needs psk_key_exchange_modes present, plus early_data for 0-RTT.
+	// Resumption needs psk_key_exchange_modes present, plus early_data for 0-RTT. A
+	// HelloRetryRequest cookie (if any) must be echoed in the second ClientHello.
 	let base = fp.extensions;
-	if (resume) {
+	if (resume || cookie) {
 		base = [...fp.extensions];
-		if (!base.some((e) => e.type === Ext.psk_key_exchange_modes)) base.push(pskKeyExchangeModes([1]));
-		if (resume.earlyData) base.push(earlyData());
+		if (cookie) base.push(cookieExt(cookie));
+		if (resume) {
+			if (!base.some((e) => e.type === Ext.psk_key_exchange_modes)) base.push(pskKeyExchangeModes([1]));
+			if (resume.earlyData) base.push(earlyData());
+		}
 	}
 	// Chrome permutes the extension order each connection (JA3N = sorted = stable).
 	const mid = fp.permute ? shuffle([...base]) : base;

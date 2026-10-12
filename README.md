@@ -24,9 +24,10 @@ console.log(r.status, r.ja3nHash); // matches the published Chrome 131 JA3N
   work with — it rebuilds from a JA3 string, so it matches that JA3 and nothing more.
 - **HTTP/1.1 only.** Browser presets advertise ALPN `http/1.1`. The JA3 still matches
   (ALPN is not in JA3); the JA4 ALPN byte and the real protocol do not.
-- **TLS 1.3 only**, and only an X25519 key share is sent. `X25519MLKEM768` / FFDHE are
-  advertised in `supported_groups` but cannot be negotiated — a server that requires one
-  would send a HelloRetryRequest, which is not supported, and the handshake fails.
+- **TLS 1.3 only.** The ECDHE groups (X25519, P-256, P-384) are fully negotiable,
+  including via HelloRetryRequest when a server wants a group we only advertised. The
+  post-quantum `X25519MLKEM768` and FFDHE groups are advertised but have no
+  implementation, so a server that accepts *only* one of those cannot be reached.
 - From-scratch TLS, **not audited.**
 
 ## Install
@@ -174,26 +175,27 @@ bun-tls fills that gap for Bun, at the cost of HTTP/1.1 only.
   / dart:io values, plus `fromJa3()` for anything else.
 - No additional native dependency — a TypeScript source tree on Bun.
 - Keep-alive, 1-RTT resumption, optional 0-RTT (RFC 8448-checked key schedule).
+- ECDHE over X25519 / P-256 / P-384, with HelloRetryRequest handled.
 - Certificate verification on by default, with chain path-building to a bundled root store.
 - Fast for one-shot and concurrent requests on the local benchmark; small, readable code.
 
 ## Limitations
 
-- **TLS 1.3 only, HTTP/1.1 only.** No HTTP/2. Browser presets are therefore h1 (JA3
-  matches, JA4 ALPN byte and protocol do not). Public CDNs that gate 0-RTT behind h2 give
-  this client 1-RTT resumption instead.
-- **Only an X25519 key share is sent.** `X25519MLKEM768` / FFDHE are advertised but not
-  negotiable; a server that insists on one causes a HelloRetryRequest, which is not
-  supported → the handshake fails.
+- **TLS 1.3 only, HTTP/1.1 only.** No TLS 1.2, no HTTP/2 — both are large separate stacks,
+  not planned. Browser presets are therefore h1 (JA3 matches; JA4 ALPN byte and protocol
+  do not). Public CDNs that gate 0-RTT behind h2 give this client 1-RTT resumption instead.
+- **Post-quantum / FFDHE key exchange is advertised but not implemented.** ECDHE
+  (X25519, P-256, P-384) is negotiated, incl. via HelloRetryRequest; a server that accepts
+  only `X25519MLKEM768` or FFDHE cannot be reached.
 - **From-scratch TLS, not audited.** Certificate verification is implemented and on by
-  default, but review `src/tls/verify.ts` before relying on it.
+  default, but review `src/tls/verify.ts` before relying on it where correctness matters.
 - Certificate chain path-building anchors at the earliest chain cert signed by a known
   root (covers legacy cross-signed roots such as GlobalSign R1 / AAA Certificate
-  Services). If verification fails on a host you believe is fine, fix the trust chain
-  (add the missing root to `cacert.pem`); do not reach for `verify: false` in production.
-- `tls.peet.ws` renders JA4's `_a` without zero-padding the cipher count; this follows the
-  FoxIO spec (`03`), so the `_a` prefix can differ by a leading zero while `_b`/`_c` match.
-- Bulk upload throughput trails curl's native AEAD.
+  Services). If verification fails on a host you trust, fix the trust chain — add the
+  missing root to `cacert.pem` — rather than disabling verification.
+- Bulk upload on localhost trails curl's native stack by roughly 1.5–2× (node:crypto
+  per-record + Bun's socket path vs C). On a real network, upload is bandwidth-bound and
+  they tie.
 
 ## Test
 

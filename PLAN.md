@@ -77,17 +77,18 @@ Layers: `core/` (bytes + crypto primitives) → `tls/` (handshake, records, cert
       record_size_limit, zlib+brotli+zstd cert-compress, GREASE ECH. Live JA3N
       `3d7d71e7ee5cc9e08aa503d985e74b27`.
 - [x] All verified live against `tls.peet.ws`: handshake 200, echo == our JA3/JA3N/JA4.
-      (These servers chose X25519 — which we do send a key share for. A server that
-      requires MLKEM768/FFDHE instead would send a HelloRetryRequest, unsupported →
-      handshake fails. "advertised" ≠ "negotiable".)
+      (These servers chose X25519. If a server wants P-256/P-384 instead it sends a
+      HelloRetryRequest and we retry with that share — handled + verified vs
+      `openssl s_server -groups secp384r1`. Only MLKEM768/FFDHE, with no impl, are
+      unreachable: "advertised" ≠ "negotiable".)
 
 ## Deliberately not done
 
 - TLS 1.2 (we advertise supported_versions = 1.3 only; impersonation targets are 1.3).
 - HTTP/2 (dart:io is h1; add later if a target needs it).
-- (done) Keep-alive connection reuse, TLS session resumption (PSK) and 0-RTT early
-  data — all in `Session`; resumption/0-RTT key schedule validated vs RFC 8448 §4.
-- HelloRetryRequest handling (a server that won't accept X25519 fails the handshake).
+- ML-KEM / FFDHE key exchange (advertised for the fingerprint, not implemented).
+- (done) Keep-alive, TLS session resumption (PSK), 0-RTT early data, HelloRetryRequest —
+  all in place; resumption/0-RTT key schedule validated vs RFC 8448 §4.
 - Cross-sign path building beyond "earliest chain cert signed by a known root" (covers
   GlobalSign R1 / AAA Certificate Services legacy tops; other paths fail verification —
   fix by adding the missing root to `cacert.pem`, not by disabling verification).
