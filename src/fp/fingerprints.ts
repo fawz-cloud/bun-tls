@@ -1,7 +1,7 @@
 // Fingerprint presets. Each preset = a Fingerprint (ciphers + extensions in wire
 // order + key_share group). Add a preset (e.g. a captured 'dart') = add an entry;
 // the handshake never changes. The extension order here IS the JA3/JA4 sent.
-import { Cipher, Group, SigAlg } from '../core/consts';
+import { Cipher, Cipher12, Group, SigAlg } from '../core/consts';
 import type { Fingerprint } from '../tls/clienthello';
 import * as E from '../tls/extensions';
 
@@ -195,7 +195,44 @@ export const firefox148 = (): Fingerprint => ({
 	]
 });
 
+/** TLS 1.2 (ECDHE + AEAD). Use with `tls12: true`. No supported_versions / key_share
+ *  / psk — the server negotiates TLS 1.2 from legacy_version. Only the AEAD-ECDHE suites
+ *  are actually completed; the trailing CBC and static-RSA suites are fingerprint filler
+ *  we never select. The JA3 reflects this 1.2 extension set. */
+export const tls12 = (): Fingerprint => ({
+	ciphers: [
+		Cipher12.ECDHE_ECDSA_AES128_GCM_SHA256,
+		Cipher12.ECDHE_RSA_AES128_GCM_SHA256,
+		Cipher12.ECDHE_ECDSA_CHACHA20_POLY1305,
+		Cipher12.ECDHE_RSA_CHACHA20_POLY1305,
+		Cipher12.ECDHE_ECDSA_AES256_GCM_SHA384,
+		Cipher12.ECDHE_RSA_AES256_GCM_SHA384,
+		0xc013, 0xc014, 0x009c, 0x009d, 0x002f, 0x0035 // ECDHE-CBC + RSA filler (not negotiated)
+	],
+	keyShareGroups: [],
+	extensions: [
+		E.serverName(),
+		E.extendedMasterSecret(),
+		E.renegotiationInfo(),
+		E.supportedGroups([Group.x25519, Group.secp256r1, Group.secp384r1]),
+		E.ecPointFormats([0]),
+		E.sessionTicket(),
+		E.alpn(['http/1.1']),
+		E.statusRequest(),
+		E.signatureAlgorithms([
+			SigAlg.ecdsa_secp256r1_sha256,
+			SigAlg.rsa_pss_rsae_sha256,
+			SigAlg.rsa_pkcs1_sha256,
+			SigAlg.ecdsa_secp384r1_sha384,
+			SigAlg.rsa_pss_rsae_sha384,
+			SigAlg.rsa_pkcs1_sha384,
+			SigAlg.rsa_pss_rsae_sha512,
+			SigAlg.rsa_pkcs1_sha512
+		])
+	]
+});
+
 export { CHROME_SIGALGS };
 
-export const PRESETS: Record<string, () => Fingerprint> = { modern, dart, chrome131, firefox148 };
+export const PRESETS: Record<string, () => Fingerprint> = { modern, dart, chrome131, firefox148, tls12 };
 

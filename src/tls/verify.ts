@@ -146,8 +146,9 @@ export async function checkRevocation(certsDer: Uint8Array[], staple: Uint8Array
 	if (status === 'unknown' && mode === 'hard') throw new Error('OCSP: responder returned status unknown for this certificate');
 }
 
-/** TLS sigalg → crypto.verify options. */
-function verifyOpts(alg: number, pub: crypto.KeyObject): { hash: string; key: crypto.VerifyKeyObjectInput } {
+/** TLS sigalg → crypto.verify options. Shared by CertificateVerify (1.3) and
+ *  ServerKeyExchange (1.2) signature checks. */
+export function verifyOpts(alg: number, pub: crypto.KeyObject): { hash: string; key: crypto.VerifyKeyObjectInput } {
 	switch (alg) {
 		case 0x0403: return { hash: 'sha256', key: { key: pub, dsaEncoding: 'der' } };
 		case 0x0503: return { hash: 'sha384', key: { key: pub, dsaEncoding: 'der' } };

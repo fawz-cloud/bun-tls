@@ -15,8 +15,12 @@ export const HandshakeType = {
 	messageHash: 254,
 	encryptedExtensions: 8,
 	certificate: 11,
+	serverKeyExchange: 12, // TLS 1.2
 	certificateRequest: 13,
+	certificateStatus: 22, // TLS 1.2 stapled OCSP (RFC 6066)
+	serverHelloDone: 14, // TLS 1.2
 	certificateVerify: 15,
+	clientKeyExchange: 16, // TLS 1.2
 	finished: 20,
 	keyUpdate: 24,
 	compressedCertificate: 25
@@ -50,6 +54,17 @@ export const Cipher = {
 	TLS_AES_128_GCM_SHA256: 0x1301,
 	TLS_AES_256_GCM_SHA384: 0x1302,
 	TLS_CHACHA20_POLY1305_SHA256: 0x1303
+} as const;
+
+/** TLS 1.2 AEAD + ECDHE cipher suites (the only 1.2 suites we negotiate — no CBC, no
+ *  static-RSA key exchange). Suite → params live in handshake12.ts. */
+export const Cipher12 = {
+	ECDHE_ECDSA_AES128_GCM_SHA256: 0xc02b,
+	ECDHE_RSA_AES128_GCM_SHA256: 0xc02f,
+	ECDHE_ECDSA_AES256_GCM_SHA384: 0xc02c,
+	ECDHE_RSA_AES256_GCM_SHA384: 0xc030,
+	ECDHE_ECDSA_CHACHA20_POLY1305: 0xcca9,
+	ECDHE_RSA_CHACHA20_POLY1305: 0xcca8
 } as const;
 
 export const Group = {

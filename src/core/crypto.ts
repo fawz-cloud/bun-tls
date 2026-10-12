@@ -111,6 +111,22 @@ export const clientEarlyTraffic = (h: HashAlg, early: Uint8Array, transcriptCH: 
 export const updateTraffic = (h: HashAlg, secret: Uint8Array): Uint8Array =>
 	expandLabel(h, secret, 'traffic upd', new Uint8Array(0), hashLen(h));
 
+// ── TLS 1.2 PRF (RFC 5246 §5) ─────────────────────────────────────────────────
+/** P_hash(secret, seed) = HMAC(secret, A(1)+seed) | HMAC(secret, A(2)+seed) | …
+ *  where A(0)=seed, A(i)=HMAC(secret, A(i-1)). The TLS 1.2 PRF is P_<suite hash>. */
+export function prf12(hash: 'sha256' | 'sha384', secret: Uint8Array, label: string, seed: Uint8Array, len: number): Uint8Array {
+	const labelSeed = concat(Buffer.from(label), seed);
+	const out = new Uint8Array(len);
+	let a = labelSeed; // A(0)
+	for (let off = 0; off < len; ) {
+		a = new Uint8Array(crypto.createHmac(hash, secret).update(a).digest()); // A(i)
+		const frag = new Uint8Array(crypto.createHmac(hash, secret).update(concat(a, labelSeed)).digest());
+		out.set(frag.subarray(0, Math.min(frag.length, len - off)), off);
+		off += frag.length;
+	}
+	return out;
+}
+
 // ── ML-KEM-768 (FIPS 203) via WebCrypto, for the X25519MLKEM768 hybrid group ─────
 const subtle = globalThis.crypto.subtle;
 const MLKEM = { name: 'ML-KEM-768' } as const;

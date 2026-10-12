@@ -4,7 +4,7 @@
 // HPACK: full decode (static + dynamic table + Huffman); encode is literal-without-
 // indexing, no Huffman (valid, simplest). Enough to GET/POST over h2 and read the
 // real h2 ALPN; not a multiplexing pool.
-import type { TlsClient } from '../tls/handshake';
+import type { TlsConn } from '../tls/handshake';
 import type { HttpResponse } from './http1';
 import { concat } from '../core/bytes';
 import zlib from 'node:zlib';
@@ -294,7 +294,7 @@ export class H2Connection {
 	private goawayLast = Infinity;
 	closed = false;
 
-	constructor(private tls: TlsClient) {}
+	constructor(private tls: TlsConn) {}
 
 	/** Send the preface, our SETTINGS and the opening WINDOW_UPDATE, then start reading. */
 	init(profile: H2Profile = CHROME_H2): void {
@@ -492,7 +492,7 @@ export class H2Connection {
 
 /** One-shot HTTP/2 request (opens a connection, one stream). The caller owns `tls` and
  *  closes it afterwards. For connection reuse / multiplexing use H2Connection via Session. */
-export async function h2Request(tls: TlsClient, req: H2Request, profile: H2Profile = CHROME_H2): Promise<HttpResponse> {
+export async function h2Request(tls: TlsConn, req: H2Request, profile: H2Profile = CHROME_H2): Promise<HttpResponse> {
 	const conn = new H2Connection(tls);
 	conn.init(profile);
 	return conn.request(req);

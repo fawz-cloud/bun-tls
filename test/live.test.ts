@@ -5,7 +5,7 @@ import { request, openConnection, roundtrip, serializeForEarly } from '../src/ht
 import { Session } from '../src/http/session';
 import type { Ticket } from '../src/tls/resumption';
 import { fromJa3 } from '../src/fp/ja3';
-import { dart } from '../src/fp/fingerprints';
+import { dart, tls12 } from '../src/fp/fingerprints';
 import { clients } from '../src/fp/clients';
 import { verifyOcsp, fetchOcsp } from '../src/tls/ocsp';
 import crypto from 'node:crypto';
@@ -147,6 +147,20 @@ assert.ok(ja3nSet.size >= 5, 'client fingerprints distinct (edge==chrome collaps
 	assert.throws(() => verifyOcsp(resp!, leaf, leaf), 'OCSP CertID binding enforced (wrong issuer rejected)');
 	const hard = await request({ url: 'https://www.digicert.com/', ocsp: 'hard', timeoutMs: 20000 });
 	assert.equal(hard.status, 200, 'ocsp hard passes on a good, in-date certificate');
+}
+
+// 11) TLS 1.2 (ECDHE + AEAD): negotiate 1.2, echo our JA3, exercise both GCM and ChaCha.
+{
+	const r = await request({ url: 'https://tls-v1-2.badssl.com:1012/', tls12: true, timeoutMs: 20000 });
+	console.log(`tls1.2 → ${r.status} ja4=${r.ja4}`);
+	assert.equal(r.status, 200, 'TLS 1.2-only server handshake (not a 1.3 downgrade)');
+	assert.ok(r.ja4.startsWith('t12'), 'JA4 reports TLS 1.2');
+	const e = await request({ url: 'https://tls.peet.ws/api/clean', tls12: true, timeoutMs: 20000 });
+	assert.equal(e.json<{ ja3_hash?: string }>().ja3_hash, e.ja3Hash, 'TLS 1.2 JA3 echo == ours');
+	const fp = tls12();
+	fp.ciphers = [0xcca9, 0xcca8]; // only ECDHE-CHACHA20-POLY1305 → forces the RFC 7905 record path
+	const c = await request({ url: 'https://www.cloudflare.com/', tls12: true, fingerprint: fp, timeoutMs: 20000 });
+	assert.equal(c.status, 200, 'TLS 1.2 ChaCha20-Poly1305 handshake + transfer');
 }
 
 console.log('live: OK');

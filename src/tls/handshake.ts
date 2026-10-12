@@ -69,6 +69,25 @@ export interface TlsOptions {
 	onTicket?: (t: Ticket) => void;
 }
 
+/** The post-handshake surface shared by the TLS 1.3 (TlsClient) and 1.2 (Tls12Client)
+ *  clients — what http/client.ts, Session and H2Connection actually use. */
+export interface TlsConn {
+	writeApp(d: Uint8Array): void;
+	writeAppStream(d: Uint8Array): Promise<void>;
+	readApp(): Promise<Uint8Array | null>;
+	close(): void;
+	alpn: string | null;
+	ja3: string;
+	ja3Hash: string;
+	ja3n: string;
+	ja3nHash: string;
+	ja4: string;
+	resumed: boolean;
+	earlyAccepted: boolean;
+	peerCertificates: Uint8Array[];
+	ocspStaple: Uint8Array | null;
+}
+
 export class TlsClient {
 	private rr = new RecordReader();
 	private hsbuf: Uint8Array = new Uint8Array(0); // handshake message reassembly

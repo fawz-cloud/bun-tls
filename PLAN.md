@@ -33,6 +33,7 @@ via a patched libcurl (C); we do it in TS.
 | `tls/clienthello.ts` | assemble CH + compute JA3/JA3N + JA4; extension permute |
 | `tls/record.ts` | record layer + AEAD direction (seq, nonce, inner type) |
 | `tls/handshake.ts` | TLS 1.3 client state machine (verify on by default) |
+| `tls/handshake12.ts` | TLS 1.2 client (ECDHE + AEAD), opt-in `tls12` |
 | `tls/verify.ts` | cert chain (path-building) + hostname + CertificateVerify + OCSP gate |
 | `tls/asn1.ts` | minimal DER reader + encoder (OCSP, cert fields) |
 | `tls/ocsp.ts` | OCSP (RFC 6960): verify stapled/fetched response, CertID + signature + freshness |
@@ -88,7 +89,6 @@ Layers: `core/` (bytes + crypto primitives) → `tls/` (handshake, records, cert
 
 ## Deliberately not done
 
-- TLS 1.2 (we advertise supported_versions = 1.3 only; impersonation targets are 1.3).
 - FFDHE key exchange (advertised for fingerprint fidelity, not implemented; no mainstream
   server requires it).
 - CRL revocation (big delta lists; OCSP covers the same need per-cert).
@@ -97,8 +97,10 @@ Layers: `core/` (bytes + crypto primitives) → `tls/` (handshake, records, cert
   decompression, post-handshake KeyUpdate, optional-mTLS (empty client Certificate),
   HTTP+SOCKS5 proxy, gzip/deflate/br/zstd, cookie Public Suffix List, HTTP/2 (HPACK + flow
   control + Chrome h2 fingerprint + Session multiplexing), OCSP revocation (RFC 6960:
-  stapling + AIA fetch, own minimal DER codec in `tls/asn1.ts`). Resumption/0-RTT key schedule
-  validated vs RFC 8448 §4; cert verify enforces CA issuer + IP SANs; OCSP verifies the
+  stapling + AIA fetch, own minimal DER codec in `tls/asn1.ts`), TLS 1.2 (opt-in `tls12`:
+  ECDHE + AEAD AES-GCM/ChaCha20-Poly1305, extended master secret, ServerKeyExchange-signature
+  verify; `tls/handshake12.ts`). Resumption/0-RTT key schedule validated vs RFC 8448 §4; the
+  TLS 1.2 PRF vs a known test vector; cert verify enforces CA issuer + IP SANs; OCSP verifies the
   responder signature + CertID binding + freshness; failed handshakes close the socket.
 - Cross-sign path building beyond "earliest chain cert signed by a known root" (covers
   GlobalSign R1 / AAA Certificate Services legacy tops; other paths fail verification —

@@ -2,10 +2,11 @@
 // fingerprint, proxy, verify }). One connection per request (Connection: close).
 // openConnection + roundtrip are the reusable pieces Session uses for keep-alive.
 import type { Fingerprint, ResumeSpec } from '../tls/clienthello';
-import { modern } from '../fp/fingerprints';
+import { modern, tls12 as tls12Fp } from '../fp/fingerprints';
 import { alpn as alpnExt } from '../tls/extensions';
 import { Ext } from '../core/consts';
-import { TlsClient } from '../tls/handshake';
+import { TlsClient, type TlsConn } from '../tls/handshake';
+import { Tls12Client } from '../tls/handshake12';
 import type { OcspMode } from '../tls/verify';
 import type { Ticket } from '../tls/resumption';
 import { HttpResponse, readResponse, serializeRequest } from './http1';
@@ -31,6 +32,9 @@ export interface RequestOptions {
 	/** Negotiate and use HTTP/2 (ALPN h2). Falls back to HTTP/1.1 if the server declines.
 	 *  One-shot only — Session keep-alive is HTTP/1.1. */
 	http2?: boolean;
+	/** Speak TLS 1.2 (ECDHE + AEAD) instead of 1.3 — for 1.2-only servers. Default false
+	 *  (TLS 1.3). Uses the `tls12` preset unless a fingerprint is given. */
+	tls12?: boolean;
 }
 
 /** Return a copy of `fp` whose ALPN advertises h2 (then http/1.1), so the server may
@@ -65,6 +69,8 @@ export interface OpenOptions {
 	fingerprint?: Fingerprint;
 	verify?: boolean;
 	ocsp?: OcspMode;
+	/** Speak TLS 1.2 instead of 1.3 (ECDHE + AEAD). */
+	tls12?: boolean;
 	timeoutMs?: number;
 	/** Resume from a stored ticket (pre_shared_key); set resume.earlyData for 0-RTT. */
 	resume?: ResumeSpec;
@@ -74,18 +80,20 @@ export interface OpenOptions {
 	onTicket?: (t: Ticket) => void;
 }
 
-/** Dial (TCP or proxy CONNECT) + TLS 1.3 handshake → a ready TlsClient. */
-export async function openConnection(o: OpenOptions): Promise<TlsClient> {
+/** Dial (TCP or proxy CONNECT) + TLS handshake (1.3, or 1.2 when `tls12`) → a ready conn. */
+export async function openConnection(o: OpenOptions): Promise<TlsConn> {
 	const t = o.proxy ? await proxyConnect(o.proxy, o.host, o.port) : await tcpConnect(o.host, o.port);
-	const tls = new TlsClient(t, {
-		host: o.host,
-		fingerprint: o.fingerprint ?? modern(),
-		verify: o.verify,
-		ocsp: o.ocsp,
-		resume: o.resume,
-		earlyData: o.earlyData,
-		onTicket: o.onTicket
-	});
+	const tls = o.tls12
+		? new Tls12Client(t, { host: o.host, fingerprint: o.fingerprint ?? tls12Fp(), verify: o.verify, ocsp: o.ocsp })
+		: new TlsClient(t, {
+				host: o.host,
+				fingerprint: o.fingerprint ?? modern(),
+				verify: o.verify,
+				ocsp: o.ocsp,
+				resume: o.resume,
+				earlyData: o.earlyData,
+				onTicket: o.onTicket
+			});
 	const timer = o.timeoutMs ? setTimeout(() => tls.close(), o.timeoutMs) : null;
 	try {
 		await tls.handshake();
@@ -127,7 +135,7 @@ export function serializeForEarly(o: RoundtripOptions): Uint8Array {
 /** Send one request + read one response over an already-handshaked TlsClient. Does NOT
  *  close the connection — the caller decides (see ClientResponse.reusable). When
  *  `alreadySent` (the request went out as 0-RTT early data), skip the write and just read. */
-export async function roundtrip(tls: TlsClient, o: RoundtripOptions, alreadySent = false): Promise<ClientResponse> {
+export async function roundtrip(tls: TlsConn, o: RoundtripOptions, alreadySent = false): Promise<ClientResponse> {
 	if (!alreadySent) {
 		// Head and body written separately (no big copy to prepend the header). A large body
 		// streams in backpressure-paced batches so it pipelines with the server's read; a
@@ -157,7 +165,7 @@ export async function request(opts: RequestOptions): Promise<ClientResponse> {
 	const bodyBytes = typeof opts.body === 'string' ? new Uint8Array(Buffer.from(opts.body)) : opts.body;
 
 	const fingerprint = opts.http2 ? withH2(opts.fingerprint ?? modern()) : opts.fingerprint;
-	const tls = await openConnection({ host, port, proxy: opts.proxy, fingerprint, verify: opts.verify, ocsp: opts.ocsp, timeoutMs: opts.timeoutMs });
+	const tls = await openConnection({ host, port, proxy: opts.proxy, fingerprint, verify: opts.verify, ocsp: opts.ocsp, tls12: opts.tls12, timeoutMs: opts.timeoutMs });
 	const timer = opts.timeoutMs ? setTimeout(() => tls.close(), opts.timeoutMs) : null;
 	try {
 		// Use HTTP/2 only if the server actually selected it via ALPN; otherwise HTTP/1.1.

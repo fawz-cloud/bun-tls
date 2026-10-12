@@ -24,10 +24,12 @@ console.log(r.status, r.ja3nHash); // matches the published Chrome 131 JA3N
   work with — it rebuilds from a JA3 string, so it matches that JA3 and nothing more.
 - **HTTP/1.1 only.** Browser presets advertise ALPN `http/1.1`. The JA3 still matches
   (ALPN is not in JA3); the JA4 ALPN byte and the real protocol do not.
-- **TLS 1.3 only.** The ECDHE groups (X25519, P-256, P-384) are fully negotiable,
-  including via HelloRetryRequest when a server wants a group we only advertised. The
-  post-quantum `X25519MLKEM768` and FFDHE groups are advertised but have no
-  implementation, so a server that accepts *only* one of those cannot be reached.
+- **TLS 1.3 by default; TLS 1.2 is opt-in** (`tls12: true`) for 1.2-only servers —
+  ECDHE + AEAD (AES-GCM / ChaCha20-Poly1305) with extended master secret, no CBC or
+  static-RSA. The ECDHE groups (X25519, P-256, P-384) are fully negotiable, including via
+  HelloRetryRequest (1.3) when a server wants a group we only advertised. The post-quantum
+  `X25519MLKEM768` and FFDHE groups are advertised but have no implementation, so a server
+  that accepts *only* one of those cannot be reached.
 - From-scratch TLS, **not audited.**
 
 ## Install
@@ -53,6 +55,9 @@ await request({ url: 'https://example.com/', fingerprint: clients.firefox() });
 // HTTP/2 (ALPN h2, falls back to h1 if the server declines)
 await request({ url: 'https://nghttp2.org/', http2: true });
 
+// TLS 1.2 (ECDHE + AEAD) for a 1.2-only server
+await request({ url: 'https://tls-v1-2.badssl.com:1012/', tls12: true });
+
 // reproduce an arbitrary JA3 (full, runnable value)
 await request({
   url: 'https://example.com/',
@@ -72,7 +77,7 @@ s.close();
 
 `request(options)` → `ClientResponse`: `url`, `method?`, `headers?`, `body?`,
 `fingerprint?`, `proxy?`, `verify?` (default true), `ocsp?` (`'off'`\|`'soft'`\|`'hard'`,
-default `'off'`), `timeoutMs?`. Response adds `ja3`,
+default `'off'`), `tls12?` (speak TLS 1.2 instead of 1.3), `timeoutMs?`. Response adds `ja3`,
 `ja3Hash`, `ja3n`, `ja3nHash`, `ja4`, `alpn` on top of `status`, `headers`, `body`,
 `text()`, `json()`.
 
@@ -186,6 +191,8 @@ bun-tls fills that gap for Bun, at the cost of HTTP/1.1 only.
   PQC-preferring CDNs with their real fingerprint. HTTP and SOCKS5 proxies; gzip/deflate/br/zstd.
 - HTTP/2: ALPN h2, HPACK, flow control, Chrome's h2 fingerprint, and request multiplexing
   over one connection via `new Session({ http2: true })`.
+- TLS 1.2 fallback (`tls12: true`): ECDHE + AEAD (AES-GCM / ChaCha20-Poly1305) with extended
+  master secret and ServerKeyExchange-signature verification, for 1.2-only servers.
 - Optional mutual-TLS servers complete (we answer a CertificateRequest).
 - Certificate verification on by default (CA-constrained chain, hostname + IP SANs, path-building
   to a bundled root store); optional OCSP revocation (`ocsp: 'soft' | 'hard'`) — stapled response
@@ -195,7 +202,10 @@ bun-tls fills that gap for Bun, at the cost of HTTP/1.1 only.
 
 ## Limitations
 
-- **TLS 1.2 is not supported** (TLS 1.3 only). **HTTP/2 works** via `request({ http2: true })`
+- **TLS 1.2 is opt-in** via `request({ tls12: true })` — ECDHE + AEAD (AES-GCM /
+  ChaCha20-Poly1305), extended master secret, OCSP; no CBC or static-RSA key exchange (so a
+  1.2 server offering *only* those is not reachable — all modern ones offer ECDHE-AEAD). The
+  default is TLS 1.3. **HTTP/2 works** via `request({ http2: true })`
   — ALPN h2, HPACK, flow control, verified against Cloudflare/Google/nghttp2. Its
   SETTINGS / WINDOW_UPDATE / pseudo-header order reproduce Chrome's h2 (Akamai) fingerprint
   `1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p`. `new Session({ http2: true })` keeps one

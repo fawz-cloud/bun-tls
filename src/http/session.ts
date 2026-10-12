@@ -6,7 +6,7 @@ import type { RequestOptions } from './client';
 import { modern } from '../fp/fingerprints';
 import type { Fingerprint } from '../tls/clienthello';
 import type { OcspMode } from '../tls/verify';
-import type { TlsClient } from '../tls/handshake';
+import type { TlsConn } from '../tls/handshake';
 import { H2Connection } from './h2';
 import { TicketStore } from '../tls/resumption';
 import { isPublicSuffix } from './psl';
@@ -95,6 +95,8 @@ export interface SessionOptions {
 	verify?: boolean;
 	/** OCSP revocation check (default 'off'): 'soft' tolerates missing, 'hard' requires good. */
 	ocsp?: OcspMode;
+	/** Speak TLS 1.2 instead of 1.3 (ECDHE + AEAD) for 1.2-only servers. Default false. */
+	tls12?: boolean;
 	/** Max redirects to follow (default 10, 0 = don't follow). */
 	maxRedirects?: number;
 	timeoutMs?: number;
@@ -117,7 +119,7 @@ export interface SessionOptions {
 export class Session {
 	readonly cookies = new CookieJar();
 	/** Idle keep-alive connections, keyed by proxy|host:port. */
-	private pool = new Map<string, TlsClient[]>();
+	private pool = new Map<string, TlsConn[]>();
 	/** Resumption tickets (per host), captured from NewSessionTickets. */
 	private tickets = new TicketStore();
 	/** Live multiplexed HTTP/2 connections, keyed by proxy|host:port. */
@@ -142,6 +144,7 @@ export class Session {
 				fingerprint: req.fingerprint ?? this.opts.fingerprint,
 				verify: req.verify ?? this.opts.verify,
 				ocsp: req.ocsp ?? this.opts.ocsp,
+				tls12: req.tls12 ?? this.opts.tls12,
 				timeoutMs: req.timeoutMs ?? this.opts.timeoutMs
 			};
 			const cookieHeader = this.cookies.header(u);
@@ -204,7 +207,7 @@ export class Session {
 		return this.recycle(key, tls, await roundtrip(tls, rt, tls.earlyAccepted), keepAlive);
 	}
 
-	private recycle(key: string, tls: TlsClient, res: ClientResponse, keepAlive: boolean): ClientResponse {
+	private recycle(key: string, tls: TlsConn, res: ClientResponse, keepAlive: boolean): ClientResponse {
 		if (keepAlive && res.reusable) (this.pool.get(key) ?? this.pool.set(key, []).get(key)!).push(tls);
 		else tls.close();
 		return res;
