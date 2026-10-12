@@ -73,10 +73,11 @@ export interface SessionOptions {
 	 *  handshake entirely, like curl keep-alive. Set false to force a fresh
 	 *  connection per request. */
 	keepAlive?: boolean;
-	/** Use TLS 1.3 0-RTT early data on NEW connections when the server issued a ticket
-	 *  allowing it (default true). Only applied to idempotent requests (GET/HEAD) — never
-	 *  POST — so it is replay-safe. Resumption (1-RTT, no early data) is still used for
-	 *  other methods. Set false to disable 0-RTT entirely. */
+	/** Opt in to TLS 1.3 0-RTT early data on NEW connections when the server issued a
+	 *  ticket allowing it (default false). Even when enabled it is only applied to GET/HEAD,
+	 *  but early data can still be replayed by an attacker — whether that is harmless
+	 *  depends on the endpoint. Enable only for endpoints where a replayed request is safe.
+	 *  Resumption (1-RTT, no early data) is used regardless. */
 	zeroRtt?: boolean;
 }
 
@@ -152,11 +153,11 @@ export class Session {
 				}
 			}
 		}
-		// 2) New connection: resume from a stored ticket if we have one, and send the
-		//    request as 0-RTT early data for idempotent GET/HEAD when the server allows it.
+		// 2) New connection: resume from a stored ticket if we have one. With zeroRtt opted
+		//    in, a GET/HEAD also rides in the ClientHello as early data when allowed.
 		const ticket = this.tickets.take(open.host);
 		const idempotent = rt.method === 'GET' || rt.method === 'HEAD';
-		const use0rtt = !!ticket && ticket.maxEarlyData > 0 && idempotent && (this.opts.zeroRtt ?? true);
+		const use0rtt = !!ticket && ticket.maxEarlyData > 0 && idempotent && (this.opts.zeroRtt ?? false);
 		const resume = ticket ? { ticket, earlyData: use0rtt } : undefined;
 		const earlyData = use0rtt ? serializeForEarly(rt) : undefined;
 		const tls = await openConnection({ ...open, resume, earlyData, onTicket: (t) => this.tickets.add(open.host, t) });

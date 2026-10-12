@@ -2,7 +2,7 @@
 <rect width="1000" height="392" rx="14" fill="#141518"/>
 <rect x="0.5" y="0.5" width="999" height="391" rx="13.5" fill="none" stroke="#2C2D33"/>
 
-<text x="60" y="44" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,sans-serif" font-size="20" font-weight="700" fill="#E8E6E0">Resumption trims a full round trip</text>
+<text x="60" y="44" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,sans-serif" font-size="20" font-weight="700" fill="#E8E6E0">0-RTT saves a round trip (opt-in)</text>
 
 <text x="80" y="74" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,sans-serif" font-size="16" font-weight="700" fill="#E8E6E0">Full handshake</text>
 <text x="80" y="97" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,sans-serif" font-size="12.5" fill="#9A968C">first visit to a host</text>

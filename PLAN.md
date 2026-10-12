@@ -77,8 +77,9 @@ Layers: `core/` (bytes + crypto primitives) → `tls/` (handshake, records, cert
       record_size_limit, zlib+brotli+zstd cert-compress, GREASE ECH. Live JA3N
       `3d7d71e7ee5cc9e08aa503d985e74b27`.
 - [x] All verified live against `tls.peet.ws`: handshake 200, echo == our JA3/JA3N/JA4.
-      (ECH-grease + MLKEM-in-groups do NOT break the handshake; server falls back to
-      X25519 for key exchange.)
+      (These servers chose X25519 — which we do send a key share for. A server that
+      requires MLKEM768/FFDHE instead would send a HelloRetryRequest, unsupported →
+      handshake fails. "advertised" ≠ "negotiable".)
 
 ## Deliberately not done
 
@@ -86,8 +87,10 @@ Layers: `core/` (bytes + crypto primitives) → `tls/` (handshake, records, cert
 - HTTP/2 (dart:io is h1; add later if a target needs it).
 - (done) Keep-alive connection reuse, TLS session resumption (PSK) and 0-RTT early
   data — all in `Session`; resumption/0-RTT key schedule validated vs RFC 8448 §4.
-- Cross-sign path building beyond "earliest chain cert signed by a known root"
-  (covers GlobalSign R1 / AAA Certificate Services legacy tops; exotic paths fail closed).
+- HelloRetryRequest handling (a server that won't accept X25519 fails the handshake).
+- Cross-sign path building beyond "earliest chain cert signed by a known root" (covers
+  GlobalSign R1 / AAA Certificate Services legacy tops; other paths fail verification —
+  fix by adding the missing root to `cacert.pem`, not by disabling verification).
 
 ## Phase 2 (replace the Dart relay for Kopken)
 

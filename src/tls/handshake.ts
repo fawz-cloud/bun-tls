@@ -165,10 +165,7 @@ export class TlsClient {
 				const cet = clientEarlyTraffic(suite.hash, ch.earlySecret, ch.bytes);
 				const k = trafficKey(suite.hash, cet, suite.keyLen);
 				earlyWrite = new AeadDir(suite.aead(k.key), k.iv);
-				const MAX = 16384 - 1;
-				for (let off = 0; off < this.opts.earlyData.length; off += MAX) {
-					this.t.write(earlyWrite.encrypt(ContentType.applicationData, this.opts.earlyData.subarray(off, off + MAX)));
-				}
+				this.t.write(earlyWrite.encryptMany(ContentType.applicationData, this.opts.earlyData, 16384 - 1));
 				sentEarly = true;
 			}
 		}
@@ -264,13 +261,9 @@ export class TlsClient {
 
 	writeApp(data: Uint8Array): void {
 		if (!this.appMode) throw new Error('handshake not finished');
-		// TLSInnerPlaintext ≤ 2^14 (content + 1 type byte), so fragment at 16383 bytes
-		// of content. A large request body otherwise becomes one oversized record the
-		// server rejects.
-		const MAX = 16384 - 1;
-		for (let off = 0; off < data.length; off += MAX) {
-			this.t.write(this.appWrite.encrypt(ContentType.applicationData, data.subarray(off, off + MAX)));
-		}
+		// TLSInnerPlaintext ≤ 2^14 (content + 1 type byte) → fragment at 16383 bytes of
+		// content. All records are encrypted into one buffer and sent with one write.
+		if (data.length) this.t.write(this.appWrite.encryptMany(ContentType.applicationData, data, 16384 - 1));
 	}
 
 	/** Decrypted application data. NewSessionTicket → onTicket; KeyUpdate ignored. null = EOF. */

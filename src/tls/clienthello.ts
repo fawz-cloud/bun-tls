@@ -27,10 +27,10 @@ export interface Fingerprint {
 	compression?: number[];
 	/** Inject GREASE like Chrome (cipher[0], a leading+trailing GREASE ext, and
 	 *  GREASE first in supported_groups/supported_versions/key_share). JA3/JA4
-	 *  strip GREASE, so the hashes are unchanged; the bytes match real browsers. */
+	 *  strip GREASE, so the hashes are unchanged; the wire layout follows Chrome's. */
 	grease?: boolean;
 	/** Shuffle extension order each connection (Chrome tls_permute_extensions).
-	 *  Raw JA3 then varies per call (like real Chrome); JA3N (sorted) is stable. */
+	 *  Raw JA3 then varies per call (as with Chrome); JA3N (sorted) is stable. */
 	permute?: boolean;
 }
 

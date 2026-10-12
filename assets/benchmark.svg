@@ -2,25 +2,25 @@
 <rect width="1000" height="460" rx="14" fill="#141518"/>
 <rect x="0.5" y="0.5" width="999" height="459" rx="13.5" fill="none" stroke="#2C2D33"/>
 
-<text x="60" y="44" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,sans-serif" font-size="20" font-weight="700" fill="#E8E6E0">Throughput — 1000 requests over a reused connection</text>
-<text x="60" y="68" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,sans-serif" font-size="13" fill="#9A968C">requests per second, localhost (handshake amortized by keep-alive). Higher is better.</text>
+<text x="60" y="44" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,sans-serif" font-size="20" font-weight="700" fill="#E8E6E0">Throughput — 1000 requests, connections reused</text>
+<text x="60" y="68" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,sans-serif" font-size="13" fill="#9A968C">requests per second on localhost, median of one interleaved run. Higher is better.</text>
 <rect x="60" y="86" width="13" height="13" rx="3" fill="#C8A24A"/><text x="80" y="97" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,sans-serif" font-size="13" fill="#E8E6E0">bun-tls</text>
 <rect x="166" y="86" width="13" height="13" rx="3" fill="#3A3B41"/><text x="186" y="97" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,sans-serif" font-size="13" fill="#9A968C">curl_cffi</text>
 
 <text x="212" y="144" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,sans-serif" font-size="14" fill="#E8E6E0" text-anchor="end">1 connection</text>
-<rect x="230" y="108" width="452.16" height="30" rx="5" fill="#C8A24A"/>
-<text x="692.1600000000001" y="129" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="14" font-weight="700" fill="#C8A24A">11,304</text>
-<rect x="230" y="146" width="60.760000000000005" height="30" rx="5" fill="#3A3B41"/>
-<text x="300.76" y="167" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="14" fill="#9A968C">1,519</text>
+<rect x="230" y="108" width="387.2666666666667" height="30" rx="5" fill="#C8A24A"/>
+<text x="627.2666666666667" y="129" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="14" font-weight="700" fill="#C8A24A">11,618</text>
+<rect x="230" y="146" width="74.23333333333333" height="30" rx="5" fill="#3A3B41"/>
+<text x="314.23333333333335" y="167" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="14" fill="#9A968C">2,227</text>
 <text x="212" y="248" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,sans-serif" font-size="14" fill="#E8E6E0" text-anchor="end">10 concurrent</text>
-<rect x="230" y="212" width="567.72" height="30" rx="5" fill="#C8A24A"/>
-<text x="807.72" y="233" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="14" font-weight="700" fill="#C8A24A">14,193</text>
-<rect x="230" y="250" width="125.72" height="30" rx="5" fill="#3A3B41"/>
-<text x="365.72" y="271" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="14" fill="#9A968C">3,143</text>
+<rect x="230" y="212" width="567.6333333333333" height="30" rx="5" fill="#C8A24A"/>
+<text x="807.6333333333333" y="233" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="14" font-weight="700" fill="#C8A24A">17,029</text>
+<rect x="230" y="250" width="100.66666666666667" height="30" rx="5" fill="#3A3B41"/>
+<text x="340.6666666666667" y="271" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="14" fill="#9A968C">3,020</text>
 <text x="212" y="352" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,sans-serif" font-size="14" fill="#E8E6E0" text-anchor="end">50 concurrent</text>
-<rect x="230" y="316" width="238.44" height="30" rx="5" fill="#C8A24A"/>
-<text x="478.44" y="337" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="14" font-weight="700" fill="#C8A24A">5,961</text>
-<rect x="230" y="354" width="95.52000000000001" height="30" rx="5" fill="#3A3B41"/>
-<text x="335.52" y="375" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="14" fill="#9A968C">2,388</text>
-<text x="60" y="426" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,sans-serif" font-size="12" fill="#5C5A54">Bun 1.4.2, curl_cffi 0.15.0, AES-128-GCM. Over the internet, latency is round-trip-bound and the two converge.</text>
+<rect x="230" y="316" width="194.93333333333334" height="30" rx="5" fill="#C8A24A"/>
+<text x="434.93333333333334" y="337" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="14" font-weight="700" fill="#C8A24A">5,848</text>
+<rect x="230" y="354" width="44" height="30" rx="5" fill="#3A3B41"/>
+<text x="284" y="375" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="14" fill="#9A968C">1,320</text>
+<text x="60" y="426" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,sans-serif" font-size="12" fill="#5C5A54">bun-tls Session vs curl_cffi AsyncSession, self-signed cert (verification off for both), Bun 1.4.2, curl_cffi 0.15.0. Scripts in bench/.</text>
 </svg>

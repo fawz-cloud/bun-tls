@@ -141,33 +141,58 @@ export function ecdheShared(group: number, priv: crypto.KeyObject, peerRaw: Uint
 }
 
 // ── AEAD: AES-GCM (nonce = iv XOR seq). ChaCha in chacha.ts. ──────────────────
-export type Aead = { seal: (nonce: Uint8Array, aad: Uint8Array, pt: Uint8Array) => Uint8Array; open: (nonce: Uint8Array, aad: Uint8Array, ct: Uint8Array) => Uint8Array; keyLen: number };
+export type Aead = {
+	seal: (nonce: Uint8Array, aad: Uint8Array, pt: Uint8Array) => Uint8Array;
+	open: (nonce: Uint8Array, aad: Uint8Array, ct: Uint8Array) => Uint8Array;
+	/** Optional fast path: encrypt `parts` (concatenated) straight into `out` at `off`,
+	 *  ciphertext then tag, returning the new offset. Avoids building a joined input
+	 *  and a separate output per record. */
+	sealParts?: (nonce: Uint8Array, aad: Uint8Array, parts: Uint8Array[], out: Uint8Array, off: number) => number;
+	keyLen: number;
+};
 
 export function aesGcm(keyLen: 16 | 32): (key: Uint8Array) => Aead {
 	const algo = keyLen === 16 ? 'aes-128-gcm' : 'aes-256-gcm';
-	return (key: Uint8Array): Aead => ({
-		keyLen,
-		seal(nonce, aad, pt) {
-			const c = crypto.createCipheriv(algo, key, nonce, { authTagLength: 16 });
-			c.setAAD(aad, { plaintextLength: pt.length });
-			const body = c.update(pt); // GCM is a stream cipher: update() returns all ct
-			c.final(); // empty for GCM, but required
-			const out = new Uint8Array(body.length + 16);
-			out.set(body);
-			out.set(c.getAuthTag(), body.length);
-			return out;
-		},
-		open(nonce, aad, ct) {
-			const tag = ct.subarray(ct.length - 16);
-			const body = ct.subarray(0, ct.length - 16);
-			const d = crypto.createDecipheriv(algo, key, nonce, { authTagLength: 16 });
-			d.setAAD(aad, { plaintextLength: body.length });
-			d.setAuthTag(tag);
-			const out = d.update(body); // all plaintext; d.final() only verifies the tag
-			d.final(); // throws on tag mismatch → we never return unverified plaintext
-			return new Uint8Array(out);
-		}
-	});
+	return (raw: Uint8Array): Aead => {
+		const key = crypto.createSecretKey(raw); // import once per traffic key, not per record
+		return {
+			keyLen,
+			seal(nonce, aad, pt) {
+				const c = crypto.createCipheriv(algo, key, nonce, { authTagLength: 16 });
+				c.setAAD(aad, { plaintextLength: pt.length });
+				const body = c.update(pt); // GCM is a stream cipher: update() returns all ct
+				c.final(); // empty for GCM, but required
+				const out = new Uint8Array(body.length + 16);
+				out.set(body);
+				out.set(c.getAuthTag(), body.length);
+				return out;
+			},
+			sealParts(nonce, aad, parts, out, off) {
+				const c = crypto.createCipheriv(algo, key, nonce, { authTagLength: 16 });
+				let total = 0;
+				for (const p of parts) total += p.length;
+				c.setAAD(aad, { plaintextLength: total });
+				for (const p of parts) {
+					const enc = c.update(p);
+					out.set(enc, off);
+					off += enc.length;
+				}
+				c.final();
+				out.set(c.getAuthTag(), off);
+				return off + 16;
+			},
+			open(nonce, aad, ct) {
+				const tag = ct.subarray(ct.length - 16);
+				const body = ct.subarray(0, ct.length - 16);
+				const d = crypto.createDecipheriv(algo, key, nonce, { authTagLength: 16 });
+				d.setAAD(aad, { plaintextLength: body.length });
+				d.setAuthTag(tag);
+				const out = d.update(body); // all plaintext; d.final() only verifies the tag
+				d.final(); // throws on tag mismatch → we never return unverified plaintext
+				return new Uint8Array(out);
+			}
+		};
+	};
 }
 
 /** TLS 1.3 nonce: iv with the last 8 bytes XORed with seq (big-endian). */

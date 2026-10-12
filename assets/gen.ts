@@ -111,7 +111,7 @@ ${arrows}
 <text x="${(cx + sx) / 2}" y="${boxY + 18}" ${FS} font-size="12.5" fill="${rttColor}" text-anchor="middle">${esc(rtt)}</text>`;
 	}
 	return frame(w, h, `
-<text x="60" y="44" ${FS} font-size="20" font-weight="700" fill="${C.text}">Resumption trims a full round trip</text>
+<text x="60" y="44" ${FS} font-size="20" font-weight="700" fill="${C.text}">0-RTT saves a round trip (opt-in)</text>
 ${panel(70, 'Full handshake', 'first visit to a host', [
 		['ClientHello', true],
 		['ServerHello + cert + Finished', false],
@@ -126,17 +126,16 @@ ${panel(540, '0-RTT resumption', 'returning, with a cached ticket', [
 
 // ── 5. Comparison matrix vs other clients ─────────────────────────────────────
 function comparison(): string {
-	const w = 1000, h = 408;
+	const w = 1000, h = 370;
 	const cols = ['bun-tls', 'curl_cffi', 'utls', 'node fetch', 'requests'];
-	// y = yes, n = no, or a short string
+	// true = yes, false = no, or a short string. Only properties checked for every column.
 	const rows: [string, (string | boolean)[]][] = [
-		['Runtime', ['Bun / TS', 'Python', 'Go', 'Node', 'Python']],
-		['No native binary to install', [true, false, false, true, true]],
+		['Language', ['TypeScript', 'Python', 'Go', 'JavaScript', 'Python']],
+		['No FFI / extra native library', [true, false, true, true, true]],
 		['JA3 / JA4 control', [true, true, true, false, false]],
 		['Browser presets', [true, true, true, false, false]],
-		['TLS 1.3 0-RTT', [true, true, true, false, false]],
-		['HTTP/2', [false, true, true, true, false]],
-		['Cert verify by default', [true, true, true, true, true]]
+		['HTTP/2', [false, true, 'TLS only', true, false]],
+		['Cert verification by default', [true, true, true, true, true]]
 	];
 	const lx = 60, labelW = 300, c0 = lx + labelW, cw = (w - c0 - 40) / cols.length;
 	const colX = (i: number) => c0 + cw * i + cw / 2;
@@ -160,7 +159,7 @@ function comparison(): string {
 	});
 	return frame(w, h, `
 <text x="60" y="44" ${FS} font-size="20" font-weight="700" fill="${C.text}">How it compares</text>
-<text x="60" y="68" ${FS} font-size="13" fill="${C.dim}">filled = yes, dash = no. The niche: fingerprint control with nothing to compile.</text>
+<text x="60" y="68" ${FS} font-size="13" fill="${C.dim}">filled = yes, dash = no. utls is a TLS library; HTTP/2 comes from the HTTP layer you pair it with.</text>
 ${head}
 <line x1="${lx - 14}" y1="108" x2="${w - (lx - 14)}" y2="108" stroke="${C.line}"/>
 ${body}`);
@@ -169,12 +168,13 @@ ${body}`);
 // ── 4. Throughput vs curl_cffi ────────────────────────────────────────────────
 function benchmark(): string {
 	const w = 1000, h = 460;
+	// bench/bun.ts vs bench/curl_bench.py, same machine, interleaved run (see README).
 	const rows: [string, number, number][] = [
-		['1 connection', 11304, 1519],
-		['10 concurrent', 14193, 3143],
-		['50 concurrent', 5961, 2388]
+		['1 connection', 11618, 2227],
+		['10 concurrent', 17029, 3020],
+		['50 concurrent', 5848, 1320]
 	];
-	const max = 15000, x0 = 230, barW = 600, top = 108, gh = 104, bh = 30;
+	const max = 18000, x0 = 230, barW = 600, top = 108, gh = 104, bh = 30;
 	const sx = (v: number) => (v / max) * barW;
 	let body = '';
 	rows.forEach((r, i) => {
@@ -187,12 +187,12 @@ function benchmark(): string {
 <text x="${x0 + sx(r[2]) + 10}" y="${y + bh + 29}" ${FM} font-size="14" fill="${C.dim}">${r[2].toLocaleString()}</text>`;
 	});
 	return frame(w, h, `
-<text x="60" y="44" ${FS} font-size="20" font-weight="700" fill="${C.text}">Throughput — 1000 requests over a reused connection</text>
-<text x="60" y="68" ${FS} font-size="13" fill="${C.dim}">requests per second, localhost (handshake amortized by keep-alive). Higher is better.</text>
+<text x="60" y="44" ${FS} font-size="20" font-weight="700" fill="${C.text}">Throughput — 1000 requests, connections reused</text>
+<text x="60" y="68" ${FS} font-size="13" fill="${C.dim}">requests per second on localhost, median of one interleaved run. Higher is better.</text>
 <rect x="60" y="86" width="13" height="13" rx="3" fill="${C.accent}"/><text x="80" y="97" ${FS} font-size="13" fill="${C.text}">bun-tls</text>
 <rect x="166" y="86" width="13" height="13" rx="3" fill="${C.curl}"/><text x="186" y="97" ${FS} font-size="13" fill="${C.dim}">curl_cffi</text>
 ${body}
-<text x="60" y="${top + 3 * gh + 6}" ${FS} font-size="12" fill="${C.faint}">Bun 1.4.2, curl_cffi 0.15.0, AES-128-GCM. Over the internet, latency is round-trip-bound and the two converge.</text>`);
+<text x="60" y="${top + 3 * gh + 6}" ${FS} font-size="12" fill="${C.faint}">bun-tls Session vs curl_cffi AsyncSession, self-signed cert (verification off for both), Bun 1.4.2, curl_cffi 0.15.0. Scripts in bench/.</text>`);
 }
 
 const out = import.meta.dir;

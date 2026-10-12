@@ -78,17 +78,17 @@ export const dart = (): Fingerprint => ({
 });
 
 // ---------------------------------------------------------------------------
-// Faithful browser presets, transcribed from utls (refraction-networking/utls)
-// u_parrots.go — the authoritative TLS-fingerprint library. These reproduce the
-// real browser ClientHello (cipher + extension order + curves + sigalgs), so the
-// JA3/JA3N match current browsers, including the post-quantum X25519MLKEM768
-// group and GREASE ECH. We only hold a key_share for X25519 (no ML-KEM impl);
-// MLKEM is advertised in supported_groups only — not in JA3 key material, and the
-// server falls back to X25519. supported_versions is TLS 1.3 only (this client is
-// 1.3-only); the version list is not in JA3, so the hash is unchanged.
-//
-// h1 caveat: real browsers ALPN = h2,http/1.1; we are HTTP/1.1 only, so we send
-// http/1.1 (ALPN value is not in JA3 → hash unchanged; JA4 alpn byte differs).
+// Browser presets transcribed from utls (refraction-networking/utls) u_parrots.go:
+// cipher list, extension set + order, curves and sigalgs follow the utls spec, so
+// the JA3/JA3N match the published values for that browser version (verified against
+// an echo server). They are NOT full browser clones. Known differences:
+//  - key_share: only an X25519 share is sent. X25519MLKEM768 (and FFDHE in the
+//    Firefox preset) are advertised in supported_groups but cannot be negotiated —
+//    a server that insists on one of them would answer with HelloRetryRequest, which
+//    this client does not support, and the handshake fails.
+//  - ALPN: http/1.1 only (real browsers offer h2,http/1.1) — the JA4 ALPN byte differs.
+//  - supported_versions: TLS 1.3 only. GREASE values and the GREASE ECH payload are
+//    random per connection, as in browsers, but not byte-identical to any capture.
 
 /** Chromium sigalgs (Chrome/Edge 131): 0403,0804,0401,0503,0805,0501,0806,0601. */
 const CHROME_SIGALGS = [
