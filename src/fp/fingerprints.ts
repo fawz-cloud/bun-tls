@@ -82,10 +82,10 @@ export const dart = (): Fingerprint => ({
 // cipher list, extension set + order, curves and sigalgs follow the utls spec, so
 // the JA3/JA3N match the published values for that browser version (verified against
 // an echo server). They are NOT full browser clones. Known differences:
-//  - key_share: an X25519 share is sent. If the server wants P-256/P-384 instead it
-//    sends a HelloRetryRequest and the client resends with that share (handled). Only
-//    X25519MLKEM768 (and FFDHE in the Firefox preset) cannot be negotiated — they are
-//    advertised but have no implementation, so an MLKEM/FFDHE-only server is unreachable.
+//  - key_share: the presets send X25519MLKEM768 (post-quantum hybrid) + X25519 (+ P-256 for
+//    Firefox), matching the real browsers; the hybrid is fully negotiated (ML-KEM via
+//    WebCrypto). P-256/P-384 via HelloRetryRequest also work. Only FFDHE groups are
+//    advertised-but-not-implemented (no mainstream server requires FFDHE).
 //  - ALPN: http/1.1 only (real browsers offer h2,http/1.1) — the JA4 ALPN byte differs.
 //  - supported_versions: TLS 1.3 only. GREASE values and the GREASE ECH payload are
 //    random per connection, as in browsers, but not byte-identical to any capture.
@@ -116,7 +116,7 @@ const CHROME_CIPHERS = [
  *  `true` to applicationSettings). curves = GREASE,MLKEM768,x25519,P256,P384. */
 export const chrome131 = (): Fingerprint => ({
 	ciphers: CHROME_CIPHERS,
-	keyShareGroups: [Group.x25519],
+	keyShareGroups: [Group.x25519mlkem768, Group.x25519], // real Chrome sends both shares
 	grease: true,
 	permute: true,
 	extensions: [
@@ -150,7 +150,7 @@ export const firefox148 = (): Fingerprint => ({
 		0x009c, 0x009d, // RSA AES-GCM
 		0x002f, 0x0035 // RSA AES-CBC
 	],
-	keyShareGroups: [Group.x25519],
+	keyShareGroups: [Group.x25519mlkem768, Group.x25519, Group.secp256r1], // Firefox sends these shares
 	extensions: [
 		E.serverName(),
 		E.extendedMasterSecret(),

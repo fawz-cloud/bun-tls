@@ -18,7 +18,8 @@ export const HandshakeType = {
 	certificateRequest: 13,
 	certificateVerify: 15,
 	finished: 20,
-	keyUpdate: 24
+	keyUpdate: 24,
+	compressedCertificate: 25
 } as const;
 
 export const Ext = {

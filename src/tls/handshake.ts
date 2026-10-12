@@ -21,7 +21,11 @@ import {
 	resumptionMaster,
 	resumptionPsk,
 	clientEarlyTraffic,
-	updateTraffic
+	updateTraffic,
+	x25519Keypair,
+	x25519Shared,
+	mlkem768Keypair,
+	mlkem768Decapsulate
 } from '../core/crypto';
 import { chacha20Poly1305 } from '../core/chacha';
 import type { Fingerprint, ResumeSpec } from './clienthello';
@@ -31,6 +35,7 @@ import type { Transport } from './transport';
 import type { Ticket } from './resumption';
 import { verifyCertificateVerify, verifyChain } from './verify';
 import crypto from 'node:crypto';
+import zlib from 'node:zlib';
 
 interface Suite {
 	hash: HashAlg;
@@ -150,8 +155,18 @@ export class TlsClient {
 
 	async handshake(): Promise<void> {
 		const resume = this.opts.resume;
+		// X25519MLKEM768 hybrid: ML-KEM keygen is async, so build the key_share up front
+		// (ek || X25519 pubkey) and keep both private parts for the shared-secret recovery.
+		let hybrid: { x: crypto.KeyObject; mlkem: CryptoKey } | null = null;
+		let prebuilt: Map<number, Uint8Array> | undefined;
+		if (this.opts.fingerprint.keyShareGroups.includes(Group.x25519mlkem768)) {
+			const x = x25519Keypair();
+			const mk = await mlkem768Keypair();
+			hybrid = { x: x.priv, mlkem: mk.priv };
+			prebuilt = new Map([[Group.x25519mlkem768, concat(mk.ek, x.pub)]]);
+		}
 		// 1) ClientHello (+ pre_shared_key + early_data when resuming)
-		let ch = buildClientHello(this.opts.fingerprint, this.opts.host, resume);
+		let ch = buildClientHello(this.opts.fingerprint, this.opts.host, resume, undefined, prebuilt);
 		this.ja3 = ch.ja3;
 		this.ja3Hash = ch.ja3Hash;
 		this.ja3n = ch.ja3n;
@@ -195,10 +210,19 @@ export class TlsClient {
 		// the ticket's (the binder/PSK are bound to that hash).
 		const pskAccepted = !!resume && server.selectedIdentity != null && this.suite.hash === resume.ticket.hash;
 
-		// 3) ECDHE + handshake keys (early_secret comes from the PSK when resumed)
-		const priv = ch.privs.get(server.keyShare.group);
-		if (!priv) throw new Error('server chose a group we did not offer: ' + server.keyShare.group);
-		const ecdhe = ecdheShared(server.keyShare.group, priv, server.keyShare.pub);
+		// 3) (EC)DHE + handshake keys (early_secret comes from the PSK when resumed)
+		let ecdhe: Uint8Array;
+		if (server.keyShare.group === Group.x25519mlkem768) {
+			if (!hybrid) throw new Error('server chose X25519MLKEM768 but no hybrid share was offered');
+			const ks = server.keyShare.pub; // ML-KEM-768 ciphertext (1088) || X25519 pubkey (32)
+			const mlShared = await mlkem768Decapsulate(hybrid.mlkem, ks.subarray(0, 1088));
+			const xShared = x25519Shared(hybrid.x, ks.subarray(1088));
+			ecdhe = concat(mlShared, xShared); // combined secret = ML-KEM || X25519
+		} else {
+			const priv = ch.privs.get(server.keyShare.group);
+			if (!priv) throw new Error('server chose a group we did not offer: ' + server.keyShare.group);
+			ecdhe = ecdheShared(server.keyShare.group, priv, server.keyShare.pub);
+		}
 		const early = pskAccepted ? earlySecret(this.suite.hash, resume!.ticket.psk) : undefined;
 		this.sched = deriveHandshake(this.suite.hash, ecdhe, this.th(), early);
 		const sHs = trafficKey(this.suite.hash, this.sched.sHs, this.suite.keyLen);
@@ -229,13 +253,15 @@ export class TlsClient {
 				this.opts.onAlpn?.(this.alpn);
 			} else if (msg.type === HandshakeType.certificate) {
 				certs = parseCertificate(msg.body);
+			} else if (msg.type === HandshakeType.compressedCertificate) {
+				certs = parseCompressedCertificate(msg.body); // RFC 8879
 			} else if (msg.type === HandshakeType.certificateVerify) {
 				cv = { alg: msg.body.u16(), sig: msg.body.block(2).buf };
 			} else if (msg.type === HandshakeType.certificateRequest) {
 				certReqContext = new Uint8Array(msg.body.block(1).buf); // echo this in our Certificate
 			}
 			this.addTranscript(msg.raw);
-			if (msg.type === HandshakeType.certificate) thBeforeCV = this.th(); // CV hash = up to Certificate
+			if (msg.type === HandshakeType.certificate || msg.type === HandshakeType.compressedCertificate) thBeforeCV = this.th(); // CV hash = up to (compressed) Certificate
 		}
 
 		// 4b) Certificate verification — only on a full (non-resumed) handshake.
@@ -466,6 +492,20 @@ function parseCertificate(r: Reader): Uint8Array[] {
 		list.block(2); // per-cert extensions (ignored)
 	}
 	return certs;
+}
+
+/** CompressedCertificate (RFC 8879): algorithm(u16) + uncompressed_length(u24) +
+ *  compressed Certificate-message body. Decompress, then parse as a normal Certificate. */
+function parseCompressedCertificate(r: Reader): Uint8Array[] {
+	const algo = r.u16();
+	r.u24(); // uncompressed_length (the decompressors size themselves)
+	const compressed = r.block(3).buf;
+	let raw: Buffer;
+	if (algo === 1) raw = zlib.inflateSync(compressed);
+	else if (algo === 2) raw = zlib.brotliDecompressSync(compressed);
+	else if (algo === 3 && typeof zlib.zstdDecompressSync === 'function') raw = zlib.zstdDecompressSync(compressed);
+	else throw new Error('unsupported certificate compression algorithm ' + algo);
+	return parseCertificate(new Reader(new Uint8Array(raw)));
 }
 
 /** EncryptedExtensions: negotiated ALPN + whether the server accepted 0-RTT (early_data).

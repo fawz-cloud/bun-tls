@@ -111,6 +111,24 @@ export const clientEarlyTraffic = (h: HashAlg, early: Uint8Array, transcriptCH: 
 export const updateTraffic = (h: HashAlg, secret: Uint8Array): Uint8Array =>
 	expandLabel(h, secret, 'traffic upd', new Uint8Array(0), hashLen(h));
 
+// ── ML-KEM-768 (FIPS 203) via WebCrypto, for the X25519MLKEM768 hybrid group ─────
+const subtle = globalThis.crypto.subtle;
+const MLKEM = { name: 'ML-KEM-768' } as const;
+
+/** Generate an ML-KEM-768 keypair: the 1184-byte encapsulation key (to send) + the
+ *  decapsulation key (kept to recover the shared secret from the server's ciphertext). */
+export async function mlkem768Keypair(): Promise<{ ek: Uint8Array; priv: CryptoKey }> {
+	const kp = (await subtle.generateKey(MLKEM, true, ['encapsulateBits', 'decapsulateBits'])) as CryptoKeyPair;
+	const ek = new Uint8Array(await subtle.exportKey('raw-public' as 'raw', kp.publicKey));
+	return { ek, priv: kp.privateKey };
+}
+
+/** Recover the 32-byte ML-KEM-768 shared secret from the server's 1088-byte ciphertext. */
+export async function mlkem768Decapsulate(priv: CryptoKey, ciphertext: Uint8Array): Promise<Uint8Array> {
+	// @ts-expect-error — decapsulateBits is newer than the lib.dom types
+	return new Uint8Array(await subtle.decapsulateBits(MLKEM, priv, ciphertext));
+}
+
 // ── X25519 ────────────────────────────────────────────────────────────────────
 const X25519_SPKI_PREFIX = Buffer.from('302a300506032b656e032100', 'hex');
 

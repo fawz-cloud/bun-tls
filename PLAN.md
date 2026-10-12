@@ -88,14 +88,16 @@ Layers: `core/` (bytes + crypto primitives) → `tls/` (handshake, records, cert
 - TLS 1.2 (we advertise supported_versions = 1.3 only; impersonation targets are 1.3).
 - HTTP/2 multiplexing / Session over h2 (one-shot `request({http2:true})` is done; no pooling,
   and the h2 SETTINGS are generic, not a browser-exact h2 fingerprint).
-- ML-KEM / FFDHE key exchange (advertised for the fingerprint, not implemented → presets that
-  advertise MLKEM fail against servers that prefer it).
+- FFDHE key exchange (advertised for fingerprint fidelity, not implemented; no mainstream
+  server requires it).
 - OCSP / CRL revocation (needs an ASN.1 OCSP stack; browsers soft-fail it anyway).
 - (done) Keep-alive, TLS session resumption (PSK), 0-RTT early data, HelloRetryRequest,
-  post-handshake KeyUpdate, optional-mTLS (empty client Certificate), HTTP+SOCKS5 proxy,
-  gzip/deflate/br/zstd, HTTP/2 (HPACK + flow control, one request per connection).
-  Resumption/0-RTT key schedule validated vs RFC 8448 §4; cert verify enforces CA issuer +
-  IP SANs; failed handshakes close the socket.
+  X25519MLKEM768 post-quantum hybrid (ML-KEM via WebCrypto), RFC 8879 certificate
+  decompression, post-handshake KeyUpdate, optional-mTLS (empty client Certificate),
+  HTTP+SOCKS5 proxy, gzip/deflate/br/zstd, cookie Public Suffix List, HTTP/2 (HPACK + flow
+  control + Chrome h2 fingerprint, one request per connection). Resumption/0-RTT key schedule
+  validated vs RFC 8448 §4; cert verify enforces CA issuer + IP SANs; failed handshakes close
+  the socket.
 - Cross-sign path building beyond "earliest chain cert signed by a known root" (covers
   GlobalSign R1 / AAA Certificate Services legacy tops; other paths fail verification —
   fix by adding the missing root to `cacert.pem`, not by disabling verification).

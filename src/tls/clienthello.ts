@@ -97,9 +97,11 @@ function genShare(group: number): { priv: crypto.KeyObject; pub: Uint8Array } {
 	throw new Error(`group ${group} not supported for key_share`);
 }
 
-export function buildClientHello(fp: Fingerprint, host: string, resume?: ResumeSpec, cookie?: Uint8Array): BuiltHello {
+export function buildClientHello(fp: Fingerprint, host: string, resume?: ResumeSpec, cookie?: Uint8Array, prebuilt?: Map<number, Uint8Array>): BuiltHello {
 	const privs = new Map<number, crypto.KeyObject>();
 	const shares = fp.keyShareGroups.map((group) => {
+		const pre = prebuilt?.get(group);
+		if (pre) return { group, pub: pre }; // caller supplied the public key (e.g. ML-KEM hybrid) and keeps its private part
 		const { priv, pub } = genShare(group);
 		privs.set(group, priv);
 		return { group, pub };
