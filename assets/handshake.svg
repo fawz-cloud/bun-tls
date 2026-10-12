@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 400" width="1000" height="400" role="img">
+<rect width="1000" height="400" rx="14" fill="#141518"/>
+<rect x="0.5" y="0.5" width="999" height="399" rx="13.5" fill="none" stroke="#2C2D33"/>
+
+<text x="60" y="40" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,sans-serif" font-size="20" font-weight="700" fill="#E8E6E0">Resumption trims a full round trip</text>
+
+<text x="80" y="70" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,sans-serif" font-size="16" font-weight="700" fill="#E8E6E0">Full handshake</text>
+<text x="80" y="92" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,sans-serif" font-size="12.5" fill="#9A968C">first visit to a host</text>
+<text x="80" y="286" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,sans-serif" font-size="12" fill="#9A968C">client</text>
+<text x="380" y="286" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,sans-serif" font-size="12" fill="#9A968C" text-anchor="end">server</text>
+<line x1="80" y1="100" x2="80" y2="272" stroke="#2C2D33"/>
+<line x1="380" y1="100" x2="380" y2="272" stroke="#2C2D33"/>
+
+<line x1="80" y1="110" x2="380" y2="110" stroke="#5C5A54" stroke-width="1.5"/>
+<path d="M 372 105 L 380 110 L 372 115" fill="#5C5A54"/>
+<text x="230" y="101" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="12.5" fill="#9A968C" text-anchor="middle">ClientHello</text>
+<line x1="380" y1="156" x2="80" y2="156" stroke="#5C5A54" stroke-width="1.5"/>
+<path d="M 88 151 L 80 156 L 88 161" fill="#5C5A54"/>
+<text x="230" y="147" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="12.5" fill="#9A968C" text-anchor="middle">ServerHello + cert + Finished</text>
+<line x1="80" y1="202" x2="380" y2="202" stroke="#5C5A54" stroke-width="1.5"/>
+<path d="M 372 197 L 380 202 L 372 207" fill="#5C5A54"/>
+<text x="230" y="193" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="12.5" fill="#9A968C" text-anchor="middle">Finished + request</text>
+<line x1="380" y1="248" x2="80" y2="248" stroke="#5C5A54" stroke-width="1.5"/>
+<path d="M 88 243 L 80 248 L 88 253" fill="#5C5A54"/>
+<text x="230" y="239" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="12.5" fill="#9A968C" text-anchor="middle">response</text>
+<rect x="80" y="298" width="300" height="26" rx="6" fill="none" stroke="#9A968C"/>
+<text x="230" y="315" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,sans-serif" font-size="12.5" fill="#9A968C" text-anchor="middle">2 round trips before data</text>
+
+<text x="580" y="70" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,sans-serif" font-size="16" font-weight="700" fill="#E8E6E0">0-RTT resumption</text>
+<text x="580" y="92" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,sans-serif" font-size="12.5" fill="#9A968C">returning, with a cached ticket</text>
+<text x="580" y="194" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,sans-serif" font-size="12" fill="#9A968C">client</text>
+<text x="880" y="194" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,sans-serif" font-size="12" fill="#9A968C" text-anchor="end">server</text>
+<line x1="580" y1="100" x2="580" y2="180" stroke="#2C2D33"/>
+<line x1="880" y1="100" x2="880" y2="180" stroke="#2C2D33"/>
+
+<line x1="580" y1="110" x2="880" y2="110" stroke="#5C5A54" stroke-width="1.5"/>
+<path d="M 872 105 L 880 110 L 872 115" fill="#5C5A54"/>
+<text x="730" y="101" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="12.5" fill="#9A968C" text-anchor="middle">ClientHello + request</text>
+<line x1="880" y1="156" x2="580" y2="156" stroke="#5C5A54" stroke-width="1.5"/>
+<path d="M 588 151 L 580 156 L 588 161" fill="#5C5A54"/>
+<text x="730" y="147" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="12.5" fill="#9A968C" text-anchor="middle">response</text>
+<rect x="580" y="206" width="300" height="26" rx="6" fill="none" stroke="#C8A24A"/>
+<text x="730" y="223" font-family="ui-sans-serif,-apple-system,Segoe UI,Roboto,sans-serif" font-size="12.5" fill="#C8A24A" text-anchor="middle">1 round trip — request rides along</text>
+</svg>

@@ -1,0 +1,180 @@
+// TLS 1.3 crypto primitives via node:crypto (synchronous, full byte control).
+// HKDF + Expand-Label + key schedule + AEAD (AES-GCM; ChaCha lives in chacha.ts
+// if the server picks it). All validated against RFC 8448 vectors in test/.
+import crypto from 'node:crypto';
+import { Writer, concat } from './bytes';
+
+export type HashAlg = 'sha256' | 'sha384';
+export const hashLen = (h: HashAlg): number => (h === 'sha256' ? 32 : 48);
+export const sha = (h: HashAlg, data: Uint8Array): Uint8Array => new Uint8Array(crypto.createHash(h).update(data).digest());
+const hmac = (h: HashAlg, key: Uint8Array, data: Uint8Array): Uint8Array =>
+	new Uint8Array(crypto.createHmac(h, key).update(data).digest());
+
+export const hkdfExtract = (h: HashAlg, salt: Uint8Array, ikm: Uint8Array): Uint8Array => hmac(h, salt, ikm);
+
+export function hkdfExpand(h: HashAlg, prk: Uint8Array, info: Uint8Array, length: number): Uint8Array {
+	const hl = hashLen(h);
+	const n = Math.ceil(length / hl);
+	let t: Uint8Array = new Uint8Array(0);
+	const out = new Uint8Array(n * hl);
+	for (let i = 0; i < n; i++) {
+		t = hmac(h, prk, concat(t, info, Uint8Array.of(i + 1)));
+		out.set(t, i * hl);
+	}
+	return out.subarray(0, length);
+}
+
+/** HKDF-Expand-Label (RFC 8446 §7.1). */
+export function expandLabel(h: HashAlg, secret: Uint8Array, label: string, context: Uint8Array, length: number): Uint8Array {
+	const info = new Writer()
+		.u16(length)
+		.block(1, (w) => w.bytes(Buffer.from('tls13 ' + label)))
+		.block(1, (w) => w.bytes(context))
+		.build();
+	return hkdfExpand(h, secret, info, length);
+}
+
+/** Derive-Secret(secret, label, messages) — messages are hashed first. */
+export const deriveSecret = (h: HashAlg, secret: Uint8Array, label: string, msgs: Uint8Array): Uint8Array =>
+	expandLabel(h, secret, label, sha(h, msgs), hashLen(h));
+
+// ── TLS 1.3 key schedule (RFC 8446 §7.1) ──────────────────────────────────────
+export interface Schedule {
+	h: HashAlg;
+	handshake: Uint8Array;
+	master: Uint8Array;
+	cHs: Uint8Array;
+	sHs: Uint8Array;
+}
+
+/** Stage 1: after we have the ECDHE shared secret + transcript CH..SH. `early` =
+ *  a precomputed early_secret (from a resumption PSK); omitted → the 0-PSK one. */
+export function deriveHandshake(h: HashAlg, ecdhe: Uint8Array, transcriptCHSH: Uint8Array, early?: Uint8Array): Schedule {
+	const zero = new Uint8Array(hashLen(h));
+	const earlyS = early ?? hkdfExtract(h, zero, zero);
+	const derived = deriveSecret(h, earlyS, 'derived', new Uint8Array(0));
+	const handshake = hkdfExtract(h, derived, ecdhe);
+	const cHs = deriveSecret(h, handshake, 'c hs traffic', transcriptCHSH);
+	const sHs = deriveSecret(h, handshake, 's hs traffic', transcriptCHSH);
+	const derived2 = deriveSecret(h, handshake, 'derived', new Uint8Array(0));
+	const master = hkdfExtract(h, derived2, zero);
+	return { h, handshake, master, cHs, sHs };
+}
+
+/** Stage 2: app traffic secrets, transcript CH..server Finished. */
+export function appSecrets(s: Schedule, transcriptToServerFin: Uint8Array): { cAp: Uint8Array; sAp: Uint8Array } {
+	return {
+		cAp: deriveSecret(s.h, s.master, 'c ap traffic', transcriptToServerFin),
+		sAp: deriveSecret(s.h, s.master, 's ap traffic', transcriptToServerFin)
+	};
+}
+
+/** key + iv from a traffic secret. */
+export function trafficKey(h: HashAlg, secret: Uint8Array, keyLen: number): { key: Uint8Array; iv: Uint8Array } {
+	return {
+		key: expandLabel(h, secret, 'key', new Uint8Array(0), keyLen),
+		iv: expandLabel(h, secret, 'iv', new Uint8Array(0), 12)
+	};
+}
+
+/** Finished verify_data = HMAC(finished_key, Transcript-Hash). */
+export function finishedVerify(h: HashAlg, baseSecret: Uint8Array, transcript: Uint8Array): Uint8Array {
+	const fk = expandLabel(h, baseSecret, 'finished', new Uint8Array(0), hashLen(h));
+	return hmac(h, fk, sha(h, transcript));
+}
+
+// ── Resumption + 0-RTT (RFC 8446 §4.6.1, §7.1) ────────────────────────────────
+/** early_secret = HKDF-Extract(0, PSK). PSK omitted → the 0-PSK early secret. */
+export function earlySecret(h: HashAlg, psk?: Uint8Array): Uint8Array {
+	const zero = new Uint8Array(hashLen(h));
+	return hkdfExtract(h, zero, psk ?? zero);
+}
+/** resumption_master_secret = Derive-Secret(master, "res master", CH..client Finished). */
+export const resumptionMaster = (h: HashAlg, master: Uint8Array, transcriptToClientFin: Uint8Array): Uint8Array =>
+	deriveSecret(h, master, 'res master', transcriptToClientFin);
+/** A ticket's PSK = HKDF-Expand-Label(res master, "resumption", ticket_nonce). */
+export const resumptionPsk = (h: HashAlg, resMaster: Uint8Array, nonce: Uint8Array): Uint8Array =>
+	expandLabel(h, resMaster, 'resumption', nonce, hashLen(h));
+/** binder_key = Derive-Secret(early_secret, "res binder", ""). */
+export const binderKey = (h: HashAlg, early: Uint8Array): Uint8Array => deriveSecret(h, early, 'res binder', new Uint8Array(0));
+/** PSK binder = HMAC(finished_key(binder_key), Transcript-Hash(truncated ClientHello)). */
+export function pskBinder(h: HashAlg, bKey: Uint8Array, truncatedTranscript: Uint8Array): Uint8Array {
+	const fk = expandLabel(h, bKey, 'finished', new Uint8Array(0), hashLen(h));
+	return hmac(h, fk, sha(h, truncatedTranscript));
+}
+/** client_early_traffic_secret = Derive-Secret(early_secret, "c e traffic", ClientHello). */
+export const clientEarlyTraffic = (h: HashAlg, early: Uint8Array, transcriptCH: Uint8Array): Uint8Array =>
+	deriveSecret(h, early, 'c e traffic', transcriptCH);
+
+// ── X25519 ────────────────────────────────────────────────────────────────────
+const X25519_SPKI_PREFIX = Buffer.from('302a300506032b656e032100', 'hex');
+
+export function x25519Keypair(): { priv: crypto.KeyObject; pub: Uint8Array } {
+	const { privateKey, publicKey } = crypto.generateKeyPairSync('x25519');
+	const der = publicKey.export({ type: 'spki', format: 'der' }) as Buffer;
+	return { priv: privateKey, pub: new Uint8Array(der.subarray(der.length - 32)) };
+}
+
+export function x25519Shared(priv: crypto.KeyObject, peerRaw32: Uint8Array): Uint8Array {
+	const spki = Buffer.concat([X25519_SPKI_PREFIX, Buffer.from(peerRaw32)]);
+	const peer = crypto.createPublicKey({ key: spki, format: 'der', type: 'spki' });
+	return new Uint8Array(crypto.diffieHellman({ privateKey: priv, publicKey: peer }));
+}
+
+// ECDHE P-256/P-384: SPKI prefix captured at runtime (constant per curve), peer
+// = uncompressed point (0x04||X||Y). diffieHellman returns the X coordinate = shared.
+const EC_CURVE: Record<number, string> = { 0x0017: 'prime256v1', 0x0018: 'secp384r1' };
+const ecPrefix = new Map<number, Buffer>();
+export function ecdheShared(group: number, priv: crypto.KeyObject, peerRaw: Uint8Array): Uint8Array {
+	if (group === 0x001d) return x25519Shared(priv, peerRaw);
+	const curve = EC_CURVE[group];
+	if (!curve) throw new Error(`unsupported ECDHE group ${group}`);
+	let prefix = ecPrefix.get(group);
+	if (!prefix) {
+		const { publicKey } = crypto.generateKeyPairSync('ec', { namedCurve: curve });
+		const der = publicKey.export({ type: 'spki', format: 'der' }) as Buffer;
+		prefix = der.subarray(0, der.length - peerRaw.length);
+		ecPrefix.set(group, prefix);
+	}
+	const peer = crypto.createPublicKey({ key: Buffer.concat([prefix, Buffer.from(peerRaw)]), format: 'der', type: 'spki' });
+	return new Uint8Array(crypto.diffieHellman({ privateKey: priv, publicKey: peer }));
+}
+
+// ── AEAD: AES-GCM (nonce = iv XOR seq). ChaCha in chacha.ts. ──────────────────
+export type Aead = { seal: (nonce: Uint8Array, aad: Uint8Array, pt: Uint8Array) => Uint8Array; open: (nonce: Uint8Array, aad: Uint8Array, ct: Uint8Array) => Uint8Array; keyLen: number };
+
+export function aesGcm(keyLen: 16 | 32): (key: Uint8Array) => Aead {
+	const algo = keyLen === 16 ? 'aes-128-gcm' : 'aes-256-gcm';
+	return (key: Uint8Array): Aead => ({
+		keyLen,
+		seal(nonce, aad, pt) {
+			const c = crypto.createCipheriv(algo, key, nonce, { authTagLength: 16 });
+			c.setAAD(aad, { plaintextLength: pt.length });
+			const body = c.update(pt); // GCM is a stream cipher: update() returns all ct
+			c.final(); // empty for GCM, but required
+			const out = new Uint8Array(body.length + 16);
+			out.set(body);
+			out.set(c.getAuthTag(), body.length);
+			return out;
+		},
+		open(nonce, aad, ct) {
+			const tag = ct.subarray(ct.length - 16);
+			const body = ct.subarray(0, ct.length - 16);
+			const d = crypto.createDecipheriv(algo, key, nonce, { authTagLength: 16 });
+			d.setAAD(aad, { plaintextLength: body.length });
+			d.setAuthTag(tag);
+			const out = d.update(body); // all plaintext; d.final() only verifies the tag
+			d.final(); // throws on tag mismatch → we never return unverified plaintext
+			return new Uint8Array(out);
+		}
+	});
+}
+
+/** TLS 1.3 nonce: iv with the last 8 bytes XORed with seq (big-endian). */
+export function aeadNonce(iv: Uint8Array, seq: bigint): Uint8Array {
+	const n = new Uint8Array(iv);
+	for (let i = 0; i < 8; i++) {
+		n[11 - i] ^= Number((seq >> BigInt(8 * i)) & 0xffn);
+	}
+	return n;
+}
