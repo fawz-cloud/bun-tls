@@ -2,8 +2,8 @@
 
 # bun-tls
 
-A TLS 1.3 HTTPS client written from scratch in TypeScript, with **control over the TLS
-fingerprint** (JA3 / JA3N / JA4). The handshake is assembled by hand on a raw
+A TLS 1.3 / 1.2 HTTPS client written from scratch in TypeScript, with **control over the
+TLS fingerprint** (JA3 / JA3N / JA4). The handshake is assembled by hand on a raw
 `Bun.connect` socket; `node:crypto` is used only for primitives, so the ClientHello —
 cipher list, extensions, order, GREASE — is yours to set. **No additional native
 dependency**: no patched libcurl, no Python, no Dart, no `.dll` to build (it runs on Bun,
@@ -15,23 +15,6 @@ import { request, clients } from './src';
 const r = await request({ url: 'https://example.com/', fingerprint: clients.chrome() });
 console.log(r.status, r.ja3nHash); // matches the published Chrome 131 JA3N
 ```
-
-## Scope — read this first
-
-- **"Matches a fingerprint" ≠ "is that client."** A JA3/JA4 summarizes only part of the
-  ClientHello. The presets reproduce the JA3/JA3N of a given client version (verified
-  against an echo server), not every byte of its handshake. `fromJa3()` has even less to
-  work with — it rebuilds from a JA3 string, so it matches that JA3 and nothing more.
-- **HTTP/1.1 by default, HTTP/2 opt-in** (`http2: true`). Browser presets advertise ALPN
-  `http/1.1` unless you opt into h2 (ALPN is not in JA3, so the JA3 matches either way; the
-  JA4 ALPN byte reflects what you advertise).
-- **TLS 1.3 by default; TLS 1.2 is opt-in** (`tls12: true`) for 1.2-only servers —
-  ECDHE + AEAD (AES-GCM / ChaCha20-Poly1305) with extended master secret, no CBC or
-  static-RSA. The ECDHE groups (X25519, P-256, P-384) are fully negotiable, including via
-  HelloRetryRequest (1.3) when a server wants a group we only advertised. The post-quantum
-  `X25519MLKEM768` and FFDHE groups are advertised but have no implementation, so a server
-  that accepts *only* one of those cannot be reached.
-- From-scratch TLS, **not audited.**
 
 ## Install
 
@@ -50,24 +33,14 @@ import { request, Session, clients, fromJa3 } from './src';
 const r = await request({ url: 'https://api.github.com/' });
 console.log(r.status, r.json(), r.ja3, r.ja4);
 
-// a named preset
+// impersonate a browser fingerprint
 await request({ url: 'https://example.com/', fingerprint: clients.firefox() });
 
-// HTTP/2 (ALPN h2, falls back to h1 if the server declines)
+// HTTP/2, TLS 1.2, a raw JA3, a proxy
 await request({ url: 'https://nghttp2.org/', http2: true });
-
-// TLS 1.2 (ECDHE + AEAD) for a 1.2-only server
 await request({ url: 'https://tls-v1-2.badssl.com:1012/', tls12: true });
-
-// reproduce an arbitrary JA3 (full, runnable value)
-await request({
-  url: 'https://example.com/',
-  fingerprint: fromJa3('771,4865-4866-4867-49195-49199-49196-49200-52393-52392-49171-49172-156-157-47-53,0-23-65281-10-11-16-5-13-18-51-45-43-27,29-23-24,0', { grease: true }),
-});
-
-// through a proxy — HTTP CONNECT or SOCKS5
-await request({ url: 'https://host/', proxy: 'http://user:pass@host:8080' });
-await request({ url: 'https://host/', proxy: 'socks5://user:pass@host:1080' });
+await request({ url, fingerprint: fromJa3('771,4865-4866-4867,0-23-65281-10-11-…,29-23-24,0', { grease: true }) });
+await request({ url, proxy: 'socks5://user:pass@host:1080' });
 
 // a session: cookies, redirects, keep-alive, resumption
 const s = new Session();
@@ -76,84 +49,34 @@ await s.post('https://example.com/do', { body: 'x=1' });
 s.close();
 ```
 
-`request(options)` → `ClientResponse`: `url`, `method?`, `headers?`, `body?`,
-`fingerprint?`, `proxy?`, `verify?` (default true), `ocsp?` (`'off'`\|`'soft'`\|`'hard'`,
-default `'off'`), `tls12?` (speak TLS 1.2 instead of 1.3), `timeoutMs?`. Response adds `ja3`,
-`ja3Hash`, `ja3n`, `ja3nHash`, `ja4`, `alpn` on top of `status`, `headers`, `body`,
-`text()`, `json()`.
+## Features
 
-## Fingerprints
+- **Fingerprint control** — JA3 / JA3N / JA4 computed from the ClientHello actually sent;
+  presets whose JA3/JA3N match published Chrome 131 / Firefox 148 / dart:io, plus
+  `fromJa3()` for anything else.
+- **TLS 1.3** (default) and **TLS 1.2** (`tls12: true`, ECDHE + AEAD) — keep-alive, 1-RTT
+  resumption, opt-in 0-RTT, HelloRetryRequest, KeyUpdate, X25519 / P-256 / P-384 and the
+  post-quantum **X25519MLKEM768** hybrid, RFC 8879 cert decompression, optional mTLS.
+- **HTTP/1.1 and HTTP/2** — h2 with HPACK, flow control, Chrome's h2 fingerprint, and
+  request multiplexing over one connection via `new Session({ http2: true })`.
+- **Certificate verification** on by default (CA-constrained chain, hostname + IP SANs,
+  path-building); optional **OCSP** revocation (stapling + AIA fetch); cookie jar with
+  Public Suffix List; HTTP and SOCKS5 proxies; gzip / deflate / br / zstd.
 
-- **`fromJa3(ja3, opts?)`** — rebuild from a JA3 string (hash-exact to that JA3; cipher
-  and extension order preserved; optional GREASE). A JA3 omits ALPN, sigalgs and key-share
-  contents, so pass them via `opts` when they matter.
-- **`clients.*`** — presets:
-  - `chrome`, `edge`, `firefox`, `dart`: built from a ClientHello spec (utls
-    `u_parrots.go` for browsers, a live capture for dart:io). Their JA3/JA3N match the
-    published values; `chrome`/`edge` permute extensions per connection, so the raw JA3
-    varies while the JA3N (sorted) is stable.
-  - `safari`, `okhttp`: rebuilt from a reference JA3 via `fromJa3` (see the caveat above).
+**No additional native dependency** — a TypeScript source tree on Bun. From-scratch TLS,
+**not audited**.
 
-Custom fingerprints are an array of extension builders, in wire order:
+## Documentation
 
-```ts
-import { ext, consts } from './src';
-const fp = {
-  ciphers: [consts.Cipher.TLS_AES_128_GCM_SHA256, consts.Cipher.TLS_CHACHA20_POLY1305_SHA256],
-  keyShareGroups: [consts.Group.x25519],
-  extensions: [ ext.serverName(), ext.supportedGroups([consts.Group.x25519]),
-    ext.signatureAlgorithms([0x0403, 0x0804]), ext.supportedVersions(),
-    ext.pskKeyExchangeModes([1]), ext.keyShare(), ext.alpn(['http/1.1']) ],
-};
-```
-
-## Keep-alive, resumption & 0-RTT
-
-![handshake](assets/handshake.svg)
-
-`Session` reuses work across requests:
-
-- **Keep-alive** (on): connections are pooled per host, so only the first request pays a
-  handshake.
-- **Session resumption** (on): `NewSessionTicket`s are cached; a new connection presents
-  one as a `pre_shared_key` and resumes in 1-RTT, with no certificate exchange.
-- **0-RTT early data** (`{ zeroRtt: true }`, **off by default**): a GET/HEAD rides in the
-  ClientHello, saving a round trip. 0-RTT early data can be **replayed** by a network
-  attacker — restricting it to GET/HEAD does not remove that risk, because whether a
-  replay is harmless depends on the endpoint. Enable it only for endpoints where replay
-  is safe. If the server declines, the request is resent over the completed handshake.
-
-The resumption/0-RTT key schedule is checked byte-for-byte against the RFC 8448 §4 vectors
-(`test/resumption.test.ts`).
-
-## How it's built
-
-![architecture](assets/architecture.svg)
-
-Four layers, imports pointing down only: `core` (bytes + crypto) → `tls` (handshake,
-records, cert verification, transport) → `fp` (presets, `fromJa3`) → `http` (`request`,
-`Session`). ~2k lines; each module owns one concern and is tested on its own.
+**Full API reference → [DOCS.md](DOCS.md)** — every option, `Session`, fingerprints,
+TLS features, OCSP, HTTP/2, proxies, cookies, the low-level API and the architecture.
 
 ## Benchmarks
 
 ![benchmark](assets/benchmark.svg)
 
-Reproducible, not hand-picked — the scripts are in `bench/`:
-
-```bash
-# one self-signed cert for the local server (verification is off for both clients)
-openssl req -x509 -newkey rsa:2048 -nodes -keyout bench/key.pem -out bench/cert.pem \
-  -days 7 -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost"
-
-bun bench/server.ts            # terminal 1
-bun bench/bun.ts               # terminal 2 — bun-tls
-python bench/curl_bench.py     # terminal 2 — curl_cffi (pip install curl_cffi)
-```
-
-Both use the same scenarios: a fresh `Session` per request for *fresh* latency, one
-`Session`/`AsyncSession` for *reused* latency, uploads and throughput; throughput is 1000
-requests at concurrency C; medians after a warmup. One interleaved run on localhost
-(Bun 1.4.2, curl_cffi 0.15.0, AES-128-GCM):
+Reproducible, not hand-picked — scripts in `bench/` (see [DOCS.md](DOCS.md#testing)). One
+interleaved run on localhost (Bun 1.4.2, curl_cffi 0.15.0, AES-128-GCM):
 
 | scenario | bun-tls | curl_cffi |
 |---|---|---|
@@ -164,48 +87,24 @@ requests at concurrency C; medians after a warmup. One interleaved run on localh
 | throughput, 50 concurrent | 5,848 req/s | 1,320 req/s |
 | upload 10 MB, reused | ~350 MB/s | ~420 MB/s |
 
-What this shows, and what it does not: on this localhost setup bun-tls is faster for
-one-shot and concurrent requests, and curl keeps an edge on bulk upload (native AEAD).
-These numbers do **not** isolate a cause — curl_cffi offers `AsyncSession` and connection
-reuse (both used here), so the gap is not attributed to any single factor like the GIL.
-Over a real network, latency is dominated by round-trips and the two converge. Run the
-scripts on your own machine.
+On this localhost setup bun-tls is faster for one-shot and concurrent requests; curl keeps
+an edge on bulk upload (native AEAD). The numbers do **not** isolate a cause (both use
+connection reuse), and over a real network latency is round-trip-bound and the two converge.
+Run the scripts on your own machine.
 
 ## How it compares
 
 ![comparison](assets/comparison.svg)
 
-Clients that let you shape the ClientHello — `curl_cffi` (patched libcurl) and `utls`
-(Go TLS library) — either ship a patched native library or are a Go package. The ones
-with nothing extra to install — `fetch`/`undici`, `requests`/`httpx` — can't shape it.
-bun-tls fills that gap for Bun, at the cost of HTTP/1.1 only.
-
-## What it does well
-
-- Control over JA3 / JA4; presets whose JA3/JA3N match published Chrome 131 / Firefox 148
-  / dart:io values, plus `fromJa3()` for anything else.
-- No additional native dependency — a TypeScript source tree on Bun.
-- Keep-alive, 1-RTT resumption, optional 0-RTT (RFC 8448-checked key schedule),
-  post-handshake KeyUpdate, and HelloRetryRequest — all handled.
-- Key exchange over X25519 / P-256 / P-384 and the post-quantum X25519MLKEM768 hybrid,
-  with HelloRetryRequest and RFC 8879 certificate decompression — the browser presets reach
-  PQC-preferring CDNs with their real fingerprint. HTTP and SOCKS5 proxies; gzip/deflate/br/zstd.
-- HTTP/2: ALPN h2, HPACK, flow control, Chrome's h2 fingerprint, and request multiplexing
-  over one connection via `new Session({ http2: true })`.
-- TLS 1.2 fallback (`tls12: true`): ECDHE + AEAD (AES-GCM / ChaCha20-Poly1305) with extended
-  master secret and ServerKeyExchange-signature verification, for 1.2-only servers.
-- Optional mutual-TLS servers complete (we answer a CertificateRequest).
-- Certificate verification on by default (CA-constrained chain, hostname + IP SANs, path-building
-  to a bundled root store); optional OCSP revocation (`ocsp: 'soft' | 'hard'`) — stapled response
-  or AIA fetch, with responder-signature, CertID-binding and freshness checks; cookie jar with
-  Public Suffix List + `__Host-`/`__Secure-` rules.
-- Fast for one-shot and concurrent requests on the local benchmark; small, readable code.
+Clients that let you shape the ClientHello — `curl_cffi` (patched libcurl) and `utls` (Go) —
+ship a patched native library or are a Go package. The ones with nothing extra to install —
+`fetch`/`undici`, `requests`/`httpx` — can't shape it. bun-tls fills that gap for Bun.
 
 ## Test
 
 ```bash
-bun test/all.ts          # offline: crypto, chacha, resumption vs RFC vectors
-bun test/all.ts --live   # + network: handshake, JA3/JA4 echo, POST, resumption
+bun test/all.ts          # offline: crypto, chacha, resumption vs RFC vectors, cookies
+bun test/all.ts --live   # + network: handshake, JA3/JA4 echo, POST, resumption, h2, OCSP, TLS 1.2
 ```
 
 ## License

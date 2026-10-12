@@ -11,7 +11,8 @@
 //     types, curves, point formats), so these match that JA3 and nothing more.
 //
 // fromJa3(targetJa3) reproduces any JA3 the same way, with the same limits.
-// This client speaks HTTP/1.1 only, so presets advertise ALPN http/1.1.
+// Presets advertise ALPN http/1.1 by default; pass http2:true (or add h2 to the ALPN
+// extension) to negotiate HTTP/2.
 import type { Fingerprint } from '../tls/clienthello';
 import { fromJa3 } from './ja3';
 import { dart, chrome131, firefox148, CHROME_SIGALGS } from './fingerprints';
