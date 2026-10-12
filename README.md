@@ -22,8 +22,9 @@ console.log(r.status, r.ja3nHash); // matches the published Chrome 131 JA3N
   ClientHello. The presets reproduce the JA3/JA3N of a given client version (verified
   against an echo server), not every byte of its handshake. `fromJa3()` has even less to
   work with — it rebuilds from a JA3 string, so it matches that JA3 and nothing more.
-- **HTTP/1.1 only.** Browser presets advertise ALPN `http/1.1`. The JA3 still matches
-  (ALPN is not in JA3); the JA4 ALPN byte and the real protocol do not.
+- **HTTP/1.1 by default, HTTP/2 opt-in** (`http2: true`). Browser presets advertise ALPN
+  `http/1.1` unless you opt into h2 (ALPN is not in JA3, so the JA3 matches either way; the
+  JA4 ALPN byte reflects what you advertise).
 - **TLS 1.3 by default; TLS 1.2 is opt-in** (`tls12: true`) for 1.2-only servers —
   ECDHE + AEAD (AES-GCM / ChaCha20-Poly1305) with extended master secret, no CBC or
   static-RSA. The ECDHE groups (X25519, P-256, P-384) are fully negotiable, including via
@@ -199,38 +200,6 @@ bun-tls fills that gap for Bun, at the cost of HTTP/1.1 only.
   or AIA fetch, with responder-signature, CertID-binding and freshness checks; cookie jar with
   Public Suffix List + `__Host-`/`__Secure-` rules.
 - Fast for one-shot and concurrent requests on the local benchmark; small, readable code.
-
-## Limitations
-
-- **TLS 1.2 is opt-in** via `request({ tls12: true })` — ECDHE + AEAD (AES-GCM /
-  ChaCha20-Poly1305), extended master secret, OCSP; no CBC or static-RSA key exchange (so a
-  1.2 server offering *only* those is not reachable — all modern ones offer ECDHE-AEAD). The
-  default is TLS 1.3. **HTTP/2 works** via `request({ http2: true })`
-  — ALPN h2, HPACK, flow control, verified against Cloudflare/Google/nghttp2. Its
-  SETTINGS / WINDOW_UPDATE / pseudo-header order reproduce Chrome's h2 (Akamai) fingerprint
-  `1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p`. `new Session({ http2: true })` keeps one
-  h2 connection per host and **multiplexes** concurrent requests over it; the one-shot
-  `request({ http2: true })` uses a fresh connection. HTTP/1.1 is the default.
-- **Key exchange:** X25519, P-256, P-384, and the post-quantum **X25519MLKEM768** hybrid
-  are negotiated (incl. via HelloRetryRequest). The Chrome/Firefox presets send the ML-KEM
-  share, so they connect to PQC-preferring servers (current Cloudflare/Google). FFDHE groups
-  are advertised for fingerprint fidelity but not implemented (no mainstream server requires
-  them).
-- **From-scratch TLS, not audited.** Certificate verification is implemented and on by
-  default, but review `src/tls/verify.ts` before relying on it where correctness matters.
-- **OCSP revocation is opt-in** (`ocsp: 'off'` by default). `'soft'` is browser-style — a
-  confirmed `revoked` fails, but a missing or `unknown` status is tolerated. `'hard'` requires
-  a good, in-date response (stapled, or fetched from the cert's AIA responder), so it fails on
-  certs that carry no OCSP at all — including current Let's Encrypt, which retired OCSP in 2025.
-  No CRL fallback.
-- Certificate chain path-building anchors at the earliest chain cert signed by a known
-  root (covers legacy cross-signed roots such as GlobalSign R1 / AAA Certificate
-  Services). If verification fails on a host you trust, fix the trust chain — add the
-  missing root to `cacert.pem` — rather than disabling verification.
-- Bulk upload: a large body is streamed in backpressure-paced batches (overlaps encryption
-  with the server read). On localhost, curl's native AES-NI + C socket path still leads raw
-  bulk throughput — a JS + `node:crypto` ceiling, not a design flaw. On a real network,
-  upload is bandwidth-bound and the two tie.
 
 ## Test
 
