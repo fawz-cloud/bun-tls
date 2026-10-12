@@ -71,7 +71,8 @@ s.close();
 ```
 
 `request(options)` → `ClientResponse`: `url`, `method?`, `headers?`, `body?`,
-`fingerprint?`, `proxy?`, `verify?` (default true), `timeoutMs?`. Response adds `ja3`,
+`fingerprint?`, `proxy?`, `verify?` (default true), `ocsp?` (`'off'`\|`'soft'`\|`'hard'`,
+default `'off'`), `timeoutMs?`. Response adds `ja3`,
 `ja3Hash`, `ja3n`, `ja3nHash`, `ja4`, `alpn` on top of `status`, `headers`, `body`,
 `text()`, `json()`.
 
@@ -187,7 +188,9 @@ bun-tls fills that gap for Bun, at the cost of HTTP/1.1 only.
   over one connection via `new Session({ http2: true })`.
 - Optional mutual-TLS servers complete (we answer a CertificateRequest).
 - Certificate verification on by default (CA-constrained chain, hostname + IP SANs, path-building
-  to a bundled root store); cookie jar with Public Suffix List + `__Host-`/`__Secure-` rules.
+  to a bundled root store); optional OCSP revocation (`ocsp: 'soft' | 'hard'`) — stapled response
+  or AIA fetch, with responder-signature, CertID-binding and freshness checks; cookie jar with
+  Public Suffix List + `__Host-`/`__Secure-` rules.
 - Fast for one-shot and concurrent requests on the local benchmark; small, readable code.
 
 ## Limitations
@@ -205,6 +208,11 @@ bun-tls fills that gap for Bun, at the cost of HTTP/1.1 only.
   them).
 - **From-scratch TLS, not audited.** Certificate verification is implemented and on by
   default, but review `src/tls/verify.ts` before relying on it where correctness matters.
+- **OCSP revocation is opt-in** (`ocsp: 'off'` by default). `'soft'` is browser-style — a
+  confirmed `revoked` fails, but a missing or `unknown` status is tolerated. `'hard'` requires
+  a good, in-date response (stapled, or fetched from the cert's AIA responder), so it fails on
+  certs that carry no OCSP at all — including current Let's Encrypt, which retired OCSP in 2025.
+  No CRL fallback.
 - Certificate chain path-building anchors at the earliest chain cert signed by a known
   root (covers legacy cross-signed roots such as GlobalSign R1 / AAA Certificate
   Services). If verification fails on a host you trust, fix the trust chain — add the

@@ -33,7 +33,7 @@ import { buildClientHello } from './clienthello';
 import { AeadDir, plaintextRecord, RecordReader } from './record';
 import type { Transport } from './transport';
 import type { Ticket } from './resumption';
-import { verifyCertificateVerify, verifyChain } from './verify';
+import { verifyCertificateVerify, verifyChain, checkRevocation, type OcspMode } from './verify';
 import crypto from 'node:crypto';
 import zlib from 'node:zlib';
 
@@ -56,6 +56,9 @@ export interface TlsOptions {
 	fingerprint: Fingerprint;
 	/** Verify the server certificate (default true). false = skip (like curl verify=False). */
 	verify?: boolean;
+	/** OCSP revocation check (default 'off'): 'soft' tolerates a missing/unknown status like
+	 *  browsers, 'hard' requires a good stapled-or-fetched response; 'revoked' always fails. */
+	ocsp?: OcspMode;
 	/** Negotiated ALPN read from EncryptedExtensions (informational). */
 	onAlpn?: (proto: string | null) => void;
 	/** Resume from a stored ticket (pre_shared_key). Enables 0-RTT if resume.earlyData. */
@@ -90,6 +93,10 @@ export class TlsClient {
 	ja3n = '';
 	ja3nHash = '';
 	ja4 = '';
+	/** Server certificate chain (DER), leaf first. Empty on a resumed handshake. */
+	peerCertificates: Uint8Array[] = [];
+	/** Stapled OCSP response (DER) from the leaf CertificateEntry, or null. */
+	ocspStaple: Uint8Array | null = null;
 	/** Server accepted our pre_shared_key (resumed handshake). */
 	resumed = false;
 	/** Server accepted our 0-RTT early data (the request was delivered in the CH flight). */
@@ -232,6 +239,7 @@ export class TlsClient {
 
 		// 4) EncryptedExtensions .. server Finished. When resumed, NO Certificate/CertVerify.
 		let certs: Uint8Array[] = [];
+		let staple: Uint8Array | null = null; // stapled OCSP (status_request on the leaf)
 		let cv: { alg: number; sig: Uint8Array } | null = null;
 		let thBeforeCV: Uint8Array = new Uint8Array(0);
 		let eeEarly = false;
@@ -252,9 +260,9 @@ export class TlsClient {
 				eeEarly = ee.earlyData;
 				this.opts.onAlpn?.(this.alpn);
 			} else if (msg.type === HandshakeType.certificate) {
-				certs = parseCertificate(msg.body);
+				({ certs, ocsp: staple } = parseCertificate(msg.body));
 			} else if (msg.type === HandshakeType.compressedCertificate) {
-				certs = parseCompressedCertificate(msg.body); // RFC 8879
+				({ certs, ocsp: staple } = parseCompressedCertificate(msg.body)); // RFC 8879
 			} else if (msg.type === HandshakeType.certificateVerify) {
 				cv = { alg: msg.body.u16(), sig: msg.body.block(2).buf };
 			} else if (msg.type === HandshakeType.certificateRequest) {
@@ -265,10 +273,13 @@ export class TlsClient {
 		}
 
 		// 4b) Certificate verification — only on a full (non-resumed) handshake.
+		this.peerCertificates = certs;
+		this.ocspStaple = staple;
 		if (!pskAccepted && this.opts.verify !== false) {
 			verifyChain(certs, this.opts.host);
 			if (!cv) throw new Error('server did not send CertificateVerify');
 			verifyCertificateVerify(certs[0]!, cv.alg, cv.sig, this.suite.hash, thBeforeCV);
+			await checkRevocation(certs, staple, this.opts.ocsp ?? 'off');
 		}
 		this.resumed = pskAccepted;
 		this.earlyAccepted = sentEarly && eeEarly && pskAccepted;
@@ -481,22 +492,30 @@ function parseNewSessionTicket(r: Reader, hash: HashAlg, resMaster: Uint8Array, 
 	return { identity, psk, hash, cipher, ageAdd, obtainedAt: Date.now(), lifetime, maxEarlyData, alpn };
 }
 
-/** TLS 1.3 Certificate: context(block1) + list(block3 of [cert(block3) ext(block2)]). */
-function parseCertificate(r: Reader): Uint8Array[] {
+/** TLS 1.3 Certificate: context(block1) + list(block3 of [cert(block3) ext(block2)]).
+ *  Captures the leaf CertificateEntry's status_request extension (stapled OCSP). */
+function parseCertificate(r: Reader): { certs: Uint8Array[]; ocsp: Uint8Array | null } {
 	r.block(1); // certificate_request_context
 	const list = r.block(3);
 	const certs: Uint8Array[] = [];
+	let ocsp: Uint8Array | null = null;
 	while (list.rem >= 3) {
 		const cert = list.block(3).buf;
 		certs.push(new Uint8Array(cert)); // copy off the reader buffer
-		list.block(2); // per-cert extensions (ignored)
+		const exts = list.block(2); // per-cert extensions
+		while (exts.rem >= 4) {
+			const t = exts.u16();
+			const eb = exts.block(2);
+			// status_request on the leaf → CertificateStatus { status_type(1=ocsp), OCSPResponse<u24> }
+			if (t === Ext.status_request && certs.length === 1 && ocsp == null && eb.rem >= 4 && eb.u8() === 1) ocsp = new Uint8Array(eb.block(3).buf);
+		}
 	}
-	return certs;
+	return { certs, ocsp };
 }
 
 /** CompressedCertificate (RFC 8879): algorithm(u16) + uncompressed_length(u24) +
  *  compressed Certificate-message body. Decompress, then parse as a normal Certificate. */
-function parseCompressedCertificate(r: Reader): Uint8Array[] {
+function parseCompressedCertificate(r: Reader): { certs: Uint8Array[]; ocsp: Uint8Array | null } {
 	const algo = r.u16();
 	r.u24(); // uncompressed_length (the decompressors size themselves)
 	const compressed = r.block(3).buf;

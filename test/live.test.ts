@@ -7,6 +7,8 @@ import type { Ticket } from '../src/tls/resumption';
 import { fromJa3 } from '../src/fp/ja3';
 import { dart } from '../src/fp/fingerprints';
 import { clients } from '../src/fp/clients';
+import { verifyOcsp, fetchOcsp } from '../src/tls/ocsp';
+import crypto from 'node:crypto';
 
 // 1) example.com → 200 + body, cert verified (default)
 const r = await request({ url: 'https://example.com/', timeoutMs: 15000 });
@@ -121,6 +123,30 @@ assert.ok(ja3nSet.size >= 5, 'client fingerprints distinct (edge==chrome collaps
 	assert.ok(a.status === 200 && b.status === 200 && c.status === 200, 'h2 multiplexed 3 streams on one connection');
 	assert.equal(a.alpn, 'h2', 'session negotiated h2');
 	s2.close();
+}
+
+// 10) OCSP revocation (RFC 6960): stapling + AIA fetch; signature and CertID binding enforced.
+{
+	// soft mode is browser-style: a cert with no OCSP (e.g. current Let's Encrypt) still passes.
+	const soft = await request({ url: 'https://www.cloudflare.com/', ocsp: 'soft', timeoutMs: 20000 });
+	assert.equal(soft.status, 200, 'ocsp soft tolerates a missing OCSP response');
+
+	// A stapling CA: verify the response end to end, and prove the checks actually bite.
+	const tls = await openConnection({ host: 'www.digicert.com', port: 443, timeoutMs: 15000 });
+	const certs = tls.peerCertificates;
+	tls.close();
+	const leaf = new crypto.X509Certificate(Buffer.from(certs[0]!));
+	const issuer = new crypto.X509Certificate(Buffer.from(certs[1]!));
+	const resp = tls.ocspStaple ?? (await fetchOcsp(leaf, issuer)); // stapled, else fetched from AIA
+	assert.ok(resp, 'digicert provides an OCSP response (staple or AIA)');
+	console.log(`ocsp → ${tls.ocspStaple ? 'stapled' : 'fetched'} ${resp!.length}B status=${verifyOcsp(resp!, leaf, issuer)}`);
+	assert.equal(verifyOcsp(resp!, leaf, issuer), 'good', 'OCSP status is good');
+	const bad = Uint8Array.from(resp!);
+	bad[bad.length - 1] ^= 0xff; // flip a signature byte → signature must be rejected
+	assert.throws(() => verifyOcsp(bad, leaf, issuer), 'tampered OCSP signature rejected');
+	assert.throws(() => verifyOcsp(resp!, leaf, leaf), 'OCSP CertID binding enforced (wrong issuer rejected)');
+	const hard = await request({ url: 'https://www.digicert.com/', ocsp: 'hard', timeoutMs: 20000 });
+	assert.equal(hard.status, 200, 'ocsp hard passes on a good, in-date certificate');
 }
 
 console.log('live: OK');

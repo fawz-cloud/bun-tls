@@ -5,6 +5,7 @@ import { openConnection, roundtrip, serializeForEarly, withH2, type ClientRespon
 import type { RequestOptions } from './client';
 import { modern } from '../fp/fingerprints';
 import type { Fingerprint } from '../tls/clienthello';
+import type { OcspMode } from '../tls/verify';
 import type { TlsClient } from '../tls/handshake';
 import { H2Connection } from './h2';
 import { TicketStore } from '../tls/resumption';
@@ -92,6 +93,8 @@ export interface SessionOptions {
 	headers?: Record<string, string>;
 	proxy?: string;
 	verify?: boolean;
+	/** OCSP revocation check (default 'off'): 'soft' tolerates missing, 'hard' requires good. */
+	ocsp?: OcspMode;
 	/** Max redirects to follow (default 10, 0 = don't follow). */
 	maxRedirects?: number;
 	timeoutMs?: number;
@@ -138,6 +141,7 @@ export class Session {
 				proxy: req.proxy ?? this.opts.proxy,
 				fingerprint: req.fingerprint ?? this.opts.fingerprint,
 				verify: req.verify ?? this.opts.verify,
+				ocsp: req.ocsp ?? this.opts.ocsp,
 				timeoutMs: req.timeoutMs ?? this.opts.timeoutMs
 			};
 			const cookieHeader = this.cookies.header(u);

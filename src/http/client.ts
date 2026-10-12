@@ -6,6 +6,7 @@ import { modern } from '../fp/fingerprints';
 import { alpn as alpnExt } from '../tls/extensions';
 import { Ext } from '../core/consts';
 import { TlsClient } from '../tls/handshake';
+import type { OcspMode } from '../tls/verify';
 import type { Ticket } from '../tls/resumption';
 import { HttpResponse, readResponse, serializeRequest } from './http1';
 import { h2Request } from './h2';
@@ -24,6 +25,9 @@ export interface RequestOptions {
 	proxy?: string;
 	/** Verify the server certificate (default true). false = skip. */
 	verify?: boolean;
+	/** OCSP revocation check (default 'off'): 'soft' = browser-style (tolerate missing),
+	 *  'hard' = require a good stapled-or-fetched response. 'revoked' always fails. */
+	ocsp?: OcspMode;
 	/** Negotiate and use HTTP/2 (ALPN h2). Falls back to HTTP/1.1 if the server declines.
 	 *  One-shot only — Session keep-alive is HTTP/1.1. */
 	http2?: boolean;
@@ -60,6 +64,7 @@ export interface OpenOptions {
 	proxy?: string;
 	fingerprint?: Fingerprint;
 	verify?: boolean;
+	ocsp?: OcspMode;
 	timeoutMs?: number;
 	/** Resume from a stored ticket (pre_shared_key); set resume.earlyData for 0-RTT. */
 	resume?: ResumeSpec;
@@ -76,6 +81,7 @@ export async function openConnection(o: OpenOptions): Promise<TlsClient> {
 		host: o.host,
 		fingerprint: o.fingerprint ?? modern(),
 		verify: o.verify,
+		ocsp: o.ocsp,
 		resume: o.resume,
 		earlyData: o.earlyData,
 		onTicket: o.onTicket
@@ -151,7 +157,7 @@ export async function request(opts: RequestOptions): Promise<ClientResponse> {
 	const bodyBytes = typeof opts.body === 'string' ? new Uint8Array(Buffer.from(opts.body)) : opts.body;
 
 	const fingerprint = opts.http2 ? withH2(opts.fingerprint ?? modern()) : opts.fingerprint;
-	const tls = await openConnection({ host, port, proxy: opts.proxy, fingerprint, verify: opts.verify, timeoutMs: opts.timeoutMs });
+	const tls = await openConnection({ host, port, proxy: opts.proxy, fingerprint, verify: opts.verify, ocsp: opts.ocsp, timeoutMs: opts.timeoutMs });
 	const timer = opts.timeoutMs ? setTimeout(() => tls.close(), opts.timeoutMs) : null;
 	try {
 		// Use HTTP/2 only if the server actually selected it via ALPN; otherwise HTTP/1.1.

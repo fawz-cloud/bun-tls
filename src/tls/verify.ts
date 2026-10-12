@@ -11,6 +11,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { HashAlg, sha } from '../core/crypto';
 import { concat } from '../core/bytes';
+import { verifyOcsp, fetchOcsp } from './ocsp';
 
 // Trust store = Bun's built-in roots (tls.rootCertificates, often incomplete)
 // UNION the bundled Mozilla cacert.pem (scratch/bun-tls/cacert.pem). Roots are
@@ -112,6 +113,37 @@ export function verifyChain(certsDer: Uint8Array[], host: string, now = new Date
 		validUntil = Math.min(validUntil, to);
 	}
 	chainCache.set(key, validUntil);
+}
+
+export type OcspMode = 'off' | 'soft' | 'hard';
+
+/**
+ * OCSP revocation check (RFC 6960). `staple` is the response the server sent in the
+ * Certificate message (null if none). In 'soft' mode a missing/unknown status is
+ * tolerated (what browsers do); in 'hard' mode a good, in-date response is required.
+ * A confirmed `revoked` always throws, in either mode. On 'hard' with no staple we
+ * fall back to the leaf's AIA responder over HTTP.
+ *
+ * certsDer[0] = leaf, certsDer[1] = its issuer (needed to key the CertID). Call only on
+ * a full (non-resumed) handshake, after verifyChain has established the chain is trusted.
+ */
+export async function checkRevocation(certsDer: Uint8Array[], staple: Uint8Array | null, mode: OcspMode): Promise<void> {
+	if (mode === 'off') return;
+	if (certsDer.length < 2) {
+		if (mode === 'hard') throw new Error('OCSP: issuer certificate not sent, cannot check revocation');
+		return; // soft: no issuer → nothing to key the request on
+	}
+	const leaf = new crypto.X509Certificate(Buffer.from(certsDer[0]!));
+	const issuer = new crypto.X509Certificate(Buffer.from(certsDer[1]!));
+	let response = staple;
+	if (!response && mode === 'hard') response = await fetchOcsp(leaf, issuer);
+	if (!response) {
+		if (mode === 'hard') throw new Error('OCSP: no stapled response and the AIA fetch failed');
+		return; // soft-fail, like browsers when the responder is unreachable
+	}
+	const status = verifyOcsp(response, leaf, issuer);
+	if (status === 'revoked') throw new Error(`certificate revoked (OCSP): ${leaf.subject}`);
+	if (status === 'unknown' && mode === 'hard') throw new Error('OCSP: responder returned status unknown for this certificate');
 }
 
 /** TLS sigalg → crypto.verify options. */
