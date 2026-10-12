@@ -193,9 +193,10 @@ bun-tls fills that gap for Bun, at the cost of HTTP/1.1 only.
   root (covers legacy cross-signed roots such as GlobalSign R1 / AAA Certificate
   Services). If verification fails on a host you trust, fix the trust chain — add the
   missing root to `cacert.pem` — rather than disabling verification.
-- Bulk upload on localhost trails curl's native stack by roughly 1.5–2× (node:crypto
-  per-record + Bun's socket path vs C). On a real network, upload is bandwidth-bound and
-  they tie.
+- Bulk upload: a large body is streamed in backpressure-paced batches (overlaps encryption
+  with the server read). On localhost, curl's native AES-NI + C socket path still leads raw
+  bulk throughput — a JS + `node:crypto` ceiling, not a design flaw. On a real network,
+  upload is bandwidth-bound and the two tie.
 
 ## Test
 

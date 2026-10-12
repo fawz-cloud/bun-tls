@@ -296,9 +296,20 @@ export class TlsClient {
 	writeApp(data: Uint8Array): void {
 		if (!this.appMode) throw new Error('handshake not finished');
 		// TLSInnerPlaintext ≤ 2^14 (content + 1 type byte) → fragment at 16383 bytes/record.
-		// All records go into one buffer and one socket write: measured faster than batching
-		// into several writes (Bun's write path favours fewer, larger buffers).
+		// One buffer, one socket write — lowest latency for small/medium writes.
 		if (data.length) this.t.write(this.appWrite.encryptMany(ContentType.applicationData, data, 16384 - 1));
+	}
+
+	/** Streaming upload for a large body: encrypt a batch, await it onto the socket (which
+	 *  yields to the event loop), then encrypt the next. The peer drains batch k while we
+	 *  encrypt batch k+1 — overlaps CPU with I/O and paces to backpressure. */
+	async writeAppStream(data: Uint8Array): Promise<void> {
+		if (!this.appMode) throw new Error('handshake not finished');
+		const BATCH = 16383 * 16; // ~256 KB of plaintext per flush
+		for (let off = 0; off < data.length; off += BATCH) {
+			const chunk = data.subarray(off, off + BATCH);
+			await this.t.writeAsync(this.appWrite.encryptMany(ContentType.applicationData, chunk, 16384 - 1));
+		}
 	}
 
 	/** Decrypted application data. NewSessionTicket → onTicket; KeyUpdate ignored. null = EOF. */

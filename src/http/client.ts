@@ -105,10 +105,14 @@ export function serializeForEarly(o: RoundtripOptions): Uint8Array {
  *  `alreadySent` (the request went out as 0-RTT early data), skip the write and just read. */
 export async function roundtrip(tls: TlsClient, o: RoundtripOptions, alreadySent = false): Promise<ClientResponse> {
 	if (!alreadySent) {
-		// Write head and body separately — avoids copying a large body just to prepend the
-		// header (writeApp fragments the body into records; the body is only viewed, not copied).
+		// Head and body written separately (no big copy to prepend the header). A large body
+		// streams in backpressure-paced batches so it pipelines with the server's read; a
+		// small one goes in a single write for lowest latency.
 		tls.writeApp(serializeRequest({ method: o.method, host: o.host, path: o.path, headers: rtHeaders(o) }));
-		if (o.body && o.body.length) tls.writeApp(o.body);
+		if (o.body && o.body.length) {
+			if (o.body.length > 256 * 1024) await tls.writeAppStream(o.body);
+			else tls.writeApp(o.body);
+		}
 	}
 	const res = await readResponse(() => tls.readApp(), o.method);
 	return Object.assign(res, {

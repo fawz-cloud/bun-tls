@@ -6,6 +6,10 @@ import { concat } from '../core/bytes';
 
 export interface Transport {
 	write(b: Uint8Array): void;
+	/** Write and resolve once the kernel has accepted everything queued (backpressure-aware).
+	 *  Awaiting it between chunks yields to the event loop, so the peer reads while we
+	 *  prepare the next chunk — lets a large upload pipeline instead of blocking. */
+	writeAsync(b: Uint8Array): Promise<void>;
 	/** null = EOF / closed. */
 	read(): Promise<Uint8Array | null>;
 	close(): void;
@@ -64,6 +68,7 @@ async function rawConnect(host: string, port: number): Promise<RawConn> {
 	// rest must wait for `drain`. Ignoring this drops bytes on large writes (e.g. a
 	// 10MB upload → hundreds of records) → the server sees a truncated body. FIFO.
 	const outQ: Uint8Array[] = [];
+	let drainWaiters: (() => void)[] = [];
 	let sock!: BunSock;
 	const flush = () => {
 		while (outQ.length) {
@@ -71,9 +76,15 @@ async function rawConnect(host: string, port: number): Promise<RawConn> {
 			const n = sock.write(b);
 			if (n < b.length) {
 				outQ[0] = b.subarray(n); // partial — keep remainder, resume on drain
-				break;
+				return;
 			}
 			outQ.shift();
+		}
+		// fully flushed → wake anyone awaiting backpressure relief
+		if (drainWaiters.length) {
+			const w = drainWaiters;
+			drainWaiters = [];
+			for (const f of w) f();
 		}
 	};
 	sock = (await Bun.connect({
@@ -85,7 +96,7 @@ async function rawConnect(host: string, port: number): Promise<RawConn> {
 				q.push(new Uint8Array(data)); // Bun reuses the buffer → copy
 			},
 			drain() {
-				flush();
+				flush(); // socket writable again → push queued bytes, wake waiters
 			},
 			close() {
 				if (!closed) {
@@ -107,6 +118,12 @@ async function rawConnect(host: string, port: number): Promise<RawConn> {
 		write(b) {
 			outQ.push(b);
 			flush();
+		},
+		writeAsync(b) {
+			outQ.push(b);
+			flush();
+			if (!outQ.length) return Promise.resolve(); // accepted immediately, no backpressure
+			return new Promise<void>((res) => drainWaiters.push(res));
 		},
 		read: () => q.read(),
 		close() {
@@ -157,5 +174,5 @@ export async function proxyConnect(proxyUrl: string, targetHost: string, targetP
 		throw new Error(`proxy CONNECT failed: ${head.split('\r\n')[0]}`);
 	}
 	conn.q.unshift(buf.subarray(sep + 4)); // bytes the server already sent
-	return { write: conn.write, read: conn.read, close: conn.close };
+	return { write: conn.write, writeAsync: conn.writeAsync, read: conn.read, close: conn.close };
 }
