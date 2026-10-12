@@ -20,7 +20,8 @@ import {
 	earlySecret,
 	resumptionMaster,
 	resumptionPsk,
-	clientEarlyTraffic
+	clientEarlyTraffic,
+	updateTraffic
 } from '../core/crypto';
 import { chacha20Poly1305 } from '../core/chacha';
 import type { Fingerprint, ResumeSpec } from './clienthello';
@@ -71,6 +72,9 @@ export class TlsClient {
 	private appRead!: AeadDir;
 	private appWrite!: AeadDir;
 	private appMode = false;
+	// current application_traffic_secret per direction, for KeyUpdate rotation
+	private sApSecret!: Uint8Array;
+	private cApSecret!: Uint8Array;
 	// Resumption master secret + its suite, for deriving PSKs from NewSessionTickets.
 	private resMaster: Uint8Array | null = null;
 	private resHash: HashAlg = 'sha256';
@@ -207,6 +211,7 @@ export class TlsClient {
 		let cv: { alg: number; sig: Uint8Array } | null = null;
 		let thBeforeCV: Uint8Array = new Uint8Array(0);
 		let eeEarly = false;
+		let certReqContext: Uint8Array | null = null; // set if the server asks for a client cert
 		for (;;) {
 			const msg = await this.nextHandshakeMsg(true);
 			if (!msg) throw new Error('connection closed before server Finished');
@@ -226,6 +231,8 @@ export class TlsClient {
 				certs = parseCertificate(msg.body);
 			} else if (msg.type === HandshakeType.certificateVerify) {
 				cv = { alg: msg.body.u16(), sig: msg.body.block(2).buf };
+			} else if (msg.type === HandshakeType.certificateRequest) {
+				certReqContext = new Uint8Array(msg.body.block(1).buf); // echo this in our Certificate
 			}
 			this.addTranscript(msg.raw);
 			if (msg.type === HandshakeType.certificate) thBeforeCV = this.th(); // CV hash = up to Certificate
@@ -254,6 +261,20 @@ export class TlsClient {
 			this.t.write(earlyWrite!.encrypt(ContentType.handshake, eoed));
 			this.addTranscript(eoed);
 		}
+		// Client Certificate when asked (RFC 8446 §4.4.2). We hold no client cert, so send an
+		// empty list: servers doing optional mTLS proceed; ones that require a cert fail cleanly
+		// instead of hanging on a missing message.
+		if (certReqContext !== null) {
+			const cert = new Writer()
+				.u8(HandshakeType.certificate)
+				.block(3, (w) => {
+					w.block(1, (ctx) => ctx.bytes(certReqContext!)); // echo certificate_request_context
+					w.block(3, () => {}); // empty certificate_list
+				})
+				.build();
+			this.t.write(this.writeDir!.encrypt(ContentType.handshake, cert));
+			this.addTranscript(cert);
+		}
 		const verify = finishedVerify(this.suite.hash, this.sched.cHs, this.th());
 		const finMsg = new Writer().u8(HandshakeType.finished).block(3, (w) => w.bytes(verify)).build();
 		this.t.write(this.writeDir!.encrypt(ContentType.handshake, finMsg));
@@ -262,6 +283,8 @@ export class TlsClient {
 		// 7) Switch to app keys; compute resumption master for future NewSessionTickets.
 		this.appRead = new AeadDir(this.suite.aead(sAp.key), sAp.iv);
 		this.appWrite = new AeadDir(this.suite.aead(cAp.key), cAp.iv);
+		this.sApSecret = app.sAp;
+		this.cApSecret = app.cAp;
 		this.appMode = true;
 		this.resMaster = resumptionMaster(this.suite.hash, this.sched.master, this.th());
 		this.resHash = this.suite.hash;
@@ -329,18 +352,38 @@ export class TlsClient {
 		}
 	}
 
-	/** Post-handshake messages: capture NewSessionTicket as a resumption ticket; ignore
-	 *  KeyUpdate. Parses whole messages within one record (tickets are small). */
+	/** Post-handshake messages: capture NewSessionTicket (resumption) and honor KeyUpdate
+	 *  (rotate traffic keys). Parses whole messages within one record. */
 	private onPostHandshake(data: Uint8Array): void {
-		if (!this.opts.onTicket || !this.resMaster) return;
 		const r = new Reader(data);
 		while (r.rem >= 4) {
 			const type = r.u8();
 			const body = r.block(3);
 			if (type === HandshakeType.newSessionTicket) {
-				const t = parseNewSessionTicket(body, this.resHash, this.resMaster, this.resCipher, this.alpn);
-				if (t) this.opts.onTicket(t);
+				if (this.opts.onTicket && this.resMaster) {
+					const t = parseNewSessionTicket(body, this.resHash, this.resMaster, this.resCipher, this.alpn);
+					if (t) this.opts.onTicket(t);
+				}
+			} else if (type === HandshakeType.keyUpdate) {
+				this.handleKeyUpdate(body.rem >= 1 ? body.u8() : 0);
 			}
+		}
+	}
+
+	/** KeyUpdate (RFC 8446 §7.2): the server rotated its write key, so rotate our read key.
+	 *  If it requested an update, reply with our own KeyUpdate and rotate our write key too
+	 *  (reply encrypted with the OLD write key, then swap). */
+	private handleKeyUpdate(requested: number): void {
+		const h = this.suite.hash;
+		this.sApSecret = updateTraffic(h, this.sApSecret);
+		const sk = trafficKey(h, this.sApSecret, this.suite.keyLen);
+		this.appRead = new AeadDir(this.suite.aead(sk.key), sk.iv);
+		if (requested === 1) {
+			const msg = new Writer().u8(HandshakeType.keyUpdate).block(3, (w) => w.u8(0)).build();
+			this.t.write(this.appWrite.encrypt(ContentType.handshake, msg));
+			this.cApSecret = updateTraffic(h, this.cApSecret);
+			const ck = trafficKey(h, this.cApSecret, this.suite.keyLen);
+			this.appWrite = new AeadDir(this.suite.aead(ck.key), ck.iv);
 		}
 	}
 

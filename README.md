@@ -56,8 +56,9 @@ await request({
   fingerprint: fromJa3('771,4865-4866-4867-49195-49199-49196-49200-52393-52392-49171-49172-156-157-47-53,0-23-65281-10-11-16-5-13-18-51-45-43-27,29-23-24,0', { grease: true }),
 });
 
-// through a proxy, verification off (only for hosts you trust)
-await request({ url: 'https://host/', proxy: 'http://user:pass@host:8080', verify: false });
+// through a proxy — HTTP CONNECT or SOCKS5
+await request({ url: 'https://host/', proxy: 'http://user:pass@host:8080' });
+await request({ url: 'https://host/', proxy: 'socks5://user:pass@host:1080' });
 
 // a session: cookies, redirects, keep-alive, resumption
 const s = new Session();
@@ -174,8 +175,10 @@ bun-tls fills that gap for Bun, at the cost of HTTP/1.1 only.
 - Control over JA3 / JA4; presets whose JA3/JA3N match published Chrome 131 / Firefox 148
   / dart:io values, plus `fromJa3()` for anything else.
 - No additional native dependency — a TypeScript source tree on Bun.
-- Keep-alive, 1-RTT resumption, optional 0-RTT (RFC 8448-checked key schedule).
-- ECDHE over X25519 / P-256 / P-384, with HelloRetryRequest handled.
+- Keep-alive, 1-RTT resumption, optional 0-RTT (RFC 8448-checked key schedule),
+  post-handshake KeyUpdate, and HelloRetryRequest — all handled.
+- ECDHE over X25519 / P-256 / P-384; HTTP and SOCKS5 proxies; gzip/deflate/br/zstd.
+- Optional mutual-TLS servers complete (we answer a CertificateRequest).
 - Certificate verification on by default, with chain path-building to a bundled root store.
 - Fast for one-shot and concurrent requests on the local benchmark; small, readable code.
 

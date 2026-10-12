@@ -36,7 +36,7 @@ const DEFAULT_HEADERS = (host: string): Record<string, string> => ({
 	Host: host,
 	'User-Agent': 'bun-tls/0.1',
 	Accept: '*/*',
-	'Accept-Encoding': 'gzip, deflate, br'
+	'Accept-Encoding': 'gzip, deflate, br, zstd'
 });
 
 export interface OpenOptions {

@@ -71,6 +71,7 @@ function dechunk(b: Uint8Array): Uint8Array {
 function decompress(body: Uint8Array, enc?: string | string[]): Uint8Array {
 	const e = (Array.isArray(enc) ? enc.join(',') : enc ?? '').toLowerCase();
 	try {
+		if (e.includes('zstd') && typeof zlib.zstdDecompressSync === 'function') return new Uint8Array(zlib.zstdDecompressSync(body));
 		if (e.includes('br')) return new Uint8Array(zlib.brotliDecompressSync(body));
 		if (e.includes('gzip')) return new Uint8Array(zlib.gunzipSync(body));
 		if (e.includes('deflate')) return new Uint8Array(zlib.inflateSync(body));

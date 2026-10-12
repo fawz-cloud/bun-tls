@@ -87,8 +87,10 @@ Layers: `core/` (bytes + crypto primitives) → `tls/` (handshake, records, cert
 - TLS 1.2 (we advertise supported_versions = 1.3 only; impersonation targets are 1.3).
 - HTTP/2 (dart:io is h1; add later if a target needs it).
 - ML-KEM / FFDHE key exchange (advertised for the fingerprint, not implemented).
-- (done) Keep-alive, TLS session resumption (PSK), 0-RTT early data, HelloRetryRequest —
-  all in place; resumption/0-RTT key schedule validated vs RFC 8448 §4.
+- OCSP / CRL revocation (needs an ASN.1 OCSP stack; browsers soft-fail it anyway).
+- (done) Keep-alive, TLS session resumption (PSK), 0-RTT early data, HelloRetryRequest,
+  post-handshake KeyUpdate, optional-mTLS (empty client Certificate), HTTP+SOCKS5 proxy,
+  gzip/deflate/br/zstd. Resumption/0-RTT key schedule validated vs RFC 8448 §4.
 - Cross-sign path building beyond "earliest chain cert signed by a known root" (covers
   GlobalSign R1 / AAA Certificate Services legacy tops; other paths fail verification —
   fix by adding the missing root to `cacert.pem`, not by disabling verification).

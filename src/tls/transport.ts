@@ -141,9 +141,58 @@ async function rawConnect(host: string, port: number): Promise<RawConn> {
 
 export const tcpConnect = (host: string, port: number): Promise<Transport> => rawConnect(host, port);
 
-/** Tunnel through an HTTP proxy: CONNECT host:port, read 200, push back any
- *  leftover bytes. `proxyUrl` = http://[user:pass@]host:port. TLS runs on top. */
+/** Read exactly `n` bytes from a raw connection, buffering across chunks; any surplus is
+ *  pushed back for the next reader. */
+async function readExact(conn: RawConn, n: number): Promise<Uint8Array> {
+	let buf: Uint8Array = new Uint8Array(0);
+	while (buf.length < n) {
+		const c = await conn.read();
+		if (c === null) throw new Error('connection closed mid-read');
+		buf = buf.length ? concat(buf, c) : c;
+	}
+	if (buf.length > n) conn.q.unshift(buf.subarray(n));
+	return buf.subarray(0, n);
+}
+
+/** SOCKS5 proxy (RFC 1928, + RFC 1929 user/pass). The hostname is sent to the proxy to
+ *  resolve (socks5h semantics). `proxyUrl` = socks5://[user:pass@]host:port. TLS on top. */
+export async function socks5Connect(proxyUrl: string, targetHost: string, targetPort: number): Promise<Transport> {
+	const pu = new URL(proxyUrl);
+	const conn = await rawConnect(pu.hostname, Number(pu.port || 1080));
+	const user = pu.username ? decodeURIComponent(pu.username) : '';
+	const pass = pu.password ? decodeURIComponent(pu.password) : '';
+	// greeting: offer no-auth, plus user/pass when credentials are present
+	const methods = user ? [0x00, 0x02] : [0x00];
+	conn.write(Uint8Array.of(0x05, methods.length, ...methods));
+	const sel = await readExact(conn, 2);
+	if (sel[0] !== 0x05) throw new Error('socks5: unexpected version 0x' + sel[0]!.toString(16));
+	if (sel[1] === 0x02) {
+		const u = Buffer.from(user);
+		const p = Buffer.from(pass);
+		conn.write(concat(Uint8Array.of(0x01, u.length), new Uint8Array(u), Uint8Array.of(p.length), new Uint8Array(p)));
+		const auth = await readExact(conn, 2);
+		if (auth[1] !== 0x00) throw new Error('socks5: authentication failed');
+	} else if (sel[1] !== 0x00) {
+		throw new Error('socks5: no acceptable auth method (0x' + sel[1]!.toString(16) + ')');
+	}
+	// CONNECT by domain name (ATYP 0x03) so the proxy resolves it
+	const host = Buffer.from(targetHost);
+	conn.write(
+		concat(Uint8Array.of(0x05, 0x01, 0x00, 0x03, host.length), new Uint8Array(host), Uint8Array.of((targetPort >> 8) & 0xff, targetPort & 0xff))
+	);
+	const rep = await readExact(conn, 4); // VER REP RSV ATYP
+	if (rep[1] !== 0x00) throw new Error('socks5 CONNECT failed: reply 0x' + rep[1]!.toString(16));
+	const atyp = rep[3];
+	const addrLen = atyp === 0x01 ? 4 : atyp === 0x04 ? 16 : atyp === 0x03 ? (await readExact(conn, 1))[0]! : 0;
+	await readExact(conn, addrLen + 2); // BND.ADDR + BND.PORT (ignored)
+	return { write: conn.write, writeAsync: conn.writeAsync, read: conn.read, close: conn.close };
+}
+
+/** Tunnel through a proxy and return a byte transport for TLS to run on. Dispatches by
+ *  scheme: `socks5://`/`socks5h://` → SOCKS5, otherwise HTTP `CONNECT`.
+ *  `proxyUrl` = http|socks5://[user:pass@]host:port. */
 export async function proxyConnect(proxyUrl: string, targetHost: string, targetPort: number): Promise<Transport> {
+	if (/^socks/i.test(proxyUrl)) return socks5Connect(proxyUrl, targetHost, targetPort);
 	const pu = new URL(proxyUrl);
 	const conn = await rawConnect(pu.hostname, Number(pu.port || 80));
 	const authority = `${targetHost}:${targetPort}`;

@@ -106,6 +106,11 @@ export function pskBinder(h: HashAlg, bKey: Uint8Array, truncatedTranscript: Uin
 export const clientEarlyTraffic = (h: HashAlg, early: Uint8Array, transcriptCH: Uint8Array): Uint8Array =>
 	deriveSecret(h, early, 'c e traffic', transcriptCH);
 
+/** application_traffic_secret_N+1 = HKDF-Expand-Label(secret, "traffic upd", "", Hash.len)
+ *  — the post-handshake KeyUpdate rotation (RFC 8446 §7.2). */
+export const updateTraffic = (h: HashAlg, secret: Uint8Array): Uint8Array =>
+	expandLabel(h, secret, 'traffic upd', new Uint8Array(0), hashLen(h));
+
 // ── X25519 ────────────────────────────────────────────────────────────────────
 const X25519_SPKI_PREFIX = Buffer.from('302a300506032b656e032100', 'hex');
 
