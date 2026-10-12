@@ -36,6 +36,10 @@ console.log(r.status, r.json(), r.ja3, r.ja4);
 // impersonate a browser fingerprint
 await request({ url: 'https://example.com/', fingerprint: clients.firefox() });
 
+// …or a coherent persona: TLS + HTTP/2 + header order + User-Agent all match one browser,
+// and the raw JA3 rotates each request so there is no fixed JA3 to block-list
+await request({ url: 'https://example.com/', persona: 'chrome' });
+
 // HTTP/2, TLS 1.2, a raw JA3, a proxy
 await request({ url: 'https://nghttp2.org/', http2: true });
 await request({ url: 'https://tls-v1-2.badssl.com:1012/', tls12: true });
@@ -51,6 +55,11 @@ s.close();
 
 ## Features
 
+- **Coherent personas** — `persona: 'chrome'` sets the TLS fingerprint, the HTTP/2 (Akamai)
+  fingerprint, and the HTTP header order + User-Agent to **one matching browser**, and rotates
+  the raw JA3 every connection so there is no fixed JA3 to block-list. That cross-layer match —
+  TLS *and* h2 *and* headers agreeing — is exactly what anti-bot WAFs check, and what most
+  fingerprint-spoofing clients get wrong. ([details](DOCS.md#personas))
 - **Fingerprint control** — JA3 / JA3N / JA4 computed from the ClientHello actually sent;
   presets whose JA3/JA3N match published Chrome 131 / Firefox 148 / dart:io, plus
   `fromJa3()` for anything else.

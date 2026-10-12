@@ -40,6 +40,7 @@ via a patched libcurl (C); we do it in TS.
 | `tls/transport.ts` | Bun.connect byte stream + HTTP proxy CONNECT |
 | `fp/fingerprints.ts` | presets (`modern`, `dart`, faithful `chrome131`, `firefox148`) |
 | `fp/clients.ts` | named registry: `clients.{chrome,edge,firefox,dart,safari,okhttp}` |
+| `fp/personas.ts` | coherent personas (TLS + h2 + header order + UA per browser) |
 | `fp/ja3.ts` | `fromJa3(string)` → Fingerprint (impersonate from a JA3) |
 | `http/http1.ts` | HTTP/1.1 serialize/parse + gzip/deflate/br/zstd |
 | `http/h2.ts` | HTTP/2: frames + HPACK + flow control + multiplexed `H2Connection` |
@@ -99,7 +100,9 @@ Layers: `core/` (bytes + crypto primitives) → `tls/` (handshake, records, cert
   control + Chrome h2 fingerprint + Session multiplexing), OCSP revocation (RFC 6960:
   stapling + AIA fetch, own minimal DER codec in `tls/asn1.ts`), TLS 1.2 (opt-in `tls12`:
   ECDHE + AEAD AES-GCM/ChaCha20-Poly1305, extended master secret, ServerKeyExchange-signature
-  verify; `tls/handshake12.ts`). Resumption/0-RTT key schedule validated vs RFC 8448 §4; the
+  verify; `tls/handshake12.ts`), coherent **personas** (`persona:` — one browser identity
+  across TLS fingerprint + HTTP/2 Akamai profile + header order + User-Agent; per-connection
+  JA3 rotation so no fixed JA3 to block-list; `fp/personas.ts`). Resumption/0-RTT key schedule validated vs RFC 8448 §4; the
   TLS 1.2 PRF vs a known test vector; cert verify enforces CA issuer + IP SANs; OCSP verifies the
   responder signature + CertID binding + freshness; failed handshakes close the socket.
 - Cross-sign path building beyond "earliest chain cert signed by a known root" (covers

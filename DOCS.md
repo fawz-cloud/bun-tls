@@ -80,6 +80,7 @@ One request over one fresh connection (`Connection: close`). For connection reus
 | `headers` | `Record<string,string>` | see below | merged over the defaults |
 | `body` | `string \| Uint8Array` | — | sets `Content-Length` |
 | `fingerprint` | `Fingerprint` | `modern()` | see [Fingerprints](#fingerprints) |
+| `persona` | `string \| Persona` | — | coherent browser identity (TLS + h2 + headers), see [Personas](#personas) |
 | `verify` | `boolean` | `true` | `false` skips certificate verification (like curl `-k`) |
 | `ocsp` | `'off' \| 'soft' \| 'hard'` | `'off'` | revocation check, see [OCSP](#certificate-verification--ocsp) |
 | `tls12` | `boolean` | `false` | speak TLS 1.2 instead of 1.3 |
@@ -137,6 +138,7 @@ fast path: subsequent requests to the same host skip the handshake.
 | field | type | default | notes |
 |---|---|---|---|
 | `fingerprint` | `Fingerprint` | `modern()` | |
+| `persona` | `string \| Persona` | — | coherent browser identity, see [Personas](#personas) |
 | `headers` | `Record<string,string>` | — | sent on every request |
 | `proxy` | `string` | — | |
 | `verify` | `boolean` | `true` | |
@@ -256,6 +258,62 @@ Extension builders (`import { ext } from './src'`), each `ext.<name>()`:
 `compressCertificate(algos=[2])`, `signedCertTimestamp`, `recordSizeLimit(limit=0x4001)`,
 `applicationSettings(protocols=['h2'], newCodepoint=false)`, `encryptedClientHelloGrease`,
 `delegatedCredentials(algs)`, `grease(type, body?)`.
+
+---
+
+## Personas
+
+A **persona** is one coherent browser identity across *every* fingerprinting layer at once:
+the TLS ClientHello (JA3/JA4), the HTTP/2 (Akamai) fingerprint, **and** the HTTP header set +
+order + User-Agent — all from one source. This is what sets bun-tls apart: anti-bot WAFs no
+longer just check JA3, they check whether the layers *agree*. A Chrome JA3 sent with a
+non-Chrome header order, or a `curl` User-Agent over a browser TLS fingerprint, is the exact
+tell that catches most fingerprint-spoofing clients (curl_cffi included). A persona makes them
+match.
+
+```ts
+import { request, Session } from './src';
+
+await request({ url, persona: 'chrome' });          // TLS + h2 + headers + UA all Chrome 131
+const s = new Session({ persona: 'firefox' });       // every request is coherent Firefox 148
+```
+
+| persona | TLS | h2 (Akamai) | headers / UA |
+|---|---|---|---|
+| `chrome` | Chrome 131 (permuted) | `…\|15663105\|0\|m,a,s,p` | Chrome order, `sec-ch-ua`, Chrome UA |
+| `edge` | = Chrome 131 | = Chrome | Edge `sec-ch-ua` + UA |
+| `firefox` | Firefox 148 | `…\|12517377\|0\|m,p,a,s` | Firefox order (no `sec-ch-ua`), Firefox UA |
+| `safari` | Safari (JA3 rebuild) | `…\|10485760\|0\|m,s,p,a` | Safari order, Safari UA |
+
+### Two properties that matter
+
+- **Cross-layer coherence.** The TLS, h2 and HTTP layers all describe the *same* browser. Each
+  persona ships the real header order and the real h2 fingerprint for that browser, not a
+  one-size-fits-all default.
+- **Per-connection JA3 rotation (anti-block-list).** Chrome and Edge permute their TLS
+  extensions and rotate GREASE every connection — exactly as the real browsers do — so the
+  **raw JA3 differs on every request** while the JA3N (the sorted "shape") stays a valid
+  Chrome. There is no single JA3 string for a WAF to block-list. (Firefox/Safari keep a fixed
+  order, matching the real clients.)
+
+```ts
+const a = await request({ url, persona: 'chrome' });
+const b = await request({ url, persona: 'chrome' });
+a.ja3Hash !== b.ja3Hash;   // true  — different raw JA3 each time
+a.ja3nHash === b.ja3nHash;  // true  — both are Chrome 131
+```
+
+### API
+
+- `request({ persona })` / `new Session({ persona })` — a name
+  (`'chrome' | 'edge' | 'firefox' | 'safari'`) or a `Persona` object.
+- An explicit `fingerprint`, `http2` or `headers` still overrides the persona's.
+- `personas` — the registry (`personas.chrome()` → `Persona`).
+- `randomPersona()` — a uniform random persona, for rotating identities across requests.
+- `resolvePersona(name | persona)`, `personaHeaders(persona)` — helpers.
+
+A `Persona` is `{ name, fingerprint(), http2, h2Profile, headers: [name, value][] }` — build
+your own to pin a specific OS/version, or tweak a registry one.
 
 ---
 
@@ -468,19 +526,20 @@ Everything below is re-exported from `./src` (`index.ts`):
 | `request` | fn | one-shot request |
 | `Session`, `CookieJar` | class | stateful client + cookie jar |
 | `clients`, `JA3` | const | named presets + reference JA3 strings |
+| `personas`, `resolvePersona`, `randomPersona`, `personaHeaders` | const/fn | coherent browser personas |
 | `presets`, `modern`, `dart`, `chrome131`, `firefox148`, `tls12` | fn | raw `Fingerprint` presets |
 | `fromJa3`, `DEFAULT_SIGALGS` | fn/const | build a fingerprint from a JA3 |
 | `buildClientHello`, `ja3FromClientHello`, `ja4FromClientHello` | fn | assemble / inspect a ClientHello |
 | `TlsClient`, `Tls12Client`, `TlsConn` | class/type | handshake state machines |
 | `verifyOcsp`, `fetchOcsp`, `ocspUrl`, `checkRevocation` | fn | OCSP |
-| `h2Request`, `H2Connection`, `CHROME_H2` | fn/class/const | HTTP/2 |
+| `h2Request`, `H2Connection`, `CHROME_H2`, `FIREFOX_H2`, `SAFARI_H2` | fn/class/const | HTTP/2 + per-browser h2 profiles |
 | `publicSuffix`, `registrableDomain`, `isPublicSuffix` | fn | Public Suffix List |
 | `tcpConnect`, `proxyConnect`, `socks5Connect`, `Transport` | fn/type | transport |
 | `ext` | namespace | extension builders |
 | `consts` | namespace | IANA numbers (below) |
 
 Types: `RequestOptions`, `ClientResponse`, `SessionOptions`, `Fingerprint`, `FromJa3Opts`,
-`OcspMode`, `OcspStatus`, `H2Request`, `H2Profile`, `TlsConn`.
+`Persona`, `OcspMode`, `OcspStatus`, `H2Request`, `H2Profile`, `TlsConn`.
 
 `consts` holds `ContentType`, `HandshakeType`, `Ext`, `Cipher`, `Cipher12`, `Group`,
 `SigAlg`, `TLS12`, `TLS13`, `GREASE`, `isGrease`.

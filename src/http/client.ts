@@ -3,6 +3,7 @@
 // openConnection + roundtrip are the reusable pieces Session uses for keep-alive.
 import type { Fingerprint, ResumeSpec } from '../tls/clienthello';
 import { modern, tls12 as tls12Fp } from '../fp/fingerprints';
+import { resolvePersona, personaHeaders, type Persona } from '../fp/personas';
 import { alpn as alpnExt } from '../tls/extensions';
 import { Ext } from '../core/consts';
 import { TlsClient, type TlsConn } from '../tls/handshake';
@@ -20,6 +21,10 @@ export interface RequestOptions {
 	headers?: Record<string, string>;
 	body?: string | Uint8Array;
 	fingerprint?: Fingerprint;
+	/** A coherent browser identity: sets the TLS fingerprint, HTTP/2, and the real header
+	 *  set + order + User-Agent together. A name ('chrome'|'edge'|'firefox'|'safari') or a
+	 *  Persona. An explicit `fingerprint`/`http2`/`headers` still override the persona's. */
+	persona?: string | Persona;
 	/** Total timeout (ms). */
 	timeoutMs?: number;
 	/** HTTP proxy: http://[user:pass@]host:port (CONNECT tunnel). */
@@ -114,14 +119,15 @@ export interface RoundtripOptions {
 	body?: Uint8Array;
 	/** Advertise Connection: keep-alive (reuse) vs close. */
 	keepAlive: boolean;
+	/** Persona-supplied base headers (Host + browser-realistic order). When set it replaces
+	 *  the generic defaults, so the persona's header order is preserved on the wire. */
+	baseHeaders?: Record<string, string>;
 }
 
 function rtHeaders(o: RoundtripOptions): Record<string, string> {
-	const headers: Record<string, string> = {
-		...DEFAULT_HEADERS(o.host),
-		...o.headers,
-		Connection: o.keepAlive ? 'keep-alive' : 'close'
-	};
+	const headers: Record<string, string> = { ...(o.baseHeaders ?? DEFAULT_HEADERS(o.host)), ...o.headers };
+	// Only add Connection if the base didn't place it (keeps a persona's header order intact).
+	if (!Object.keys(headers).some((k) => k.toLowerCase() === 'connection')) headers.Connection = o.keepAlive ? 'keep-alive' : 'close';
 	if (o.body && o.body.length) headers['Content-Length'] = String(o.body.length);
 	return headers;
 }
@@ -164,19 +170,29 @@ export async function request(opts: RequestOptions): Promise<ClientResponse> {
 	const port = u.port ? Number(u.port) : 443;
 	const bodyBytes = typeof opts.body === 'string' ? new Uint8Array(Buffer.from(opts.body)) : opts.body;
 
-	const fingerprint = opts.http2 ? withH2(opts.fingerprint ?? modern()) : opts.fingerprint;
+	// A persona supplies the TLS fingerprint, HTTP/2, and the browser's real headers together;
+	// an explicit fingerprint/http2/headers still wins.
+	const p = opts.persona ? resolvePersona(opts.persona) : null;
+	const useH2 = opts.http2 ?? p?.http2 ?? false;
+	const baseFp = opts.fingerprint ?? p?.fingerprint();
+	const personaBase = p ? personaHeaders(p) : undefined;
+	const fingerprint = useH2 ? withH2(baseFp ?? modern()) : baseFp;
 	const tls = await openConnection({ host, port, proxy: opts.proxy, fingerprint, verify: opts.verify, ocsp: opts.ocsp, tls12: opts.tls12, timeoutMs: opts.timeoutMs });
 	const timer = opts.timeoutMs ? setTimeout(() => tls.close(), opts.timeoutMs) : null;
 	try {
 		// Use HTTP/2 only if the server actually selected it via ALPN; otherwise HTTP/1.1.
-		if (opts.http2 && tls.alpn === 'h2') {
-			const res = await h2Request(tls, {
-				method: opts.method ?? 'GET',
-				authority: u.port ? `${host}:${u.port}` : host,
-				path: u.pathname + u.search,
-				headers: { ...DEFAULT_HEADERS(host), ...(opts.headers ?? {}) },
-				body: bodyBytes
-			});
+		if (useH2 && tls.alpn === 'h2') {
+			const res = await h2Request(
+				tls,
+				{
+					method: opts.method ?? 'GET',
+					authority: u.port ? `${host}:${u.port}` : host,
+					path: u.pathname + u.search,
+					headers: { ...(personaBase ?? DEFAULT_HEADERS(host)), ...(opts.headers ?? {}) },
+					body: bodyBytes
+				},
+				p?.h2Profile
+			);
 			return Object.assign(res, { ja3: tls.ja3, ja3Hash: tls.ja3Hash, ja3n: tls.ja3n, ja3nHash: tls.ja3nHash, ja4: tls.ja4, alpn: tls.alpn });
 		}
 		return await roundtrip(tls, {
@@ -184,6 +200,7 @@ export async function request(opts: RequestOptions): Promise<ClientResponse> {
 			host,
 			path: u.pathname + u.search,
 			headers: opts.headers ?? {},
+			baseHeaders: personaBase ? { Host: host, ...personaBase } : undefined,
 			body: bodyBytes,
 			keepAlive: false
 		});

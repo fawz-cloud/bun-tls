@@ -4,10 +4,11 @@
 import { openConnection, roundtrip, serializeForEarly, withH2, type ClientResponse, type OpenOptions, type RoundtripOptions } from './client';
 import type { RequestOptions } from './client';
 import { modern } from '../fp/fingerprints';
+import { resolvePersona, personaHeaders, type Persona } from '../fp/personas';
 import type { Fingerprint } from '../tls/clienthello';
 import type { OcspMode } from '../tls/verify';
 import type { TlsConn } from '../tls/handshake';
-import { H2Connection } from './h2';
+import { H2Connection, type H2Profile } from './h2';
 import { TicketStore } from '../tls/resumption';
 import { isPublicSuffix } from './psl';
 
@@ -90,6 +91,9 @@ export class CookieJar {
 
 export interface SessionOptions {
 	fingerprint?: Fingerprint;
+	/** Coherent browser identity (TLS + HTTP/2 + headers): a name
+	 *  ('chrome'|'edge'|'firefox'|'safari') or a Persona. Applied to every request. */
+	persona?: string | Persona;
 	headers?: Record<string, string>;
 	proxy?: string;
 	verify?: boolean;
@@ -129,6 +133,9 @@ export class Session {
 	async request(req: RequestOptions): Promise<ClientResponse> {
 		const maxRedirects = this.opts.maxRedirects ?? 10;
 		const keepAlive = this.opts.keepAlive ?? true;
+		const persona = req.persona ?? this.opts.persona;
+		const P = persona ? resolvePersona(persona) : null;
+		const useH2 = req.http2 ?? this.opts.http2 ?? P?.http2 ?? false;
 		let url = req.url;
 		let method = req.method ?? 'GET';
 		let body: Uint8Array | undefined = typeof req.body === 'string' ? new Uint8Array(Buffer.from(req.body)) : req.body;
@@ -141,26 +148,38 @@ export class Session {
 				host,
 				port,
 				proxy: req.proxy ?? this.opts.proxy,
-				fingerprint: req.fingerprint ?? this.opts.fingerprint,
+				fingerprint: req.fingerprint ?? this.opts.fingerprint ?? P?.fingerprint(),
 				verify: req.verify ?? this.opts.verify,
 				ocsp: req.ocsp ?? this.opts.ocsp,
 				tls12: req.tls12 ?? this.opts.tls12,
 				timeoutMs: req.timeoutMs ?? this.opts.timeoutMs
 			};
 			const cookieHeader = this.cookies.header(u);
+			const userHeaders = { ...(this.opts.headers ?? {}), ...(req.headers ?? {}), ...(cookieHeader ? { Cookie: cookieHeader } : {}) };
 			const rt: RoundtripOptions = {
 				method,
 				host,
 				path: u.pathname + u.search,
-				headers: { ...(this.opts.headers ?? {}), ...(req.headers ?? {}), ...(cookieHeader ? { Cookie: cookieHeader } : {}) },
+				headers: userHeaders,
+				baseHeaders: P ? { Host: host, ...personaHeaders(P) } : undefined,
 				body,
 				keepAlive
 			};
 			const key = `${open.proxy ?? ''}|${host}:${port}`;
-			const res =
-				(req.http2 ?? this.opts.http2)
-					? await this.h2send(key, open, { method, authority: port === 443 ? host : `${host}:${port}`, path: rt.path, headers: rt.headers, body })
-					: await this.send(key, open, rt, keepAlive);
+			const res = useH2
+				? await this.h2send(
+						key,
+						open,
+						{
+							method,
+							authority: port === 443 ? host : `${host}:${port}`,
+							path: rt.path,
+							headers: P ? { ...personaHeaders(P), ...userHeaders } : userHeaders,
+							body
+						},
+						P?.h2Profile
+					)
+				: await this.send(key, open, rt, keepAlive);
 			this.cookies.setFromHeader(res.headers['set-cookie'], u);
 
 			const loc = res.headers['location'];
@@ -218,7 +237,8 @@ export class Session {
 	private async h2send(
 		key: string,
 		open: OpenOptions,
-		req: { method: string; authority: string; path: string; headers: Record<string, string>; body?: Uint8Array }
+		req: { method: string; authority: string; path: string; headers: Record<string, string>; body?: Uint8Array },
+		profile?: H2Profile
 	): Promise<ClientResponse> {
 		let entry = this.h2pool.get(key);
 		if (entry && entry.conn.closed) {
@@ -235,7 +255,7 @@ export class Session {
 				return res;
 			}
 			const conn = new H2Connection(tls);
-			conn.init();
+			conn.init(profile);
 			entry = { conn, fp };
 			this.h2pool.set(key, entry);
 		}

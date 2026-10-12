@@ -242,6 +242,9 @@ export interface H2Request {
 export interface H2Profile {
 	settings: [number, number][];
 	connWindowUpdate: number;
+	/** Pseudo-header order as letters of {m,a,s,p} (:method/:authority/:scheme/:path).
+	 *  The 4th field of the Akamai fingerprint. Chrome = "masp". */
+	pseudoOrder: string;
 }
 export const CHROME_H2: H2Profile = {
 	settings: [
@@ -250,7 +253,27 @@ export const CHROME_H2: H2Profile = {
 		[4, 6291456], // INITIAL_WINDOW_SIZE
 		[6, 262144] // MAX_HEADER_LIST_SIZE
 	],
-	connWindowUpdate: 15663105
+	connWindowUpdate: 15663105,
+	pseudoOrder: 'masp'
+};
+/** Firefox h2: `1:65536;4:131072;5:16384|12517377|0|m,p,a,s`. */
+export const FIREFOX_H2: H2Profile = {
+	settings: [
+		[1, 65536], // HEADER_TABLE_SIZE
+		[4, 131072], // INITIAL_WINDOW_SIZE
+		[5, 16384] // MAX_FRAME_SIZE
+	],
+	connWindowUpdate: 12517377,
+	pseudoOrder: 'mpas'
+};
+/** Safari h2: `4:4194304;3:100|10485760|0|m,s,p,a`. */
+export const SAFARI_H2: H2Profile = {
+	settings: [
+		[4, 4194304], // INITIAL_WINDOW_SIZE
+		[3, 100] // MAX_CONCURRENT_STREAMS
+	],
+	connWindowUpdate: 10485760,
+	pseudoOrder: 'mspa'
 };
 
 const readU32 = (b: Uint8Array): number => b[0]! * 0x1000000 + ((b[1]! << 16) | (b[2]! << 8) | b[3]!);
@@ -292,12 +315,14 @@ export class H2Connection {
 	private peerInitialWindow = 65535; // peer SETTINGS_INITIAL_WINDOW_SIZE → initial stream sendWindow
 	private windowWaiters: (() => void)[] = [];
 	private goawayLast = Infinity;
+	private profile: H2Profile = CHROME_H2;
 	closed = false;
 
 	constructor(private tls: TlsConn) {}
 
 	/** Send the preface, our SETTINGS and the opening WINDOW_UPDATE, then start reading. */
 	init(profile: H2Profile = CHROME_H2): void {
+		this.profile = profile;
 		const settings = new Uint8Array(profile.settings.length * 6);
 		const sv = new DataView(settings.buffer);
 		profile.settings.forEach(([id, val], i) => {
@@ -317,12 +342,13 @@ export class H2Connection {
 		if (id > this.goawayLast) return Promise.reject(new Error('h2: server sent GOAWAY, open a new connection'));
 		const st: H2Stream = { headerBytes: new Uint8Array(0), bodyParts: [], status: 0, respHeaders: [], recv: 0, sendWindow: this.peerInitialWindow, done: false, settle: () => {}, fail: () => {} };
 		this.streams.set(id, st);
-		const hdrs: [string, string][] = [
-			[':method', req.method],
-			[':authority', req.authority],
-			[':scheme', 'https'],
-			[':path', req.path]
-		];
+		const pseudo: Record<string, [string, string]> = {
+			m: [':method', req.method],
+			a: [':authority', req.authority],
+			s: [':scheme', 'https'],
+			p: [':path', req.path]
+		};
+		const hdrs: [string, string][] = this.profile.pseudoOrder.split('').map((c) => pseudo[c]!);
 		for (const [k, v] of Object.entries(req.headers)) {
 			const lk = k.toLowerCase();
 			if (lk === 'host' || lk === 'connection' || lk === 'transfer-encoding' || lk === 'keep-alive' || lk === 'upgrade') continue;

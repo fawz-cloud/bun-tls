@@ -163,5 +163,24 @@ assert.ok(ja3nSet.size >= 5, 'client fingerprints distinct (edge==chrome collaps
 	assert.equal(c.status, 200, 'TLS 1.2 ChaCha20-Poly1305 handshake + transfer');
 }
 
+// 12) Personas: one coherent identity across TLS + HTTP/2 + headers, with per-connection
+//     JA3 rotation (the anti-block-list property) and a per-persona h2 fingerprint.
+{
+	const c1 = await request({ url: 'https://tls.peet.ws/api/clean', persona: 'chrome', timeoutMs: 20000 });
+	const c2 = await request({ url: 'https://tls.peet.ws/api/clean', persona: 'chrome', timeoutMs: 20000 });
+	assert.equal(c1.status, 200, 'persona chrome handshakes');
+	assert.equal(c1.alpn, 'h2', 'persona chrome uses HTTP/2');
+	assert.equal(c1.ja3nHash, 'dee19b855b658c6aa0f575eda2525e19', 'chrome persona JA3N == Chrome 131');
+	assert.notEqual(c1.ja3Hash, c2.ja3Hash, 'raw JA3 rotates per connection (no fixed JA3 to block-list)');
+	assert.equal(c1.ja3nHash, c2.ja3nHash, 'JA3N (the shape) stays a valid Chrome');
+
+	// coherence: the h2 (Akamai) fingerprint matches the persona, not always Chrome's.
+	const ff = await request({ url: 'https://tls.peet.ws/api/all', persona: 'firefox', timeoutMs: 20000 });
+	assert.equal(ff.ja3nHash, '3d7d71e7ee5cc9e08aa503d985e74b27', 'firefox persona JA3N == Firefox 148');
+	const akamai = ff.json<{ http2?: { akamai_fingerprint?: string } }>().http2?.akamai_fingerprint ?? '';
+	console.log('persona firefox akamai h2 =', akamai);
+	assert.ok(akamai.startsWith('1:65536;4:131072;5:16384'), 'firefox persona sends the Firefox h2 fingerprint, not Chrome');
+}
+
 console.log('live: OK');
 process.exit(0);
