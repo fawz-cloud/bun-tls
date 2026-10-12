@@ -105,5 +105,15 @@ assert.ok(ja3nSet.size >= 5, 'client fingerprints distinct (edge==chrome collaps
 	t2.close();
 }
 
+// 9) HTTP/2: negotiate ALPN h2 and complete a GET (HPACK decode + flow control).
+//    modern() advertises only ECDHE groups we implement, so no MLKEM HelloRetryRequest.
+{
+	const r2 = await request({ url: 'https://nghttp2.org/', http2: true, timeoutMs: 20000 });
+	console.log(`http/2 → alpn=${r2.alpn} status=${r2.status} bodyLen=${r2.body.length}`);
+	assert.equal(r2.alpn, 'h2', 'negotiated HTTP/2');
+	assert.equal(r2.status, 200, 'h2 GET got 200');
+	assert.ok(r2.body.length > 0, 'h2 response has a body');
+}
+
 console.log('live: OK');
 process.exit(0);

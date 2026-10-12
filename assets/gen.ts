@@ -134,7 +134,7 @@ function comparison(): string {
 		['No FFI / extra native library', [true, false, true, true, true]],
 		['JA3 / JA4 control', [true, true, true, false, false]],
 		['Browser presets', [true, true, true, false, false]],
-		['HTTP/2', [false, true, 'TLS only', true, false]],
+		['HTTP/2', ['one-shot', true, 'TLS only', true, false]],
 		['Cert verification by default', [true, true, true, true, true]]
 	];
 	const lx = 60, labelW = 300, c0 = lx + labelW, cw = (w - c0 - 40) / cols.length;

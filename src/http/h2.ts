@@ -238,8 +238,17 @@ export interface H2Request {
 
 /** Perform one HTTP/2 request over a handshaked TLS client whose ALPN is "h2". */
 export async function h2Request(tls: TlsClient, req: H2Request): Promise<HttpResponse> {
-	// client connection preface + our SETTINGS (empty = defaults)
-	tls.writeApp(concat(PREFACE, frame(FRAME.SETTINGS, 0, 0, new Uint8Array(0))));
+	// preface + SETTINGS (disable push, large initial stream window) + a big connection
+	// WINDOW_UPDATE, so the server can stream a whole response without stalling on flow control.
+	const settings = new Uint8Array(12);
+	const sv = new DataView(settings.buffer);
+	sv.setUint16(0, 0x2); // ENABLE_PUSH
+	sv.setUint32(2, 0);
+	sv.setUint16(6, 0x4); // INITIAL_WINDOW_SIZE
+	sv.setUint32(8, 16777215);
+	const connWU = new Uint8Array(4);
+	new DataView(connWU.buffer).setUint32(0, 0x3fff0000); // raise the connection-level window
+	tls.writeApp(concat(PREFACE, frame(FRAME.SETTINGS, 0, 0, settings), frame(FRAME.WINDOW_UPDATE, 0, 0, connWU)));
 
 	// :pseudo-headers first (RFC 9113 §8.3), then regular headers
 	const hdrs: [string, string][] = [
@@ -309,7 +318,7 @@ export async function h2Request(tls: TlsClient, req: H2Request): Promise<HttpRes
 				const data = pl.subarray(o, pl.length - padLen);
 				bodyParts.push(data);
 				windowFromClient += f.payload.length;
-				if (windowFromClient >= 1 << 20) {
+				if (windowFromClient >= 1 << 18) {
 					// replenish connection + stream flow-control windows
 					const inc = new Uint8Array(4);
 					new DataView(inc.buffer).setUint32(0, windowFromClient);

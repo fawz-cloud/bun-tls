@@ -50,6 +50,9 @@ console.log(r.status, r.json(), r.ja3, r.ja4);
 // a named preset
 await request({ url: 'https://example.com/', fingerprint: clients.firefox() });
 
+// HTTP/2 (ALPN h2, falls back to h1 if the server declines)
+await request({ url: 'https://nghttp2.org/', http2: true });
+
 // reproduce an arbitrary JA3 (full, runnable value)
 await request({
   url: 'https://example.com/',
@@ -178,18 +181,23 @@ bun-tls fills that gap for Bun, at the cost of HTTP/1.1 only.
 - Keep-alive, 1-RTT resumption, optional 0-RTT (RFC 8448-checked key schedule),
   post-handshake KeyUpdate, and HelloRetryRequest — all handled.
 - ECDHE over X25519 / P-256 / P-384; HTTP and SOCKS5 proxies; gzip/deflate/br/zstd.
+- HTTP/2 (`request({ http2: true })`): ALPN h2, HPACK, flow control — real h2 requests.
 - Optional mutual-TLS servers complete (we answer a CertificateRequest).
 - Certificate verification on by default, with chain path-building to a bundled root store.
 - Fast for one-shot and concurrent requests on the local benchmark; small, readable code.
 
 ## Limitations
 
-- **TLS 1.3 only, HTTP/1.1 only.** No TLS 1.2, no HTTP/2 — both are large separate stacks,
-  not planned. Browser presets are therefore h1 (JA3 matches; JA4 ALPN byte and protocol
-  do not). Public CDNs that gate 0-RTT behind h2 give this client 1-RTT resumption instead.
+- **TLS 1.2 is not supported** (TLS 1.3 only). **HTTP/2 works** via `request({ http2: true })`
+  — ALPN h2, HPACK, flow control, verified against Cloudflare/Google/nghttp2 — but it is
+  one request per connection (no multiplexing; `Session` keep-alive stays HTTP/1.1), and the
+  h2 SETTINGS are a generic client's, so the HTTP/2 fingerprint does not match a specific
+  browser. HTTP/1.1 is the default.
 - **Post-quantum / FFDHE key exchange is advertised but not implemented.** ECDHE
-  (X25519, P-256, P-384) is negotiated, incl. via HelloRetryRequest; a server that accepts
-  only `X25519MLKEM768` or FFDHE cannot be reached.
+  (X25519, P-256, P-384) is negotiated, incl. via HelloRetryRequest. The browser presets
+  advertise `X25519MLKEM768` for JA3 fidelity but cannot negotiate it — so against a server
+  that *prefers* it (some current Cloudflare/Google configs) those presets fail with an
+  unsupported-group error. Use `modern()` or another non-MLKEM fingerprint for such hosts.
 - **From-scratch TLS, not audited.** Certificate verification is implemented and on by
   default, but review `src/tls/verify.ts` before relying on it where correctness matters.
 - Certificate chain path-building anchors at the earliest chain cert signed by a known
