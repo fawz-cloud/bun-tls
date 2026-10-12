@@ -3,9 +3,12 @@
 // openConnection + roundtrip are the reusable pieces Session uses for keep-alive.
 import type { Fingerprint, ResumeSpec } from '../tls/clienthello';
 import { modern } from '../fp/fingerprints';
+import { alpn as alpnExt } from '../tls/extensions';
+import { Ext } from '../core/consts';
 import { TlsClient } from '../tls/handshake';
 import type { Ticket } from '../tls/resumption';
 import { HttpResponse, readResponse, serializeRequest } from './http1';
+import { h2Request } from './h2';
 import { proxyConnect, tcpConnect } from '../tls/transport';
 import { concat } from '../core/bytes';
 
@@ -21,6 +24,18 @@ export interface RequestOptions {
 	proxy?: string;
 	/** Verify the server certificate (default true). false = skip. */
 	verify?: boolean;
+	/** Negotiate and use HTTP/2 (ALPN h2). Falls back to HTTP/1.1 if the server declines.
+	 *  One-shot only — Session keep-alive is HTTP/1.1. */
+	http2?: boolean;
+}
+
+/** Return a copy of `fp` whose ALPN advertises h2 (then http/1.1), so the server may
+ *  select HTTP/2. If the fingerprint has no ALPN extension, h2 is appended. */
+function withH2(fp: Fingerprint): Fingerprint {
+	let found = false;
+	const extensions = fp.extensions.map((e) => (e.type === Ext.alpn ? ((found = true), alpnExt(['h2', 'http/1.1'])) : e));
+	if (!found) extensions.push(alpnExt(['h2', 'http/1.1']));
+	return { ...fp, extensions };
 }
 
 export interface ClientResponse extends HttpResponse {
@@ -68,6 +83,9 @@ export async function openConnection(o: OpenOptions): Promise<TlsClient> {
 	const timer = o.timeoutMs ? setTimeout(() => tls.close(), o.timeoutMs) : null;
 	try {
 		await tls.handshake();
+	} catch (e) {
+		tls.close(); // a failed handshake must not leak the socket
+		throw e;
 	} finally {
 		if (timer) clearTimeout(timer);
 	}
@@ -132,9 +150,21 @@ export async function request(opts: RequestOptions): Promise<ClientResponse> {
 	const port = u.port ? Number(u.port) : 443;
 	const bodyBytes = typeof opts.body === 'string' ? new Uint8Array(Buffer.from(opts.body)) : opts.body;
 
-	const tls = await openConnection({ host, port, proxy: opts.proxy, fingerprint: opts.fingerprint, verify: opts.verify, timeoutMs: opts.timeoutMs });
+	const fingerprint = opts.http2 ? withH2(opts.fingerprint ?? modern()) : opts.fingerprint;
+	const tls = await openConnection({ host, port, proxy: opts.proxy, fingerprint, verify: opts.verify, timeoutMs: opts.timeoutMs });
 	const timer = opts.timeoutMs ? setTimeout(() => tls.close(), opts.timeoutMs) : null;
 	try {
+		// Use HTTP/2 only if the server actually selected it via ALPN; otherwise HTTP/1.1.
+		if (opts.http2 && tls.alpn === 'h2') {
+			const res = await h2Request(tls, {
+				method: opts.method ?? 'GET',
+				authority: u.port ? `${host}:${u.port}` : host,
+				path: u.pathname + u.search,
+				headers: { ...DEFAULT_HEADERS(host), ...(opts.headers ?? {}) },
+				body: bodyBytes
+			});
+			return Object.assign(res, { ja3: tls.ja3, ja3Hash: tls.ja3Hash, ja3n: tls.ja3n, ja3nHash: tls.ja3nHash, ja4: tls.ja4, alpn: tls.alpn });
+		}
 		return await roundtrip(tls, {
 			method: opts.method ?? 'GET',
 			host,

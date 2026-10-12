@@ -65,10 +65,18 @@ function anchoredByRoot(cert: crypto.X509Certificate): boolean {
 // are still checked every call, and a rotated cert (new bytes) misses the cache.
 const chainCache = new Map<string, number>();
 
+/** Match the leaf against the requested host — by IP SAN for an IP literal, by DNS SAN
+ *  otherwise. `checkHost` does not match IP addresses, so an IP target needs `checkIP`. */
+function matchesHost(leaf: crypto.X509Certificate, host: string): boolean {
+	const h = host.replace(/^\[|\]$/g, ''); // strip IPv6 brackets
+	if (/^\d{1,3}(\.\d{1,3}){3}$/.test(h) || h.includes(':')) return !!leaf.checkIP(h);
+	return !!leaf.checkHost(host);
+}
+
 export function verifyChain(certsDer: Uint8Array[], host: string, now = new Date()): void {
 	if (certsDer.length === 0) throw new Error('server sent no certificate');
 	const leaf = new crypto.X509Certificate(Buffer.from(certsDer[0]!));
-	if (!leaf.checkHost(host)) throw new Error(`certificate is not for ${host} (subject ${leaf.subject})`);
+	if (!matchesHost(leaf, host)) throw new Error(`certificate is not for ${host} (subject ${leaf.subject})`);
 	const key = crypto.createHash('sha256').update(Buffer.from(certsDer[0]!)).digest('hex');
 	const cachedUntil = chainCache.get(key);
 	if (cachedUntil !== undefined) {
@@ -94,7 +102,13 @@ export function verifyChain(certsDer: Uint8Array[], host: string, now = new Date
 		const to = new Date(c.validTo).getTime();
 		if (to < now.getTime()) throw new Error(`certificate expired: ${c.subject}`);
 		if (new Date(c.validFrom) > now) throw new Error(`certificate not yet valid: ${c.subject}`);
-		if (i < anchor && !signedBy(c, chain[i + 1]!)) throw new Error(`broken chain: ${c.subject} not signed by the next cert`);
+		if (i < anchor) {
+			const issuer = chain[i + 1]!;
+			// The signing cert MUST be a CA (basicConstraints CA:TRUE). Without this an
+			// attacker can sign a leaf with any non-CA cert they hold and have it accepted.
+			if (!issuer.ca) throw new Error(`untrusted: issuer is not a CA certificate (${issuer.subject})`);
+			if (!signedBy(c, issuer)) throw new Error(`broken chain: ${c.subject} not signed by the next cert`);
+		}
 		validUntil = Math.min(validUntil, to);
 	}
 	chainCache.set(key, validUntil);
