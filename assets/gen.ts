@@ -85,42 +85,85 @@ ${bands}
 
 // ── 3. Full handshake vs 0-RTT (round trips) ──────────────────────────────────
 function handshake(): string {
-	const w = 1000, h = 400;
-	function panel(ox: number, title: string, sub: string, flights: [number, string, boolean][], rtt: string, rttColor: string): string {
-		const cx = ox + 60, sx = ox + 360, top = 110, step = 46;
+	const w = 1000, h = 392;
+	const lineTop = 128, lineBot = 300, boxY = lineBot + 30;
+	function panel(ox: number, title: string, sub: string, flights: [string, boolean][], rtt: string, rttColor: string): string {
+		const cx = ox + 10, sx = ox + 380;
 		let arrows = '';
-		flights.forEach(([row, label, toServer]) => {
-			const y = top + row * step;
+		flights.forEach(([label, toServer], row) => {
+			const y = lineTop + 26 + row * 42;
 			const x1 = toServer ? cx : sx, x2 = toServer ? sx : cx;
+			const hx = x2 + (toServer ? -9 : 9);
 			arrows += `
+<text x="${(cx + sx) / 2}" y="${y - 11}" ${FM} font-size="12.5" fill="${C.dim}" text-anchor="middle">${esc(label)}</text>
 <line x1="${x1}" y1="${y}" x2="${x2}" y2="${y}" stroke="${C.faint}" stroke-width="1.5"/>
-<path d="M ${x2 + (toServer ? -8 : 8)} ${y - 5} L ${x2} ${y} L ${x2 + (toServer ? -8 : 8)} ${y + 5}" fill="${C.faint}"/>
-<text x="${(x1 + x2) / 2}" y="${y - 9}" ${FM} font-size="12.5" fill="${C.dim}" text-anchor="middle">${esc(label)}</text>`;
+<path d="M ${hx} ${y - 5} L ${x2} ${y} L ${hx} ${y + 5} Z" fill="${C.faint}"/>`;
 		});
-		const bot = top + (flights.length - 1) * step + 24;
 		return `
-<text x="${cx}" y="70" ${FS} font-size="16" font-weight="700" fill="${C.text}">${title}</text>
-<text x="${cx}" y="92" ${FS} font-size="12.5" fill="${C.dim}">${esc(sub)}</text>
-<text x="${cx}" y="${bot + 14}" ${FS} font-size="12" fill="${C.dim}">client</text>
-<text x="${sx}" y="${bot + 14}" ${FS} font-size="12" fill="${C.dim}" text-anchor="end">server</text>
-<line x1="${cx}" y1="100" x2="${cx}" y2="${bot}" stroke="${C.line}"/>
-<line x1="${sx}" y1="100" x2="${sx}" y2="${bot}" stroke="${C.line}"/>
+<text x="${cx}" y="74" ${FS} font-size="16" font-weight="700" fill="${C.text}">${title}</text>
+<text x="${cx}" y="97" ${FS} font-size="12.5" fill="${C.dim}">${esc(sub)}</text>
+<line x1="${cx}" y1="${lineTop}" x2="${cx}" y2="${lineBot}" stroke="${C.line}"/>
+<line x1="${sx}" y1="${lineTop}" x2="${sx}" y2="${lineBot}" stroke="${C.line}"/>
 ${arrows}
-<rect x="${cx}" y="${bot + 26}" width="${sx - cx}" height="26" rx="6" fill="none" stroke="${rttColor}"/>
-<text x="${(cx + sx) / 2}" y="${bot + 43}" ${FS} font-size="12.5" fill="${rttColor}" text-anchor="middle">${esc(rtt)}</text>`;
+<text x="${cx}" y="${lineBot + 20}" ${FS} font-size="12" fill="${C.dim}">client</text>
+<text x="${sx}" y="${lineBot + 20}" ${FS} font-size="12" fill="${C.dim}" text-anchor="end">server</text>
+<rect x="${cx}" y="${boxY}" width="${sx - cx}" height="28" rx="7" fill="none" stroke="${rttColor}"/>
+<text x="${(cx + sx) / 2}" y="${boxY + 18}" ${FS} font-size="12.5" fill="${rttColor}" text-anchor="middle">${esc(rtt)}</text>`;
 	}
 	return frame(w, h, `
-<text x="60" y="40" ${FS} font-size="20" font-weight="700" fill="${C.text}">Resumption trims a full round trip</text>
-${panel(20, 'Full handshake', 'first visit to a host', [
-		[0, 'ClientHello', true],
-		[1, 'ServerHello + cert + Finished', false],
-		[2, 'Finished + request', true],
-		[3, 'response', false]
+<text x="60" y="44" ${FS} font-size="20" font-weight="700" fill="${C.text}">Resumption trims a full round trip</text>
+${panel(70, 'Full handshake', 'first visit to a host', [
+		['ClientHello', true],
+		['ServerHello + cert + Finished', false],
+		['Finished + request', true],
+		['response', false]
 	], '2 round trips before data', C.dim)}
-${panel(520, '0-RTT resumption', 'returning, with a cached ticket', [
-		[0, 'ClientHello + request', true],
-		[1, 'response', false]
-	], '1 round trip — request rides along', C.amber)}`);
+${panel(540, '0-RTT resumption', 'returning, with a cached ticket', [
+		['ClientHello + request', true],
+		['response', false]
+	], '1 round trip — request rides along', C.accent)}`);
+}
+
+// ── 5. Comparison matrix vs other clients ─────────────────────────────────────
+function comparison(): string {
+	const w = 1000, h = 408;
+	const cols = ['bun-tls', 'curl_cffi', 'utls', 'node fetch', 'requests'];
+	// y = yes, n = no, or a short string
+	const rows: [string, (string | boolean)[]][] = [
+		['Runtime', ['Bun / TS', 'Python', 'Go', 'Node', 'Python']],
+		['No native binary to install', [true, false, false, true, true]],
+		['JA3 / JA4 control', [true, true, true, false, false]],
+		['Browser presets', [true, true, true, false, false]],
+		['TLS 1.3 0-RTT', [true, true, true, false, false]],
+		['HTTP/2', [false, true, true, true, false]],
+		['Cert verify by default', [true, true, true, true, true]]
+	];
+	const lx = 60, labelW = 300, c0 = lx + labelW, cw = (w - c0 - 40) / cols.length;
+	const colX = (i: number) => c0 + cw * i + cw / 2;
+	let head = '';
+	cols.forEach((c, i) => {
+		const mine = i === 0;
+		head += `<text x="${colX(i)}" y="98" ${FM} font-size="14" font-weight="${mine ? 700 : 400}" fill="${mine ? C.accent : C.dim}" text-anchor="middle">${c}</text>`;
+	});
+	const top = 124, step = 38;
+	let body = '';
+	rows.forEach((r, ri) => {
+		const y = top + ri * step;
+		if (ri % 2 === 0) body += `<rect x="${lx - 14}" y="${y - 25}" width="${w - 2 * (lx - 14)}" height="${step}" rx="6" fill="${C.panel}"/>`;
+		body += `<text x="${lx}" y="${y}" ${FS} font-size="14" fill="${C.text}">${esc(r[0])}</text>`;
+		r[1].forEach((v, ci) => {
+			const x = colX(ci);
+			if (typeof v === 'string') body += `<text x="${x}" y="${y}" ${FM} font-size="12.5" fill="${ci === 0 ? C.text : C.dim}" text-anchor="middle">${esc(v)}</text>`;
+			else if (v) body += `<circle cx="${x}" cy="${y - 4}" r="5.5" fill="${ci === 0 ? C.accent : C.dim}"/>`;
+			else body += `<line x1="${x - 6}" y1="${y - 4}" x2="${x + 6}" y2="${y - 4}" stroke="${C.faint}" stroke-width="2"/>`;
+		});
+	});
+	return frame(w, h, `
+<text x="60" y="44" ${FS} font-size="20" font-weight="700" fill="${C.text}">How it compares</text>
+<text x="60" y="68" ${FS} font-size="13" fill="${C.dim}">filled = yes, dash = no. The niche: fingerprint control with nothing to compile.</text>
+${head}
+<line x1="${lx - 14}" y1="108" x2="${w - (lx - 14)}" y2="108" stroke="${C.line}"/>
+${body}`);
 }
 
 // ── 4. Throughput vs curl_cffi ────────────────────────────────────────────────
@@ -157,4 +200,5 @@ writeFileSync(`${out}/hero.svg`, hero());
 writeFileSync(`${out}/architecture.svg`, architecture());
 writeFileSync(`${out}/handshake.svg`, handshake());
 writeFileSync(`${out}/benchmark.svg`, benchmark());
-console.log('wrote hero.svg architecture.svg handshake.svg benchmark.svg');
+writeFileSync(`${out}/comparison.svg`, comparison());
+console.log('wrote hero.svg architecture.svg handshake.svg benchmark.svg comparison.svg');

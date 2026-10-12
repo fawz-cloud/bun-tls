@@ -140,6 +140,16 @@ libcurl-handle setup on every request and is serialized by the GIL. Over the int
 both are bounded by network round-trips and converge. Bulk upload throughput favours
 curl's native crypto.
 
+## How it compares
+
+![comparison](assets/comparison.svg)
+
+The clients that let you control a TLS fingerprint — `curl_cffi` (patched libcurl) and
+`utls` (Go) — all ship a compiled artifact. The ones with nothing to install —
+`fetch`/`undici`, `requests`/`httpx` — can't shape the ClientHello at all. bun-tls sits
+in the gap: full JA3/JA4 control, browser presets, resumption and 0-RTT, with nothing to
+compile. The trade-off it accepts for that is HTTP/1.1 only (no HTTP/2).
+
 ## Pros & cons
 
 **Pros**
