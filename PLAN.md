@@ -39,7 +39,8 @@ via a patched libcurl (C); we do it in TS.
 | `fp/clients.ts` | named registry: `clients.{chrome,edge,firefox,dart,safari,okhttp}` |
 | `fp/ja3.ts` | `fromJa3(string)` → Fingerprint (impersonate from a JA3) |
 | `http/http1.ts` | HTTP/1.1 serialize/parse + gzip/deflate/br/zstd |
-| `http/h2.ts` | HTTP/2 (frames + HPACK + flow control), one request per connection |
+| `http/h2.ts` | HTTP/2: frames + HPACK + flow control + multiplexed `H2Connection` |
+| `http/psl.ts` | Public Suffix List lookup (cookie supercookie guard) |
 | `http/client.ts` | `request()` single-shot |
 | `http/session.ts` | `Session` = cookie jar + redirects + persistent opts |
 | `index.ts` | public re-exports |
@@ -86,8 +87,6 @@ Layers: `core/` (bytes + crypto primitives) → `tls/` (handshake, records, cert
 ## Deliberately not done
 
 - TLS 1.2 (we advertise supported_versions = 1.3 only; impersonation targets are 1.3).
-- HTTP/2 multiplexing / Session over h2 (one-shot `request({http2:true})` is done; no pooling,
-  and the h2 SETTINGS are generic, not a browser-exact h2 fingerprint).
 - FFDHE key exchange (advertised for fingerprint fidelity, not implemented; no mainstream
   server requires it).
 - OCSP / CRL revocation (needs an ASN.1 OCSP stack; browsers soft-fail it anyway).
@@ -95,7 +94,7 @@ Layers: `core/` (bytes + crypto primitives) → `tls/` (handshake, records, cert
   X25519MLKEM768 post-quantum hybrid (ML-KEM via WebCrypto), RFC 8879 certificate
   decompression, post-handshake KeyUpdate, optional-mTLS (empty client Certificate),
   HTTP+SOCKS5 proxy, gzip/deflate/br/zstd, cookie Public Suffix List, HTTP/2 (HPACK + flow
-  control + Chrome h2 fingerprint, one request per connection). Resumption/0-RTT key schedule
+  control + Chrome h2 fingerprint + Session multiplexing). Resumption/0-RTT key schedule
   validated vs RFC 8448 §4; cert verify enforces CA issuer + IP SANs; failed handshakes close
   the socket.
 - Cross-sign path building beyond "earliest chain cert signed by a known root" (covers

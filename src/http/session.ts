@@ -1,12 +1,19 @@
 // Session, like curl_cffi/requests: a cookie jar + redirect following + default
 // headers/fingerprint/proxy/verify that persist across requests. The single-shot
 // request() in client.ts keeps no state; Session does.
-import { openConnection, roundtrip, serializeForEarly, type ClientResponse, type OpenOptions, type RoundtripOptions } from './client';
+import { openConnection, roundtrip, serializeForEarly, withH2, type ClientResponse, type OpenOptions, type RoundtripOptions } from './client';
 import type { RequestOptions } from './client';
+import { modern } from '../fp/fingerprints';
 import type { Fingerprint } from '../tls/clienthello';
 import type { TlsClient } from '../tls/handshake';
+import { H2Connection } from './h2';
 import { TicketStore } from '../tls/resumption';
 import { isPublicSuffix } from './psl';
+
+interface H2Entry {
+	conn: H2Connection;
+	fp: { ja3: string; ja3Hash: string; ja3n: string; ja3nHash: string; ja4: string; alpn: string | null };
+}
 
 interface Cookie {
 	value: string;
@@ -99,6 +106,9 @@ export interface SessionOptions {
 	 *  depends on the endpoint. Enable only for endpoints where a replayed request is safe.
 	 *  Resumption (1-RTT, no early data) is used regardless. */
 	zeroRtt?: boolean;
+	/** Use HTTP/2 when the server negotiates ALPN h2 (default false). One h2 connection per
+	 *  host is kept and requests multiplex over it; falls back to HTTP/1.1 if h2 is declined. */
+	http2?: boolean;
 }
 
 export class Session {
@@ -107,6 +117,8 @@ export class Session {
 	private pool = new Map<string, TlsClient[]>();
 	/** Resumption tickets (per host), captured from NewSessionTickets. */
 	private tickets = new TicketStore();
+	/** Live multiplexed HTTP/2 connections, keyed by proxy|host:port. */
+	private h2pool = new Map<string, H2Entry>();
 	constructor(private opts: SessionOptions = {}) {}
 
 	async request(req: RequestOptions): Promise<ClientResponse> {
@@ -137,7 +149,11 @@ export class Session {
 				body,
 				keepAlive
 			};
-			const res = await this.send(`${open.proxy ?? ''}|${host}:${port}`, open, rt, keepAlive);
+			const key = `${open.proxy ?? ''}|${host}:${port}`;
+			const res =
+				(req.http2 ?? this.opts.http2)
+					? await this.h2send(key, open, { method, authority: port === 443 ? host : `${host}:${port}`, path: rt.path, headers: rt.headers, body })
+					: await this.send(key, open, rt, keepAlive);
 			this.cookies.setFromHeader(res.headers['set-cookie'], u);
 
 			const loc = res.headers['location'];
@@ -190,7 +206,37 @@ export class Session {
 		return res;
 	}
 
-	/** Close all pooled connections. Call when done with the Session. */
+	/** One request over a kept, multiplexed HTTP/2 connection (dialing + preface once per
+	 *  host). If the server declines ALPN h2, do this one request over HTTP/1.1 instead. */
+	private async h2send(
+		key: string,
+		open: OpenOptions,
+		req: { method: string; authority: string; path: string; headers: Record<string, string>; body?: Uint8Array }
+	): Promise<ClientResponse> {
+		let entry = this.h2pool.get(key);
+		if (entry && entry.conn.closed) {
+			this.h2pool.delete(key);
+			entry = undefined;
+		}
+		if (!entry) {
+			const tls = await openConnection({ ...open, fingerprint: withH2(open.fingerprint ?? modern()), onTicket: (t) => this.tickets.add(open.host, t) });
+			const fp = { ja3: tls.ja3, ja3Hash: tls.ja3Hash, ja3n: tls.ja3n, ja3nHash: tls.ja3nHash, ja4: tls.ja4, alpn: tls.alpn };
+			if (tls.alpn !== 'h2') {
+				// server declined h2 → serve this request over HTTP/1.1 and drop the socket
+				const res = await roundtrip(tls, { method: req.method, host: open.host, path: req.path, headers: req.headers, body: req.body, keepAlive: false });
+				tls.close();
+				return res;
+			}
+			const conn = new H2Connection(tls);
+			conn.init();
+			entry = { conn, fp };
+			this.h2pool.set(key, entry);
+		}
+		const res = await entry.conn.request(req);
+		return Object.assign(res, entry.fp);
+	}
+
+	/** Close all pooled connections (keep-alive and HTTP/2). Call when done with the Session. */
 	close(): void {
 		for (const list of this.pool.values())
 			for (const tls of list)
@@ -200,6 +246,8 @@ export class Session {
 					/* already gone */
 				}
 		this.pool.clear();
+		for (const entry of this.h2pool.values()) entry.conn.close();
+		this.h2pool.clear();
 	}
 
 	get = (url: string, o: Partial<RequestOptions> = {}) => this.request({ ...o, url, method: 'GET' });

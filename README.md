@@ -183,7 +183,8 @@ bun-tls fills that gap for Bun, at the cost of HTTP/1.1 only.
 - Key exchange over X25519 / P-256 / P-384 and the post-quantum X25519MLKEM768 hybrid,
   with HelloRetryRequest and RFC 8879 certificate decompression — the browser presets reach
   PQC-preferring CDNs with their real fingerprint. HTTP and SOCKS5 proxies; gzip/deflate/br/zstd.
-- HTTP/2 (`request({ http2: true })`): ALPN h2, HPACK, flow control, and Chrome's h2 fingerprint.
+- HTTP/2: ALPN h2, HPACK, flow control, Chrome's h2 fingerprint, and request multiplexing
+  over one connection via `new Session({ http2: true })`.
 - Optional mutual-TLS servers complete (we answer a CertificateRequest).
 - Certificate verification on by default (CA-constrained chain, hostname + IP SANs, path-building
   to a bundled root store); cookie jar with Public Suffix List + `__Host-`/`__Secure-` rules.
@@ -194,8 +195,9 @@ bun-tls fills that gap for Bun, at the cost of HTTP/1.1 only.
 - **TLS 1.2 is not supported** (TLS 1.3 only). **HTTP/2 works** via `request({ http2: true })`
   — ALPN h2, HPACK, flow control, verified against Cloudflare/Google/nghttp2. Its
   SETTINGS / WINDOW_UPDATE / pseudo-header order reproduce Chrome's h2 (Akamai) fingerprint
-  `1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p`. It is one request per connection
-  (no multiplexing; `Session` keep-alive stays HTTP/1.1). HTTP/1.1 is the default.
+  `1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p`. `new Session({ http2: true })` keeps one
+  h2 connection per host and **multiplexes** concurrent requests over it; the one-shot
+  `request({ http2: true })` uses a fresh connection. HTTP/1.1 is the default.
 - **Key exchange:** X25519, P-256, P-384, and the post-quantum **X25519MLKEM768** hybrid
   are negotiated (incl. via HelloRetryRequest). The Chrome/Firefox presets send the ML-KEM
   share, so they connect to PQC-preferring servers (current Cloudflare/Google). FFDHE groups

@@ -175,7 +175,7 @@ function encodeHeaders(headers: [string, string][]): Uint8Array {
 }
 
 // ── Frame layer ────────────────────────────────────────────────────────────────
-const FRAME = { DATA: 0, HEADERS: 1, RST_STREAM: 3, SETTINGS: 4, PING: 6, GOAWAY: 7, WINDOW_UPDATE: 8 } as const;
+const FRAME = { DATA: 0, HEADERS: 1, RST_STREAM: 3, SETTINGS: 4, PING: 6, GOAWAY: 7, WINDOW_UPDATE: 8, CONTINUATION: 9 } as const;
 const F_END_STREAM = 0x1;
 const F_END_HEADERS = 0x4;
 const F_ACK = 0x1;
@@ -253,130 +253,247 @@ export const CHROME_H2: H2Profile = {
 	connWindowUpdate: 15663105
 };
 
-/** Perform one HTTP/2 request over a handshaked TLS client whose ALPN is "h2". */
-export async function h2Request(tls: TlsClient, req: H2Request, profile: H2Profile = CHROME_H2): Promise<HttpResponse> {
-	// preface + SETTINGS + opening connection WINDOW_UPDATE (profile = h2 fingerprint).
-	const settings = new Uint8Array(profile.settings.length * 6);
-	const sv = new DataView(settings.buffer);
-	profile.settings.forEach(([id, val], i) => {
-		sv.setUint16(i * 6, id);
-		sv.setUint32(i * 6 + 2, val >>> 0);
-	});
-	const connWU = new Uint8Array(4);
-	new DataView(connWU.buffer).setUint32(0, profile.connWindowUpdate);
-	tls.writeApp(concat(PREFACE, frame(FRAME.SETTINGS, 0, 0, settings), frame(FRAME.WINDOW_UPDATE, 0, 0, connWU)));
+const readU32 = (b: Uint8Array): number => b[0]! * 0x1000000 + ((b[1]! << 16) | (b[2]! << 8) | b[3]!);
+const u32 = (n: number): Uint8Array => Uint8Array.of((n >>> 24) & 0xff, (n >>> 16) & 0xff, (n >>> 8) & 0xff, n & 0xff);
 
-	// :pseudo-headers first (RFC 9113 §8.3), then regular headers
-	const hdrs: [string, string][] = [
-		[':method', req.method],
-		[':authority', req.authority],
-		[':scheme', 'https'],
-		[':path', req.path]
-	];
-	for (const [k, v] of Object.entries(req.headers)) {
-		const lk = k.toLowerCase();
-		if (lk === 'host' || lk === 'connection' || lk === 'transfer-encoding' || lk === 'keep-alive' || lk === 'upgrade') continue; // not allowed in h2
-		hdrs.push([lk, v]);
+function decompressBody(body: Uint8Array, enc: string | string[] | undefined): Uint8Array {
+	const e = (Array.isArray(enc) ? enc.join(',') : enc ?? '').toLowerCase();
+	try {
+		if (e.includes('zstd') && typeof zlib.zstdDecompressSync === 'function') return new Uint8Array(zlib.zstdDecompressSync(body));
+		if (e.includes('br')) return new Uint8Array(zlib.brotliDecompressSync(body));
+		if (e.includes('gzip')) return new Uint8Array(zlib.gunzipSync(body));
+		if (e.includes('deflate')) return new Uint8Array(zlib.inflateSync(body));
+	} catch {
+		/* not compressed / corrupt → as-is */
 	}
-	const hasBody = !!(req.body && req.body.length);
-	const headerBlock = encodeHeaders(hdrs);
-	tls.writeApp(frame(FRAME.HEADERS, F_END_HEADERS | (hasBody ? 0 : F_END_STREAM), 1, headerBlock));
-	if (hasBody) {
-		// DATA in ≤16KB frames (default max frame size); send END_STREAM on the last.
-		const body = req.body!;
-		const MAX = 16384;
-		for (let off = 0; off < body.length; off += MAX) {
-			const last = off + MAX >= body.length;
-			tls.writeApp(frame(FRAME.DATA, last ? F_END_STREAM : 0, 1, body.subarray(off, off + MAX)));
+	return body;
+}
+
+interface H2Stream {
+	headerBytes: Uint8Array;
+	bodyParts: Uint8Array[];
+	status: number;
+	respHeaders: [string, string][];
+	recv: number; // bytes received since our last WINDOW_UPDATE
+	sendWindow: number; // peer's flow window for our DATA on this stream
+	done: boolean;
+	settle: (r: HttpResponse) => void;
+	fail: (e: Error) => void;
+}
+
+/** A persistent HTTP/2 connection: one preface + SETTINGS, then many concurrent streams
+ *  multiplexed over the single TLS channel. One shared HPACK decoder (the dynamic table is
+ *  connection-wide and order-sensitive) + one read loop dispatching frames by stream id. */
+export class H2Connection {
+	private nextId = 1; // client streams are odd
+	private streams = new Map<number, H2Stream>();
+	private hpack = new Hpack();
+	private connSendWindow = 65535; // our DATA budget at the connection level
+	private peerInitialWindow = 65535; // peer SETTINGS_INITIAL_WINDOW_SIZE → initial stream sendWindow
+	private windowWaiters: (() => void)[] = [];
+	private goawayLast = Infinity;
+	closed = false;
+
+	constructor(private tls: TlsClient) {}
+
+	/** Send the preface, our SETTINGS and the opening WINDOW_UPDATE, then start reading. */
+	init(profile: H2Profile = CHROME_H2): void {
+		const settings = new Uint8Array(profile.settings.length * 6);
+		const sv = new DataView(settings.buffer);
+		profile.settings.forEach(([id, val], i) => {
+			sv.setUint16(i * 6, id);
+			sv.setUint32(i * 6 + 2, val >>> 0);
+		});
+		this.tls.writeApp(concat(PREFACE, frame(FRAME.SETTINGS, 0, 0, settings), frame(FRAME.WINDOW_UPDATE, 0, 0, u32(profile.connWindowUpdate))));
+		void this.readLoop();
+	}
+
+	/** Open a new stream for one request; resolves when that stream ends. Safe to call
+	 *  many times concurrently — the requests multiplex over the one connection. */
+	request(req: H2Request): Promise<HttpResponse> {
+		if (this.closed) return Promise.reject(new Error('h2: connection is closed'));
+		const id = this.nextId;
+		this.nextId += 2;
+		if (id > this.goawayLast) return Promise.reject(new Error('h2: server sent GOAWAY, open a new connection'));
+		const st: H2Stream = { headerBytes: new Uint8Array(0), bodyParts: [], status: 0, respHeaders: [], recv: 0, sendWindow: this.peerInitialWindow, done: false, settle: () => {}, fail: () => {} };
+		this.streams.set(id, st);
+		const hdrs: [string, string][] = [
+			[':method', req.method],
+			[':authority', req.authority],
+			[':scheme', 'https'],
+			[':path', req.path]
+		];
+		for (const [k, v] of Object.entries(req.headers)) {
+			const lk = k.toLowerCase();
+			if (lk === 'host' || lk === 'connection' || lk === 'transfer-encoding' || lk === 'keep-alive' || lk === 'upgrade') continue;
+			hdrs.push([lk, v]);
+		}
+		const hasBody = !!(req.body && req.body.length);
+		this.tls.writeApp(frame(FRAME.HEADERS, F_END_HEADERS | (hasBody ? 0 : F_END_STREAM), id, encodeHeaders(hdrs)));
+		const p = new Promise<HttpResponse>((res, rej) => {
+			st.settle = res;
+			st.fail = rej;
+		});
+		if (hasBody) void this.sendBody(id, st, req.body!);
+		return p;
+	}
+
+	/** Stream a request body, respecting connection + stream flow-control windows. */
+	private async sendBody(id: number, st: H2Stream, body: Uint8Array): Promise<void> {
+		let off = 0;
+		while (off < body.length && !this.closed) {
+			const avail = Math.min(this.connSendWindow, st.sendWindow, 16384);
+			if (avail <= 0) {
+				await new Promise<void>((r) => this.windowWaiters.push(r));
+				continue;
+			}
+			const n = Math.min(avail, body.length - off);
+			const last = off + n >= body.length;
+			this.tls.writeApp(frame(FRAME.DATA, last ? F_END_STREAM : 0, id, body.subarray(off, off + n)));
+			off += n;
+			this.connSendWindow -= n;
+			st.sendWindow -= n;
 		}
 	}
 
-	const fr = new FrameReader(() => tls.readApp());
-	const hpack = new Hpack();
-	let headerBytes: Uint8Array = new Uint8Array(0);
-	const bodyParts: Uint8Array[] = [];
-	let status = 0;
-	let respHeaders: [string, string][] = [];
-	let done = false;
-	let windowFromClient = 0; // bytes we've received, to replenish
+	private wakeWindow(): void {
+		const w = this.windowWaiters;
+		this.windowWaiters = [];
+		for (const f of w) f();
+	}
 
-	while (!done) {
-		const f = await fr.next();
-		if (f === null) throw new Error('h2: connection closed before stream end');
-		if (f.type === FRAME.SETTINGS && !(f.flags & F_ACK)) {
-			tls.writeApp(frame(FRAME.SETTINGS, F_ACK, 0, new Uint8Array(0))); // ack peer settings
-		} else if (f.type === FRAME.PING && !(f.flags & F_ACK)) {
-			tls.writeApp(frame(FRAME.PING, F_ACK, 0, f.payload)); // pong
-		} else if (f.type === FRAME.GOAWAY) {
-			if (!bodyParts.length && !status) throw new Error('h2: GOAWAY before response');
-			done = true;
-		} else if (f.streamId === 1) {
-			if (f.type === FRAME.HEADERS) {
-				// strip optional padding / priority
-				let pl = f.payload;
-				let o = 0;
-				const padded = (f.flags & 0x8) !== 0;
-				const prio = (f.flags & 0x20) !== 0;
-				let padLen = 0;
-				if (padded) padLen = pl[o++]!;
-				if (prio) o += 5;
-				headerBytes = concat(headerBytes, pl.subarray(o, pl.length - padLen));
-				if (f.flags & F_END_HEADERS) {
-					respHeaders = hpack.decode(headerBytes);
-					for (const [k, v] of respHeaders) if (k === ':status') status = Number(v);
-				}
-				if (f.flags & F_END_STREAM) done = true;
-			} else if (f.type === FRAME.DATA) {
-				let pl = f.payload;
-				let o = 0;
-				let padLen = 0;
-				if (f.flags & 0x8) padLen = pl[o++]!;
-				const data = pl.subarray(o, pl.length - padLen);
-				bodyParts.push(data);
-				windowFromClient += f.payload.length;
-				if (windowFromClient >= 1 << 18) {
-					// replenish connection + stream flow-control windows
-					const inc = new Uint8Array(4);
-					new DataView(inc.buffer).setUint32(0, windowFromClient);
-					tls.writeApp(frame(FRAME.WINDOW_UPDATE, 0, 0, inc));
-					tls.writeApp(frame(FRAME.WINDOW_UPDATE, 0, 1, inc));
-					windowFromClient = 0;
-				}
-				if (f.flags & F_END_STREAM) done = true;
-			} else if (f.type === FRAME.RST_STREAM) {
-				throw new Error('h2: stream reset by server');
+	private async readLoop(): Promise<void> {
+		const fr = new FrameReader(() => this.tls.readApp());
+		try {
+			for (;;) {
+				const f = await fr.next();
+				if (f === null) return this.fatal(new Error('h2: connection closed'));
+				this.onFrame(f);
+				if (this.closed) return;
+			}
+		} catch (e) {
+			this.fatal(e as Error);
+		}
+	}
+
+	private onFrame(f: Frame): void {
+		if (f.streamId === 0) {
+			if (f.type === FRAME.SETTINGS && !(f.flags & F_ACK)) {
+				this.applySettings(f.payload);
+				this.tls.writeApp(frame(FRAME.SETTINGS, F_ACK, 0, new Uint8Array(0)));
+			} else if (f.type === FRAME.PING && !(f.flags & F_ACK)) {
+				this.tls.writeApp(frame(FRAME.PING, F_ACK, 0, f.payload));
+			} else if (f.type === FRAME.WINDOW_UPDATE) {
+				this.connSendWindow += readU32(f.payload);
+				this.wakeWindow();
+			} else if (f.type === FRAME.GOAWAY) {
+				this.goawayLast = readU32(f.payload) & 0x7fffffff; // last stream the server will process
+			}
+			return;
+		}
+		const st = this.streams.get(f.streamId);
+		if (!st) return; // unknown or already-finished stream
+		if (f.type === FRAME.HEADERS || f.type === FRAME.CONTINUATION) {
+			let pl = f.payload;
+			let o = 0;
+			let padLen = 0;
+			if (f.type === FRAME.HEADERS && f.flags & 0x8) padLen = pl[o++]!; // padded
+			if (f.type === FRAME.HEADERS && f.flags & 0x20) o += 5; // priority
+			st.headerBytes = concat(st.headerBytes, pl.subarray(o, pl.length - padLen));
+			if (f.flags & F_END_HEADERS) {
+				st.respHeaders = this.hpack.decode(st.headerBytes);
+				for (const [k, v] of st.respHeaders) if (k === ':status') st.status = Number(v);
+			}
+			if (f.flags & F_END_STREAM) this.finish(f.streamId, st);
+		} else if (f.type === FRAME.DATA) {
+			let pl = f.payload;
+			let o = 0;
+			let padLen = 0;
+			if (f.flags & 0x8) padLen = pl[o++]!;
+			st.bodyParts.push(pl.subarray(o, pl.length - padLen));
+			st.recv += f.payload.length;
+			if (st.recv >= 1 << 18) {
+				this.tls.writeApp(frame(FRAME.WINDOW_UPDATE, 0, 0, u32(st.recv)));
+				this.tls.writeApp(frame(FRAME.WINDOW_UPDATE, 0, f.streamId, u32(st.recv)));
+				st.recv = 0;
+			}
+			if (f.flags & F_END_STREAM) this.finish(f.streamId, st);
+		} else if (f.type === FRAME.WINDOW_UPDATE) {
+			st.sendWindow += readU32(f.payload);
+			this.wakeWindow();
+		} else if (f.type === FRAME.RST_STREAM) {
+			this.streams.delete(f.streamId);
+			if (!st.done) {
+				st.done = true;
+				st.fail(new Error('h2: stream reset by server'));
 			}
 		}
 	}
 
-	// assemble headers map (lowercase; multiple set-cookie kept as array)
-	const headers: Record<string, string | string[]> = {};
-	for (const [k, v] of respHeaders) {
-		if (k.startsWith(':')) continue;
-		const prev = headers[k];
-		if (prev === undefined) headers[k] = v;
-		else if (Array.isArray(prev)) prev.push(v);
-		else headers[k] = [prev, v];
-	}
-	let body = concat(...bodyParts);
-	const enc = headers['content-encoding'];
-	const e = (Array.isArray(enc) ? enc.join(',') : enc ?? '').toLowerCase();
-	try {
-		if (e.includes('zstd') && typeof zlib.zstdDecompressSync === 'function') body = new Uint8Array(zlib.zstdDecompressSync(body));
-		else if (e.includes('br')) body = new Uint8Array(zlib.brotliDecompressSync(body));
-		else if (e.includes('gzip')) body = new Uint8Array(zlib.gunzipSync(body));
-		else if (e.includes('deflate')) body = new Uint8Array(zlib.inflateSync(body));
-	} catch {
-		/* leave as-is */
+	private applySettings(payload: Uint8Array): void {
+		for (let i = 0; i + 6 <= payload.length; i += 6) {
+			const id = (payload[i]! << 8) | payload[i + 1]!;
+			if (id === 0x4) {
+				// INITIAL_WINDOW_SIZE: adjust every open stream's send window by the delta (RFC §6.9.2)
+				const val = readU32(payload.subarray(i + 2));
+				const delta = val - this.peerInitialWindow;
+				this.peerInitialWindow = val;
+				for (const s of this.streams.values()) s.sendWindow += delta;
+				this.wakeWindow();
+			}
+		}
 	}
 
-	return {
-		status,
-		statusText: '',
-		headers,
-		body,
-		reusable: false,
-		text: () => Buffer.from(body).toString('utf8'),
-		json: <T>() => JSON.parse(Buffer.from(body).toString('utf8')) as T
-	};
+	private finish(id: number, st: H2Stream): void {
+		if (st.done) return;
+		st.done = true;
+		this.streams.delete(id);
+		const headers: Record<string, string | string[]> = {};
+		for (const [k, v] of st.respHeaders) {
+			if (k.startsWith(':')) continue;
+			const prev = headers[k];
+			if (prev === undefined) headers[k] = v;
+			else if (Array.isArray(prev)) prev.push(v);
+			else headers[k] = [prev, v];
+		}
+		const body = decompressBody(concat(...st.bodyParts), headers['content-encoding']);
+		st.settle({
+			status: st.status,
+			statusText: '',
+			headers,
+			body,
+			reusable: true,
+			text: () => Buffer.from(body).toString('utf8'),
+			json: <T>() => JSON.parse(Buffer.from(body).toString('utf8')) as T
+		});
+	}
+
+	private fatal(e: Error): void {
+		this.closed = true;
+		this.wakeWindow();
+		for (const st of this.streams.values())
+			if (!st.done) {
+				st.done = true;
+				st.fail(e);
+			}
+		this.streams.clear();
+	}
+
+	close(): void {
+		this.closed = true;
+		try {
+			this.tls.close();
+		} catch {
+			/* already gone */
+		}
+		this.fatal(new Error('h2: connection closed'));
+	}
+}
+
+/** One-shot HTTP/2 request (opens a connection, one stream). The caller owns `tls` and
+ *  closes it afterwards. For connection reuse / multiplexing use H2Connection via Session. */
+export async function h2Request(tls: TlsClient, req: H2Request, profile: H2Profile = CHROME_H2): Promise<HttpResponse> {
+	const conn = new H2Connection(tls);
+	conn.init(profile);
+	return conn.request(req);
 }

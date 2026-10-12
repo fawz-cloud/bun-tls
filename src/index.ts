@@ -12,7 +12,7 @@ export type { FromJa3Opts } from './fp/ja3';
 export type { Fingerprint } from './tls/clienthello';
 export { buildClientHello, ja3FromClientHello, ja4FromClientHello } from './tls/clienthello';
 export { TlsClient } from './tls/handshake';
-export { h2Request, CHROME_H2 } from './http/h2';
+export { h2Request, H2Connection, CHROME_H2 } from './http/h2';
 export type { H2Request, H2Profile } from './http/h2';
 export { publicSuffix, registrableDomain, isPublicSuffix } from './http/psl';
 export { tcpConnect, proxyConnect, socks5Connect } from './tls/transport';

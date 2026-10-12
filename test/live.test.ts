@@ -113,6 +113,14 @@ assert.ok(ja3nSet.size >= 5, 'client fingerprints distinct (edge==chrome collaps
 	assert.equal(r2.alpn, 'h2', 'negotiated HTTP/2');
 	assert.equal(r2.status, 200, 'h2 GET got 200');
 	assert.ok(r2.body.length > 0, 'h2 response has a body');
+
+	// 9b) Session over HTTP/2: 3 concurrent requests multiplexed on one connection.
+	const s2 = new Session({ http2: true });
+	const [a, b, c] = await Promise.all([s2.get('https://nghttp2.org/'), s2.get('https://nghttp2.org/httpbin/get'), s2.get('https://nghttp2.org/blog/')]);
+	console.log(`http/2 mux → ${a.status} ${b.status} ${c.status} alpn=${a.alpn}`);
+	assert.ok(a.status === 200 && b.status === 200 && c.status === 200, 'h2 multiplexed 3 streams on one connection');
+	assert.equal(a.alpn, 'h2', 'session negotiated h2');
+	s2.close();
 }
 
 console.log('live: OK');

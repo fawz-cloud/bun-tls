@@ -31,7 +31,7 @@ export interface RequestOptions {
 
 /** Return a copy of `fp` whose ALPN advertises h2 (then http/1.1), so the server may
  *  select HTTP/2. If the fingerprint has no ALPN extension, h2 is appended. */
-function withH2(fp: Fingerprint): Fingerprint {
+export function withH2(fp: Fingerprint): Fingerprint {
 	let found = false;
 	const extensions = fp.extensions.map((e) => (e.type === Ext.alpn ? ((found = true), alpnExt(['h2', 'http/1.1'])) : e));
 	if (!found) extensions.push(alpnExt(['h2', 'http/1.1']));
