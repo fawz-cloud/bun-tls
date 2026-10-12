@@ -6,6 +6,7 @@ import type { RequestOptions } from './client';
 import type { Fingerprint } from '../tls/clienthello';
 import type { TlsClient } from '../tls/handshake';
 import { TicketStore } from '../tls/resumption';
+import { isPublicSuffix } from './psl';
 
 interface Cookie {
 	value: string;
@@ -13,6 +14,7 @@ interface Cookie {
 	path: string;
 	expires: number; // epoch ms; 0 = session
 	secure: boolean;
+	sameSite: string; // lax | strict | none (stored; a programmatic client sends same-site)
 }
 
 /** Simple cookie jar: domain (suffix) + path (prefix) matching. */
@@ -20,26 +22,44 @@ export class CookieJar {
 	private jar = new Map<string, Cookie>();
 	setFromHeader(setCookie: string | string[] | undefined, url: URL): void {
 		if (!setCookie) return;
+		const host = url.hostname.toLowerCase();
 		for (const line of Array.isArray(setCookie) ? setCookie : [setCookie]) {
 			const parts = line.split(';');
-			const [nv, ...attrs] = parts;
-			const eq = nv!.indexOf('=');
+			const nv = parts[0]!;
+			const eq = nv.indexOf('=');
 			if (eq < 0) continue;
-			const name = nv!.slice(0, eq).trim();
-			const value = nv!.slice(eq + 1).trim();
-			const c: Cookie = { value, domain: url.hostname, path: '/', expires: 0, secure: false };
-			for (const a of attrs) {
+			const name = nv.slice(0, eq).trim();
+			const value = nv.slice(eq + 1).trim();
+			const c: Cookie = { value, domain: host, path: '/', expires: 0, secure: false, sameSite: 'lax' };
+			let domainAttr = '';
+			let hasDomain = false;
+			for (const a of parts.slice(1)) {
 				const i = a.indexOf('=');
 				const k = (i < 0 ? a : a.slice(0, i)).trim().toLowerCase();
 				const v = i < 0 ? '' : a.slice(i + 1).trim();
-				if (k === 'domain') c.domain = v.replace(/^\./, '');
-				else if (k === 'path') c.path = v || '/';
+				if (k === 'domain') {
+					hasDomain = true;
+					domainAttr = v.replace(/^\./, '').toLowerCase();
+				} else if (k === 'path') c.path = v || '/';
 				else if (k === 'secure') c.secure = true;
+				else if (k === 'samesite') c.sameSite = v.toLowerCase();
 				else if (k === 'max-age') c.expires = Date.now() + Number(v) * 1000;
 				else if (k === 'expires' && !c.expires) c.expires = Date.parse(v) || 0;
 			}
-			this.jar.set(`${c.domain}|${c.path}|${name}`, c);
-			if (value === '' || /deleted/i.test(value)) this.jar.delete(`${c.domain}|${c.path}|${name}`);
+			// Cookie prefixes (RFC 6265bis §5.5): __Secure- needs Secure; __Host- needs
+			// Secure, Path=/, and no Domain (host-only).
+			if (name.startsWith('__Secure-') && !c.secure) continue;
+			if (name.startsWith('__Host-') && (!c.secure || c.path !== '/' || hasDomain)) continue;
+			// Domain attribute: never a public suffix (supercookie guard), and the host must
+			// be within it. Otherwise the cookie is host-only.
+			if (hasDomain) {
+				if (isPublicSuffix(domainAttr)) continue;
+				if (host !== domainAttr && !host.endsWith('.' + domainAttr)) continue;
+				c.domain = domainAttr;
+			}
+			const key = `${c.domain}|${c.path}|${name}`;
+			this.jar.set(key, c);
+			if (value === '' || /deleted/i.test(value)) this.jar.delete(key);
 		}
 	}
 	header(url: URL): string {

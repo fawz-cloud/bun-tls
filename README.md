@@ -181,18 +181,19 @@ bun-tls fills that gap for Bun, at the cost of HTTP/1.1 only.
 - Keep-alive, 1-RTT resumption, optional 0-RTT (RFC 8448-checked key schedule),
   post-handshake KeyUpdate, and HelloRetryRequest — all handled.
 - ECDHE over X25519 / P-256 / P-384; HTTP and SOCKS5 proxies; gzip/deflate/br/zstd.
-- HTTP/2 (`request({ http2: true })`): ALPN h2, HPACK, flow control — real h2 requests.
+- HTTP/2 (`request({ http2: true })`): ALPN h2, HPACK, flow control, and Chrome's h2 fingerprint.
 - Optional mutual-TLS servers complete (we answer a CertificateRequest).
-- Certificate verification on by default, with chain path-building to a bundled root store.
+- Certificate verification on by default (CA-constrained chain, hostname + IP SANs, path-building
+  to a bundled root store); cookie jar with Public Suffix List + `__Host-`/`__Secure-` rules.
 - Fast for one-shot and concurrent requests on the local benchmark; small, readable code.
 
 ## Limitations
 
 - **TLS 1.2 is not supported** (TLS 1.3 only). **HTTP/2 works** via `request({ http2: true })`
-  — ALPN h2, HPACK, flow control, verified against Cloudflare/Google/nghttp2 — but it is
-  one request per connection (no multiplexing; `Session` keep-alive stays HTTP/1.1), and the
-  h2 SETTINGS are a generic client's, so the HTTP/2 fingerprint does not match a specific
-  browser. HTTP/1.1 is the default.
+  — ALPN h2, HPACK, flow control, verified against Cloudflare/Google/nghttp2. Its
+  SETTINGS / WINDOW_UPDATE / pseudo-header order reproduce Chrome's h2 (Akamai) fingerprint
+  `1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p`. It is one request per connection
+  (no multiplexing; `Session` keep-alive stays HTTP/1.1). HTTP/1.1 is the default.
 - **Post-quantum / FFDHE key exchange is advertised but not implemented.** ECDHE
   (X25519, P-256, P-384) is negotiated, incl. via HelloRetryRequest. The browser presets
   advertise `X25519MLKEM768` for JA3 fidelity but cannot negotiate it — so against a server

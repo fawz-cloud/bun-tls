@@ -236,18 +236,34 @@ export interface H2Request {
 	body?: Uint8Array;
 }
 
+/** The h2-level fingerprint knobs: SETTINGS (id,value in order) and the opening connection
+ *  WINDOW_UPDATE increment. These, with the pseudo-header order, form the "Akamai" h2
+ *  fingerprint. The default matches Chrome: `1:65536,2:0,4:6291456,6:262144|15663105|...|m,a,s,p`. */
+export interface H2Profile {
+	settings: [number, number][];
+	connWindowUpdate: number;
+}
+export const CHROME_H2: H2Profile = {
+	settings: [
+		[1, 65536], // HEADER_TABLE_SIZE
+		[2, 0], // ENABLE_PUSH
+		[4, 6291456], // INITIAL_WINDOW_SIZE
+		[6, 262144] // MAX_HEADER_LIST_SIZE
+	],
+	connWindowUpdate: 15663105
+};
+
 /** Perform one HTTP/2 request over a handshaked TLS client whose ALPN is "h2". */
-export async function h2Request(tls: TlsClient, req: H2Request): Promise<HttpResponse> {
-	// preface + SETTINGS (disable push, large initial stream window) + a big connection
-	// WINDOW_UPDATE, so the server can stream a whole response without stalling on flow control.
-	const settings = new Uint8Array(12);
+export async function h2Request(tls: TlsClient, req: H2Request, profile: H2Profile = CHROME_H2): Promise<HttpResponse> {
+	// preface + SETTINGS + opening connection WINDOW_UPDATE (profile = h2 fingerprint).
+	const settings = new Uint8Array(profile.settings.length * 6);
 	const sv = new DataView(settings.buffer);
-	sv.setUint16(0, 0x2); // ENABLE_PUSH
-	sv.setUint32(2, 0);
-	sv.setUint16(6, 0x4); // INITIAL_WINDOW_SIZE
-	sv.setUint32(8, 16777215);
+	profile.settings.forEach(([id, val], i) => {
+		sv.setUint16(i * 6, id);
+		sv.setUint32(i * 6 + 2, val >>> 0);
+	});
 	const connWU = new Uint8Array(4);
-	new DataView(connWU.buffer).setUint32(0, 0x3fff0000); // raise the connection-level window
+	new DataView(connWU.buffer).setUint32(0, profile.connWindowUpdate);
 	tls.writeApp(concat(PREFACE, frame(FRAME.SETTINGS, 0, 0, settings), frame(FRAME.WINDOW_UPDATE, 0, 0, connWU)));
 
 	// :pseudo-headers first (RFC 9113 §8.3), then regular headers
