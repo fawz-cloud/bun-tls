@@ -27,13 +27,28 @@ export function serializeRequest(req: HttpRequest): Uint8Array {
 	const lines = [`${req.method} ${req.path} HTTP/1.1`];
 	for (const [k, v] of Object.entries(req.headers)) lines.push(`${k}: ${v}`);
 	const head = lines.join('\r\n') + '\r\n\r\n';
-	return req.body && req.body.length ? concat(Buffer.from(head), req.body) : new Uint8Array(Buffer.from(head));
+	// Buffer IS a Uint8Array; the body is written separately by roundtrip, so no copy here.
+	return req.body && req.body.length ? concat(Buffer.from(head), req.body) : Buffer.from(head);
 }
 
-const indexOfCRLFCRLF = (b: Uint8Array): number => {
-	for (let i = 0; i + 3 < b.length; i++) if (b[i] === 13 && b[i + 1] === 10 && b[i + 2] === 13 && b[i + 3] === 10) return i;
+// Resume the CRLFCRLF scan from `from` (minus 3, to catch a terminator split across feeds).
+const indexOfCRLFCRLF = (b: Uint8Array, from = 0): number => {
+	for (let i = Math.max(0, from - 3); i + 3 < b.length; i++) if (b[i] === 13 && b[i + 1] === 10 && b[i + 2] === 13 && b[i + 3] === 10) return i;
 	return -1;
 };
+
+// Join zero-copy views into one exact-size buffer (no `concat(...parts)` spread, which can hit
+// the argument limit for many tiny chunks). Keeps body.byteOffset===0 so P8 can transfer it.
+function join(parts: Uint8Array[], total: number): Uint8Array {
+	if (parts.length === 1 && parts[0]!.length === total) return parts[0]!;
+	const out = new Uint8Array(total);
+	let o = 0;
+	for (const p of parts) {
+		out.set(p, o);
+		o += p.length;
+	}
+	return out;
+}
 
 function parseHead(head: string): { status: number; statusText: string; headers: Record<string, string | string[]> } {
 	const [statusLine, ...rest] = head.split('\r\n');
@@ -53,20 +68,114 @@ function parseHead(head: string): { status: number; statusText: string; headers:
 	return { status: Number(m[1]), statusText: m[2] ?? '', headers };
 }
 
-function dechunk(b: Uint8Array): Uint8Array {
-	const out: Uint8Array[] = [];
-	let i = 0;
-	for (;;) {
-		let j = i;
-		while (j + 1 < b.length && !(b[j] === 13 && b[j + 1] === 10)) j++;
-		const size = parseInt(Buffer.from(b.subarray(i, j)).toString('ascii').trim(), 16);
-		i = j + 2;
-		if (!Number.isFinite(size) || size === 0) break;
-		out.push(b.subarray(i, i + size));
-		i += size + 2; // skip trailing CRLF of the chunk
-	}
-	return concat(...out);
+// Incremental chunked-body decoder (RFC 9112 §7.1). A byte-level state machine so any split is
+// handled, chunk extensions (`;name=val`) and trailers are skipped, and a missing CR/LF where
+// the grammar requires one throws instead of silently truncating. push() returns true at the
+// terminating 0-size chunk; data chunks are collected as zero-copy views in `parts`.
+const enum CS {
+	Size, // reading hex size digits (and any ;extension), until CR
+	SizeLF, // seen CR after the size line, expect LF
+	Data, // copying `remaining` body bytes
+	DataCR, // expect CR after a chunk's data
+	DataLF, // expect LF after that CR
+	Trailer, // reading trailer lines after the 0 chunk
+	TrailerCR, // seen CR, expect LF (empty line ends the body)
+	Done
 }
+export class Dechunker {
+	parts: Uint8Array[] = [];
+	total = 0;
+	private st = CS.Size;
+	private size = 0; // current chunk size being parsed
+	private remaining = 0; // body bytes still to copy in Data
+	private sawDigit = false;
+	private inExt = false; // past the ';' of a chunk extension
+	private trailerLen = 0; // chars on the current trailer line
+
+	/** Feed bytes; returns true once the body is complete. Throws on malformed framing. */
+	push(b: Uint8Array): boolean {
+		let i = 0;
+		while (i < b.length) {
+			const c = b[i]!;
+			switch (this.st) {
+				case CS.Size:
+					if (c === 13) {
+						if (!this.sawDigit) throw new Error('chunked: missing size');
+						this.st = CS.SizeLF;
+						i++;
+					} else if (c === 59) {
+						this.inExt = true; // ';' → extension, skip to CR
+						i++;
+					} else if (this.inExt) {
+						i++; // ignore extension bytes
+					} else {
+						const d = hexVal(c);
+						if (d < 0) throw new Error('chunked: bad size byte');
+						if (++this.sizeDigits > 13) throw new Error('chunked: size too long'); // 13 hex = 52 bits, past 2^53
+						this.size = this.size * 16 + d;
+						this.sawDigit = true;
+						i++;
+					}
+					break;
+				case CS.SizeLF:
+					if (c !== 10) throw new Error('chunked: expected LF after size');
+					i++;
+					if (this.size === 0) {
+						this.st = CS.Trailer; // last chunk → trailers then end
+						this.trailerLen = 0;
+					} else {
+						this.remaining = this.size;
+						this.st = CS.Data;
+					}
+					this.size = 0;
+					this.sawDigit = false;
+					this.inExt = false;
+					this.sizeDigits = 0;
+					break;
+				case CS.Data: {
+					const take = Math.min(this.remaining, b.length - i);
+					this.parts.push(b.subarray(i, i + take));
+					this.total += take;
+					this.remaining -= take;
+					i += take;
+					if (this.remaining === 0) this.st = CS.DataCR;
+					break;
+				}
+				case CS.DataCR:
+					if (c !== 13) throw new Error('chunked: expected CR after data');
+					this.st = CS.DataLF;
+					i++;
+					break;
+				case CS.DataLF:
+					if (c !== 10) throw new Error('chunked: expected LF after data');
+					this.st = CS.Size;
+					i++;
+					break;
+				case CS.Trailer:
+					if (c === 13) {
+						this.st = this.trailerLen === 0 ? CS.Done : CS.TrailerCR;
+						i++;
+						if (this.st === CS.Done) return true; // empty line → body complete
+					} else {
+						this.trailerLen++;
+						i++;
+					}
+					break;
+				case CS.TrailerCR:
+					if (c !== 10) throw new Error('chunked: expected LF in trailer');
+					this.st = CS.Trailer;
+					this.trailerLen = 0;
+					i++;
+					break;
+				case CS.Done:
+					return true;
+			}
+		}
+		return this.st === CS.Done;
+	}
+	private sizeDigits = 0;
+}
+const hexVal = (c: number): number => (c >= 48 && c <= 57 ? c - 48 : c >= 97 && c <= 102 ? c - 87 : c >= 65 && c <= 70 ? c - 55 : -1);
 
 function decompress(body: Uint8Array, enc?: string | string[]): Uint8Array {
 	const e = (Array.isArray(enc) ? enc.join(',') : enc ?? '').toLowerCase();
@@ -88,10 +197,11 @@ export async function readResponse(read: () => Promise<Uint8Array | null>, metho
 	while (headEnd < 0) {
 		const chunk = await read();
 		if (chunk === null) throw new Error('connection closed before full header');
-		buf = concat(buf, chunk);
-		headEnd = indexOfCRLFCRLF(buf);
+		const prev = buf.length;
+		buf = buf.length ? concat(buf, chunk) : chunk; // adopt the first chunk, concat only if a second is needed
+		headEnd = indexOfCRLFCRLF(buf, prev);
 	}
-	const head = Buffer.from(buf.subarray(0, headEnd)).toString('latin1');
+	const head = Buffer.from(buf.buffer, buf.byteOffset, headEnd).toString('latin1'); // view, no copy
 	const { status, statusText, headers } = parseHead(head);
 	const connClose = (Array.isArray(headers['connection']) ? headers['connection'].join(',') : headers['connection'] ?? '')
 		.toLowerCase()
@@ -102,60 +212,68 @@ export async function readResponse(read: () => Promise<Uint8Array | null>, metho
 		const body = new Uint8Array(0);
 		return { status, statusText, headers, body, reusable: !connClose, text: () => '', json: <T>() => null as T };
 	}
-	let rest: Uint8Array = buf.subarray(headEnd + 4);
+	const rest: Uint8Array = buf.subarray(headEnd + 4);
 
 	const te = headers['transfer-encoding'];
 	const cl = headers['content-length'];
 	const chunked = (Array.isArray(te) ? te.join(',') : te ?? '').toLowerCase().includes('chunked');
-	// Accumulate into an array + one concat at the end (avoids O(n²) regrow per read).
-	const parts: Uint8Array[] = [rest];
+	let framed: Uint8Array;
+	let complete = true;
 	if (chunked) {
-		let tail = rest; // only the last ≤7 bytes are needed to detect the end marker
-		while (!isChunkEnd(tail)) {
+		const dc = new Dechunker();
+		let done = dc.push(rest);
+		while (!done) {
 			const chunk = await read();
-			if (chunk === null) break;
-			parts.push(chunk);
-			tail = concat(tail, chunk);
-			if (tail.length > 7) tail = tail.subarray(tail.length - 7);
+			if (chunk === null) {
+				complete = false;
+				break;
+			}
+			done = dc.push(chunk);
 		}
-		rest = dechunk(concat(...parts));
+		framed = join(dc.parts.length ? dc.parts : [new Uint8Array(0)], dc.total);
 	} else if (cl !== undefined) {
 		const want = Number(Array.isArray(cl) ? cl[0] : cl);
-		let have = rest.length;
-		while (have < want) {
-			const chunk = await read();
-			if (chunk === null) break;
-			parts.push(chunk);
-			have += chunk.length;
+		if (!Number.isFinite(want) || want <= 0) {
+			framed = new Uint8Array(0);
+		} else {
+			const parts: Uint8Array[] = [rest.length > want ? rest.subarray(0, want) : rest];
+			let have = parts[0]!.length;
+			while (have < want) {
+				const chunk = await read();
+				if (chunk === null) {
+					complete = false;
+					break;
+				}
+				const piece = have + chunk.length > want ? chunk.subarray(0, want - have) : chunk;
+				parts.push(piece);
+				have += piece.length;
+			}
+			framed = join(parts, have);
 		}
-		rest = concat(...parts).subarray(0, want);
 	} else {
+		// No framing → read to EOF; the server closed to signal the end, so not reusable.
+		const parts: Uint8Array[] = rest.length ? [rest] : [];
+		let total = rest.length;
 		for (;;) {
 			const chunk = await read();
 			if (chunk === null) break;
 			parts.push(chunk);
+			total += chunk.length;
 		}
-		rest = concat(...parts);
+		framed = join(parts.length ? parts : [new Uint8Array(0)], total);
+		complete = false; // EOF-delimited → treat as non-reusable below
 	}
 
-	const body = decompress(rest, headers['content-encoding']);
-	// Reusable only if the body was definitely framed (CL/chunked). The read-to-EOF
-	// branch means the server signalled end-of-body by closing → not reusable.
-	const reusable = (chunked || cl !== undefined) && !connClose;
+	const body = decompress(framed, headers['content-encoding']);
+	// Reusable only if the body was framed (CL/chunked), fully received, and no Connection: close.
+	const reusable = (chunked || cl !== undefined) && complete && !connClose;
 	return {
 		status,
 		statusText,
 		headers,
 		body,
 		reusable,
-		text: () => Buffer.from(body).toString('utf8'),
-		json: <T>() => JSON.parse(Buffer.from(body).toString('utf8')) as T
+		text: () => Buffer.from(body.buffer, body.byteOffset, body.length).toString('utf8'),
+		json: <T>() => JSON.parse(Buffer.from(body.buffer, body.byteOffset, body.length).toString('utf8')) as T
 	};
-}
-
-/** Chunked body is done once we see "0\r\n\r\n". */
-function isChunkEnd(b: Uint8Array): boolean {
-	if (b.length < 5) return false;
-	const s = Buffer.from(b.subarray(Math.max(0, b.length - 7))).toString('ascii');
-	return s.endsWith('0\r\n\r\n');
 }
