@@ -12,6 +12,7 @@ import { join } from 'node:path';
 import { HashAlg, sha } from '../core/crypto';
 import { concat } from '../core/bytes';
 import { verifyOcsp, fetchOcsp } from './ocsp';
+import { enforceConstraints } from './x509';
 
 // Trust store = Bun's built-in roots (tls.rootCertificates, often incomplete)
 // UNION the bundled Mozilla cacert.pem (scratch/bun-tls/cacert.pem). Roots are
@@ -112,6 +113,8 @@ export function verifyChain(certsDer: Uint8Array[], host: string, now = new Date
 		}
 		validUntil = Math.min(validUntil, to);
 	}
+	// RFC 5280 constraints: unknown critical extensions, leaf EKU, pathLen, NameConstraints.
+	enforceConstraints(chain, anchor);
 	chainCache.set(key, validUntil);
 }
 

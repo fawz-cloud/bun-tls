@@ -86,9 +86,10 @@ export function verifyOcsp(ocspDer: Uint8Array, leaf: crypto.X509Certificate, is
 	// Responder = the issuer itself, or a delegate the issuer signed carrying the
 	// OCSPSigning EKU. Try each authorised key; signature must verify under one.
 	const keys: crypto.KeyObject[] = [];
-	const certsField = basic.find((e) => e.tag === 0xa0); // [0] EXPLICIT certs
+	const certsField = basic.find((e) => e.tag === 0xa0); // [0] EXPLICIT SEQUENCE OF Certificate
 	if (certsField) {
-		const first = children(certsField.content)[0];
+		const seqOf = children(certsField.content)[0]; // unwrap the SEQUENCE OF…
+		const first = seqOf ? children(seqOf.content)[0] : undefined; // …then the first Certificate
 		if (first) {
 			const delegate = new crypto.X509Certificate(Buffer.from(first.raw));
 			if (safeVerify(delegate, issuer.publicKey) && hasOcspSigningEku(delegate)) keys.push(delegate.publicKey);
@@ -125,6 +126,7 @@ export function verifyOcsp(ocspDer: Uint8Array, leaf: crypto.X509Certificate, is
 		const nextUpd = nextEl ? derTime(children(nextEl.content)[0]!.content) : null;
 		if (thisUpd - SKEW > now) throw new Error('OCSP response not yet valid (thisUpdate in the future)');
 		if (nextUpd != null && nextUpd + SKEW < now) throw new Error('OCSP response expired (nextUpdate in the past)');
+			if (nextUpd == null && thisUpd + 7 * 24 * 3600_000 < now) throw new Error('OCSP response too old (no nextUpdate, past 7-day max age)');
 
 		const t = sr[1]!.tag; // CertStatus: [0] good, [1] revoked, [2] unknown
 		return t === 0x80 ? 'good' : t === 0xa1 ? 'revoked' : 'unknown';

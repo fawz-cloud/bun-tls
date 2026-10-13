@@ -129,6 +129,7 @@ async function rawConnect(host: string, port: number): Promise<RawConn> {
 		close() {
 			if (!closed) {
 				closed = true;
+				q.push(null); // wake any pending read() so a timeout/cancellation unblocks it
 				try {
 					sock.end();
 				} catch {
@@ -159,6 +160,7 @@ async function readExact(conn: RawConn, n: number): Promise<Uint8Array> {
 export async function socks5Connect(proxyUrl: string, targetHost: string, targetPort: number): Promise<Transport> {
 	const pu = new URL(proxyUrl);
 	const conn = await rawConnect(pu.hostname, Number(pu.port || 1080));
+	try {
 	const user = pu.username ? decodeURIComponent(pu.username) : '';
 	const pass = pu.password ? decodeURIComponent(pu.password) : '';
 	// greeting: offer no-auth, plus user/pass when credentials are present
@@ -186,6 +188,10 @@ export async function socks5Connect(proxyUrl: string, targetHost: string, target
 	const addrLen = atyp === 0x01 ? 4 : atyp === 0x04 ? 16 : atyp === 0x03 ? (await readExact(conn, 1))[0]! : 0;
 	await readExact(conn, addrLen + 2); // BND.ADDR + BND.PORT (ignored)
 	return { write: conn.write, writeAsync: conn.writeAsync, read: conn.read, close: conn.close };
+	} catch (e) {
+		conn.close(); // a failed negotiation must not leak the proxy socket
+		throw e;
+	}
 }
 
 /** Tunnel through a proxy and return a byte transport for TLS to run on. Dispatches by
@@ -195,6 +201,7 @@ export async function proxyConnect(proxyUrl: string, targetHost: string, targetP
 	if (/^socks/i.test(proxyUrl)) return socks5Connect(proxyUrl, targetHost, targetPort);
 	const pu = new URL(proxyUrl);
 	const conn = await rawConnect(pu.hostname, Number(pu.port || 80));
+	try {
 	const authority = `${targetHost}:${targetPort}`;
 	const lines = [`CONNECT ${authority} HTTP/1.1`, `Host: ${authority}`];
 	if (pu.username) {
@@ -224,4 +231,8 @@ export async function proxyConnect(proxyUrl: string, targetHost: string, targetP
 	}
 	conn.q.unshift(buf.subarray(sep + 4)); // bytes the server already sent
 	return { write: conn.write, writeAsync: conn.writeAsync, read: conn.read, close: conn.close };
+	} catch (e) {
+		conn.close(); // a failed CONNECT negotiation must not leak the proxy socket
+		throw e;
+	}
 }

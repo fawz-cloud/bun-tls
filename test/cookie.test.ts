@@ -24,4 +24,17 @@ assert.ok(h.includes('host=3'), 'host-only cookie kept');
 assert.ok(!h.includes('__Host-a=4'), '__Host- without Secure rejected');
 assert.ok(h.includes('__Host-b=5'), '__Host- with Secure + Path=/ kept');
 
+// Host-only scope (RFC 6265 §5.3): a cookie with no Domain goes ONLY to the exact host.
+const s2 = new Session();
+s2.cookies.setFromHeader(['sid=1', '__Host-k=2; Secure; Path=/'], new URL('https://login.example.com/'));
+assert.ok(s2.cookies.header(new URL('https://login.example.com/')).includes('sid=1'), 'host-only cookie sent to the exact host');
+assert.ok(!s2.cookies.header(new URL('https://child.login.example.com/')).includes('sid=1'), 'host-only cookie NOT sent to a subdomain');
+assert.ok(!s2.cookies.header(new URL('https://child.login.example.com/')).includes('__Host-k=2'), '__Host- cookie NOT sent to a subdomain');
+
+// Default-path (RFC 6265 §5.1.4): a cookie with no Path defaults to the request directory.
+const s3 = new Session();
+s3.cookies.setFromHeader(['p=1'], new URL('https://example.com/app/login'));
+assert.ok(s3.cookies.header(new URL('https://example.com/app/x')).includes('p=1'), 'default-path cookie sent within /app');
+assert.ok(!s3.cookies.header(new URL('https://example.com/other')).includes('p=1'), 'default-path cookie NOT sent to /other');
+
 console.log('cookie: OK');

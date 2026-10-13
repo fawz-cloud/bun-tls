@@ -21,9 +21,25 @@ interface Cookie {
 	value: string;
 	domain: string;
 	path: string;
+	/** No Domain attribute → the cookie is sent ONLY to the exact host (RFC 6265 §5.3). */
+	hostOnly: boolean;
 	expires: number; // epoch ms; 0 = session
 	secure: boolean;
 	sameSite: string; // lax | strict | none (stored; a programmatic client sends same-site)
+}
+
+/** A connection's security policy. Pooled connections and resumption tickets are keyed by
+ *  it so a looser-policy connection (verify:false, ocsp:off) is NEVER reused — or resumed
+ *  into — a stricter request (verify:true, ocsp:hard). */
+function policyOf(o: OpenOptions): string {
+	return `v${o.verify !== false ? 1 : 0}o${o.ocsp ?? 'off'}t${o.tls12 ? 1 : 0}`;
+}
+
+/** RFC 6265 §5.1.4 default-path: the directory of the request URI (not always "/"). */
+function defaultPath(pathname: string): string {
+	if (!pathname.startsWith('/')) return '/';
+	const i = pathname.lastIndexOf('/');
+	return i <= 0 ? '/' : pathname.slice(0, i);
 }
 
 /** Simple cookie jar: domain (suffix) + path (prefix) matching. */
@@ -39,7 +55,7 @@ export class CookieJar {
 			if (eq < 0) continue;
 			const name = nv.slice(0, eq).trim();
 			const value = nv.slice(eq + 1).trim();
-			const c: Cookie = { value, domain: host, path: '/', expires: 0, secure: false, sameSite: 'lax' };
+			const c: Cookie = { value, domain: host, path: defaultPath(url.pathname), hostOnly: true, expires: 0, secure: false, sameSite: 'lax' };
 			let domainAttr = '';
 			let hasDomain = false;
 			for (const a of parts.slice(1)) {
@@ -49,7 +65,7 @@ export class CookieJar {
 				if (k === 'domain') {
 					hasDomain = true;
 					domainAttr = v.replace(/^\./, '').toLowerCase();
-				} else if (k === 'path') c.path = v || '/';
+				} else if (k === 'path' && v.startsWith('/')) c.path = v; // else keep the default-path
 				else if (k === 'secure') c.secure = true;
 				else if (k === 'samesite') c.sameSite = v.toLowerCase();
 				else if (k === 'max-age') c.expires = Date.now() + Number(v) * 1000;
@@ -65,6 +81,7 @@ export class CookieJar {
 				if (isPublicSuffix(domainAttr)) continue;
 				if (host !== domainAttr && !host.endsWith('.' + domainAttr)) continue;
 				c.domain = domainAttr;
+				c.hostOnly = false; // a Domain attribute makes the cookie valid for subdomains too
 			}
 			const key = `${c.domain}|${c.path}|${name}`;
 			this.jar.set(key, c);
@@ -81,7 +98,7 @@ export class CookieJar {
 			}
 			if (c.secure && url.protocol !== 'https:') continue;
 			const host = url.hostname;
-			const domOk = host === c.domain || host.endsWith('.' + c.domain);
+			const domOk = c.hostOnly ? host === c.domain : host === c.domain || host.endsWith('.' + c.domain);
 			const pathOk = url.pathname === c.path || url.pathname.startsWith(c.path.endsWith('/') ? c.path : c.path + '/');
 			if (domOk && pathOk) out.push(`${key.split('|')[2]}=${c.value}`);
 		}
@@ -139,6 +156,7 @@ export class Session {
 		let url = req.url;
 		let method = req.method ?? 'GET';
 		let body: Uint8Array | undefined = typeof req.body === 'string' ? new Uint8Array(Buffer.from(req.body)) : req.body;
+		const origin0 = new URL(req.url).origin; // auth headers belong to the ORIGINAL origin only
 		for (let hop = 0; ; hop++) {
 			const u = new URL(url);
 			if (u.protocol !== 'https:') throw new Error('only https (TLS) is supported');
@@ -155,7 +173,10 @@ export class Session {
 				timeoutMs: req.timeoutMs ?? this.opts.timeoutMs
 			};
 			const cookieHeader = this.cookies.header(u);
-			const userHeaders = { ...(this.opts.headers ?? {}), ...(req.headers ?? {}), ...(cookieHeader ? { Cookie: cookieHeader } : {}) };
+			const userHeaders: Record<string, string> = { ...(this.opts.headers ?? {}), ...(req.headers ?? {}), ...(cookieHeader ? { Cookie: cookieHeader } : {}) };
+			// Never forward credentials to a different origin across a redirect (the Cookie
+			// jar already scopes cookies per origin; this covers an explicit Authorization).
+			if (u.origin !== origin0) for (const k of Object.keys(userHeaders)) if (/^(authorization|proxy-authorization)$/i.test(k)) delete userHeaders[k];
 			const rt: RoundtripOptions = {
 				method,
 				host,
@@ -165,7 +186,7 @@ export class Session {
 				body,
 				keepAlive
 			};
-			const key = `${open.proxy ?? ''}|${host}:${port}`;
+			const key = `${open.proxy ?? ''}|${host}:${port}|${policyOf(open)}`;
 			const res = useH2
 				? await this.h2send(
 						key,
@@ -201,28 +222,32 @@ export class Session {
 	 *  the next pooled one, finally dialing fresh. (Standard keep-alive retry; a POST
 	 *  that was already received by the server before the reset could be re-sent.) */
 	private async send(key: string, open: OpenOptions, rt: RoundtripOptions, keepAlive: boolean): Promise<ClientResponse> {
+		const idempotent = rt.method === 'GET' || rt.method === 'HEAD';
+		const tkey = `${open.host}|${policyOf(open)}`; // tickets scoped to the same policy as the pool
 		// 1) Reuse a live pooled connection — no handshake at all (fastest).
 		const idle = this.pool.get(key);
 		while (idle && idle.length) {
 			const tls = idle.pop()!;
 			try {
 				return this.recycle(key, tls, await roundtrip(tls, rt), keepAlive);
-			} catch {
+			} catch (e) {
 				try {
 					tls.close();
 				} catch {
 					/* already gone */
 				}
+				// A non-idempotent request may have already been received + processed by the
+				// server before the reset — never silently re-send it (at-most-once).
+				if (!idempotent) throw e;
 			}
 		}
 		// 2) New connection: resume from a stored ticket if we have one. With zeroRtt opted
 		//    in, a GET/HEAD also rides in the ClientHello as early data when allowed.
-		const ticket = this.tickets.take(open.host);
-		const idempotent = rt.method === 'GET' || rt.method === 'HEAD';
+		const ticket = this.tickets.take(tkey);
 		const use0rtt = !!ticket && ticket.maxEarlyData > 0 && idempotent && (this.opts.zeroRtt ?? false);
 		const resume = ticket ? { ticket, earlyData: use0rtt } : undefined;
 		const earlyData = use0rtt ? serializeForEarly(rt) : undefined;
-		const tls = await openConnection({ ...open, resume, earlyData, onTicket: (t) => this.tickets.add(open.host, t) });
+		const tls = await openConnection({ ...open, resume, earlyData, onTicket: (t) => this.tickets.add(tkey, t) });
 		return this.recycle(key, tls, await roundtrip(tls, rt, tls.earlyAccepted), keepAlive);
 	}
 
@@ -246,7 +271,7 @@ export class Session {
 			entry = undefined;
 		}
 		if (!entry) {
-			const tls = await openConnection({ ...open, fingerprint: withH2(open.fingerprint ?? modern()), onTicket: (t) => this.tickets.add(open.host, t) });
+			const tls = await openConnection({ ...open, fingerprint: withH2(open.fingerprint ?? modern()), onTicket: (t) => this.tickets.add(`${open.host}|${policyOf(open)}`, t) });
 			const fp = { ja3: tls.ja3, ja3Hash: tls.ja3Hash, ja3n: tls.ja3n, ja3nHash: tls.ja3nHash, ja4: tls.ja4, alpn: tls.alpn };
 			if (tls.alpn !== 'h2') {
 				// server declined h2 → serve this request over HTTP/1.1 and drop the socket
