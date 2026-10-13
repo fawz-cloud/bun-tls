@@ -47,6 +47,9 @@ via a patched libcurl (C); we do it in TS.
 | `http/h2.ts` | HTTP/2: frames + HPACK + flow control + multiplexed `H2Connection` |
 | `http/psl.ts` | Public Suffix List lookup (cookie supercookie guard) |
 | `http/client.ts` | `request()` single-shot |
+| `http/fetchlike.ts` | `fetch()` — Web-standard API, streaming Response body |
+| `http/ws.ts` | WebSocket (RFC 6455) over the fingerprinted TLS |
+| `quic/varint.ts` · `quic/crypto.ts` · `quic/packet.ts` | QUIC core: varints + RFC 9001 Initial packet protection (HTTP/3 foundation) |
 | `http/session.ts` | `Session` = cookie jar + redirects + persistent opts |
 | `index.ts` | public re-exports |
 | `cacert.pem` | bundled Mozilla roots (union with Bun's) |
