@@ -23,7 +23,12 @@ import zlib from 'node:zlib';
 import { writeVarint } from './varint';
 import { initialKeys, packetKeys, type PacketKeys } from './crypto';
 import { buildPacket, parsePacket, buildShort, parseShort, PKT, longPacketType, longPacketEnd } from './packet';
-import { parseFrames, cryptoFrame, ackFrame, type Frame } from './frames';
+import { parseFrames, cryptoFrame, PnRanges, Reassembler, type Frame } from './frames';
+
+/** Flow-control credit we grant the peer (also our transport parameters): per request stream,
+ *  and for the whole connection. h3.ts extends both as it consumes the response. */
+export const STREAM_WINDOW = 262144;
+export const CONN_WINDOW = 1048576;
 
 const SUITE_HASH: Record<number, HashAlg> = { [Cipher.TLS_AES_128_GCM_SHA256]: 'sha256', [Cipher.TLS_AES_256_GCM_SHA384]: 'sha384', [Cipher.TLS_CHACHA20_POLY1305_SHA256]: 'sha256' };
 const SUITE_KEYLEN: Record<number, number> = { [Cipher.TLS_AES_128_GCM_SHA256]: 16, [Cipher.TLS_AES_256_GCM_SHA384]: 32, [Cipher.TLS_CHACHA20_POLY1305_SHA256]: 32 };
@@ -43,11 +48,8 @@ export class QuicConnection {
 	private origDcid: Uint8Array;
 	private keys: { initial: { c: PacketKeys; s: PacketKeys }; handshake?: { c: PacketKeys; s: PacketKeys }; app?: { c: PacketKeys; s: PacketKeys } };
 	private pn = { initial: 0, handshake: 0, app: 0 };
-	private largest = { initial: -1, handshake: -1, app: -1 }; // largest received PN per space (for ACKs)
-	private cryptoBuf: Record<Space, { chunks: Map<number, Uint8Array>; consumed: number }> = {
-		initial: { chunks: new Map(), consumed: 0 },
-		handshake: { chunks: new Map(), consumed: 0 }
-	};
+	private recv = { initial: new PnRanges(), handshake: new PnRanges(), app: new PnRanges() }; // received PNs per space (ACKs name exactly these)
+	private cryptoBuf: Record<Space, Reassembler> = { initial: new Reassembler(), handshake: new Reassembler() };
 	private dgQueue: Uint8Array[] = [];
 	private dgWaiter: ((b: Uint8Array | null) => void) | null = null;
 	private transcript: Uint8Array[] = [];
@@ -100,15 +102,16 @@ export class QuicConnection {
 		this.sendInitialFlight();
 
 		const deadline = Date.now() + timeoutMs;
-		while (!this.hsComplete && Date.now() < deadline) {
+		while (!this.hsComplete && !this.closed && Date.now() < deadline) {
 			const dg = await this.recvDatagram(deadline - Date.now());
 			if (!dg) {
 				this.sendInitialFlight(); // retransmit on timeout (minimal loss recovery)
 				continue;
 			}
 			this.processDatagram(dg);
+			if (this.closeError) throw this.closeError;
 		}
-		if (!this.hsComplete) throw new Error('QUIC handshake timed out');
+		if (!this.hsComplete) throw new Error(this.closed ? 'QUIC connection closed during the handshake' : 'QUIC handshake timed out');
 	}
 
 	private buildCH(): Uint8Array {
@@ -116,10 +119,10 @@ export class QuicConnection {
 		const tp = concat(
 			tpParam(0x01, writeVarint(30000)),
 			tpParam(0x03, writeVarint(1472)),
-			tpParam(0x04, writeVarint(1048576)),
-			tpParam(0x05, writeVarint(262144)),
-			tpParam(0x06, writeVarint(262144)),
-			tpParam(0x07, writeVarint(262144)),
+			tpParam(0x04, writeVarint(CONN_WINDOW)), // initial_max_data
+			tpParam(0x05, writeVarint(STREAM_WINDOW)), // initial_max_stream_data_bidi_local (our request streams)
+			tpParam(0x06, writeVarint(STREAM_WINDOW)),
+			tpParam(0x07, writeVarint(STREAM_WINDOW)),
 			tpParam(0x08, writeVarint(100)),
 			tpParam(0x09, writeVarint(100)),
 			tpParam(0x0f, this.scid)
@@ -174,7 +177,7 @@ export class QuicConnection {
 		const ik = initialKeys(newScid);
 		this.keys.initial = { c: ik.client, s: ik.server };
 		this.pn.initial = 0;
-		this.largest.initial = -1;
+		this.recv.initial = new PnRanges();
 		this.sendInitialFlight();
 	}
 
@@ -212,18 +215,21 @@ export class QuicConnection {
 				off = end; // can't/needn't decrypt (0-RTT, or Handshake before we have keys)
 				continue;
 			}
+			let p: ReturnType<typeof parsePacket>;
 			try {
-				const p = parsePacket(dg, off, this.spaceKeys(sp).s, sp === 'handshake' ? this.keyLen : 16);
-				if (p.scid.length) this.dcid = p.scid; // adopt the server's connection id
-				this.largest[sp] = Math.max(this.largest[sp], p.pn);
-				ackNeed[sp] = true;
-				const ff = parseFrames(p.payload);
-				for (const f of ff) this.onFrame(sp, f);
-				if (sp === 'initial') this.maybeDeriveHandshake(); // install hs keys before a coalesced Handshake packet in the SAME datagram
+				p = parsePacket(dg, off, this.spaceKeys(sp).s, sp === 'handshake' ? this.keyLen : 16, this.recv[sp].largest);
 			} catch {
-				/* undecryptable (reordered) — skip */
+				off = end; // undecryptable (reordered): skipped and not acked, so the peer resends it
+				continue;
 			}
 			off = end;
+			if (p.scid.length) this.dcid = p.scid; // adopt the server's connection id
+			ackNeed[sp] = true; // (a duplicate too: our earlier ACK was likely lost)
+			if (!this.recv[sp].add(p.pn)) continue; // a duplicate: already processed
+			for (const f of parseFrames(p.payload)) this.onFrame(sp, f);
+			// install hs keys before a coalesced Handshake packet in the SAME datagram; a protocol
+			// error from the ServerHello propagates instead of being taken for a bad packet
+			if (sp === 'initial') this.maybeDeriveHandshake();
 		}
 		// Acknowledge what we processed, and advance the handshake.
 		if (ackNeed.initial) this.sendAck('initial');
@@ -232,25 +238,14 @@ export class QuicConnection {
 	}
 
 	private onFrame(sp: Space, f: Frame): void {
-		if (f.type === 'crypto') {
-			const cb = this.cryptoBuf[sp];
-			cb.chunks.set(f.offset, f.data);
-		} else if (f.type === 'handshake_done') this.handshakeDone = true;
-		else if (f.type === 'close') throw new Error(`QUIC CONNECTION_CLOSE code=${f.code} ${f.reason}`);
+		if (f.type === 'crypto') this.cryptoBuf[sp].push(f.offset, f.data);
+		else if (f.type === 'handshake_done') this.handshakeDone = true;
+		else if (f.type === 'close') this.closeError ??= new Error(`QUIC CONNECTION_CLOSE code=${f.code} ${f.reason}`);
 	}
 
 	/** Contiguous CRYPTO bytes available from `consumed` onward in a space. */
 	private drainCrypto(sp: Space): Uint8Array {
-		const cb = this.cryptoBuf[sp];
-		const parts: Uint8Array[] = [];
-		for (;;) {
-			const next = cb.chunks.get(cb.consumed);
-			if (!next) break;
-			parts.push(next);
-			cb.chunks.delete(cb.consumed);
-			cb.consumed += next.length;
-		}
-		return parts.length ? concat(...parts) : new Uint8Array(0);
+		return this.cryptoBuf[sp].take();
 	}
 
 	// TLS message reassembly buffers per space.
@@ -338,53 +333,59 @@ export class QuicConnection {
 		const verify = finishedVerify(this.hash, this.sched.cHs, th);
 		const fin = concat(Uint8Array.of(HandshakeType.finished), Uint8Array.of(0, 0, hashLen(this.hash)), verify);
 		// Send: ACK(handshake) + our Finished in a Handshake packet.
-		const hsPayload = concat(ackFrame(this.largest.handshake), cryptoFrame(0, fin));
+		const hsPayload = concat(this.recv.handshake.ackFrame(), cryptoFrame(0, fin));
 		this.sock.send(buildPacket(PKT.handshake, this.dcid, this.scid, new Uint8Array(0), hsPayload, this.pn.handshake++, this.keys.handshake!.c, this.keyLen), this.port, this.addr);
 		this.hsComplete = true;
 	}
 
 	private sendAck(sp: Space): void {
-		if (this.largest[sp] < 0) return;
+		if (this.recv[sp].largest < 0) return;
 		const keys = this.spaceKeys(sp).c;
 		const type = sp === 'initial' ? PKT.initial : PKT.handshake;
 		// Initial packets must be ≥1200 only for the client's first flight; ACK-only can be small.
-		this.sock.send(buildPacket(type, this.dcid, this.scid, new Uint8Array(0), ackFrame(this.largest[sp]), this.pn[sp]++, keys, sp === 'handshake' ? this.keyLen : 16), this.port, this.addr);
+		this.sock.send(buildPacket(type, this.dcid, this.scid, new Uint8Array(0), this.recv[sp].ackFrame(), this.pn[sp]++, keys, sp === 'handshake' ? this.keyLen : 16), this.port, this.addr);
 	}
 
 	// ── 1-RTT (application) data, for the HTTP/3 layer ──────────────────────────────
 	private app1rttFrames: Frame[] = [];
+	/** Set when the peer sent CONNECTION_CLOSE: the next read rejects with it. */
+	private closeError: Error | null = null;
 
 	private on1rtt(dg: Uint8Array, off: number): void {
 		if (!this.keys.app) return;
+		let p: { pn: number; payload: Uint8Array };
 		try {
-			const p = parseShort(dg, off, this.scid.length, this.keys.app.s, this.appKeyLen);
-			this.largest.app = Math.max(this.largest.app, p.pn);
-			for (const f of parseFrames(p.payload)) {
-				if (f.type === 'handshake_done') this.handshakeDone = true;
-				else if (f.type === 'close') throw new Error(`QUIC CONNECTION_CLOSE code=${f.code} ${f.reason}`);
-				else this.app1rttFrames.push(f);
-			}
+			p = parseShort(dg, off, this.scid.length, this.keys.app.s, this.appKeyLen, this.recv.app.largest);
 		} catch {
-			/* undecryptable */
+			return; // undecryptable: dropped and NOT acked, so the peer resends what it carried
+		}
+		if (!this.recv.app.add(p.pn)) return; // a duplicate (the peer resent it): already processed
+		for (const f of parseFrames(p.payload)) {
+			if (f.type === 'handshake_done') this.handshakeDone = true;
+			else if (f.type === 'close') this.closeError ??= new Error(`QUIC CONNECTION_CLOSE code=${f.code} ${f.reason}`);
+			else this.app1rttFrames.push(f);
 		}
 	}
 
 	/** Send frame bytes in a 1-RTT packet (plus an ACK of what we've received). */
 	send1rtt(frames: Uint8Array): void {
-		const payload = this.largest.app >= 0 ? concat(ackFrame(this.largest.app), frames) : frames;
+		const payload = this.recv.app.largest >= 0 ? concat(this.recv.app.ackFrame(), frames) : frames;
 		this.sock.send(buildShort(this.dcid, payload, this.pn.app++, this.keys.app!.c, this.appKeyLen), this.port, this.addr);
 	}
 
-	/** Await the next batch of 1-RTT STREAM/other frames (auto-ACKs, drops handshake pkts). */
+	/** Await the next batch of 1-RTT STREAM/other frames (auto-ACKs, drops handshake pkts).
+	 *  Rejects once the peer has closed the connection; [] when the time is up or we closed. */
 	async recv1rtt(timeoutMs = 8000): Promise<Frame[]> {
 		const deadline = Date.now() + timeoutMs;
 		for (;;) {
 			if (this.app1rttFrames.length) {
 				const f = this.app1rttFrames;
 				this.app1rttFrames = [];
-				if (this.largest.app >= 0) this.sock.send(buildShort(this.dcid, ackFrame(this.largest.app), this.pn.app++, this.keys.app!.c, this.appKeyLen), this.port, this.addr);
+				if (this.recv.app.largest >= 0) this.sock.send(buildShort(this.dcid, this.recv.app.ackFrame(), this.pn.app++, this.keys.app!.c, this.appKeyLen), this.port, this.addr);
 				return f;
 			}
+			if (this.closeError) throw this.closeError;
+			if (this.closed) return [];
 			const dg = await this.recvDatagram(deadline - Date.now());
 			if (!dg) {
 				if (Date.now() >= deadline) return [];

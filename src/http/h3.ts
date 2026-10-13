@@ -2,10 +2,10 @@
 // only (we advertise dynamic-table capacity 0), so field lines are indexed-static, literal
 // with a static name reference, or literal with a literal name — no dynamic table needed.
 import { writeVarint, readVarint } from '../quic/varint';
-import { streamFrame } from '../quic/frames';
+import { streamFrame, maxDataFrame, maxStreamDataFrame, Reassembler } from '../quic/frames';
 import { concat } from '../core/bytes';
 import { huffmanDecode } from './h2';
-import type { QuicConnection } from '../quic/connection';
+import { STREAM_WINDOW, CONN_WINDOW, type QuicConnection } from '../quic/connection';
 
 // RFC 9204 Appendix A — QPACK static table (index → [name, value]).
 const STATIC: [string, string][] = [
@@ -165,30 +165,33 @@ export async function h3Request(conn: QuicConnection, method: string, authority:
 	conn.send1rtt(streamFrame(0, 0, reqData, true));
 
 	// Reassemble stream 0 (our response), parse HTTP/3 frames.
-	const chunks = new Map<number, Uint8Array>();
-	let consumed = 0;
+	const stream = new Reassembler();
 	let finOffset = -1;
 	let buf: Uint8Array = new Uint8Array(0);
 	let status = 0;
 	const headers: Record<string, string | string[]> = {};
 	const bodyParts: Uint8Array[] = [];
 	const deadline = Date.now() + timeoutMs;
+	// Flow control: keep the peer's credit a full window ahead of what we consumed, or a body
+	// past STREAM_WINDOW (256 KiB) stalls the server forever.
+	let maxStream = STREAM_WINDOW;
+	let maxData = CONN_WINDOW;
+	let complete = false;
 
-	while (Date.now() < deadline) {
+	while (!complete && Date.now() < deadline) {
 		const frames = await conn.recv1rtt(deadline - Date.now());
+		if (!frames.length && conn.closed) break;
 		for (const f of frames) {
 			if (f.type !== 'stream' || f.id !== 0) continue;
-			chunks.set(f.offset, f.data);
+			stream.push(f.offset, f.data);
 			if (f.fin) finOffset = f.offset + f.data.length;
 		}
-		// contiguous drain
-		for (;;) {
-			const next = chunks.get(consumed);
-			if (!next) break;
-			buf = buf.length ? concat(buf, next) : next;
-			chunks.delete(consumed);
-			consumed += next.length;
-		}
+		const fresh = stream.take();
+		if (fresh.length) buf = buf.length ? concat(buf, fresh) : fresh;
+		const credit: Uint8Array[] = [];
+		if (maxStream - stream.consumed < STREAM_WINDOW / 2) credit.push(maxStreamDataFrame(0, (maxStream = stream.consumed + STREAM_WINDOW)));
+		if (maxData - stream.consumed < CONN_WINDOW / 2) credit.push(maxDataFrame((maxData = stream.consumed + CONN_WINDOW)));
+		if (credit.length) conn.send1rtt(concat(...credit));
 		// parse complete HTTP/3 frames out of buf
 		let o = 0;
 		for (;;) {
@@ -215,8 +218,10 @@ export async function h3Request(conn: QuicConnection, method: string, authority:
 			o += hdr + l.value;
 		}
 		buf = buf.subarray(o);
-		consumed -= 0;
-		if (finOffset >= 0 && consumed >= finOffset && chunks.size === 0 && buf.length === 0) break;
+		complete = finOffset >= 0 && stream.consumed >= finOffset && buf.length === 0;
 	}
+	// Never hand back a partial response as if it were whole.
+	if (!complete) throw new Error(`h3: response incomplete — the stream did not finish (${stream.consumed} bytes${finOffset >= 0 ? ` of ${finOffset}` : ', no FIN'}) before the deadline`);
+	if (!status) throw new Error('h3: response stream ended without a HEADERS frame');
 	return { status, headers, body: concat(...bodyParts) };
 }

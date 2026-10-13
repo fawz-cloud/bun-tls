@@ -34,6 +34,19 @@ function sealPacket(aead: Aead, nonce: Uint8Array, header: Uint8Array, payload: 
 const openPacket = (aead: Aead, nonce: Uint8Array, aad: Uint8Array, ct: Uint8Array): Uint8Array =>
 	aead.openInPlace ? aead.openInPlace(nonce, aad, ct) : aead.open(nonce, aad, ct);
 
+/** Full packet number from its truncated wire form (RFC 9000 Appendix A.3): the value closest
+ *  to largest+1 with these low bits. Without it, once the peer encodes pn in 1-2 bytes the
+ *  number wraps after 256/65536 packets, the nonce is wrong and every packet fails to open. */
+export function decodePn(largest: number, truncated: number, pnLen: number): number {
+	const win = 2 ** (8 * pnLen);
+	const hwin = win / 2;
+	const expected = largest + 1;
+	const candidate = expected - (expected % win) + truncated;
+	if (candidate <= expected - hwin && candidate < 2 ** 62 - win) return candidate + win;
+	if (candidate > expected + hwin && candidate >= win) return candidate - win;
+	return candidate;
+}
+
 /** 12-byte AEAD nonce = iv XOR packet-number (right-aligned, big-endian). */
 function nonce(iv: Uint8Array, pn: number): Uint8Array {
 	const n = Uint8Array.from(iv);
@@ -81,8 +94,9 @@ export interface ParsedPacket {
 	end: number; // offset just past this packet in the datagram (for coalesced packets)
 }
 
-/** Remove header protection + decrypt one long-header packet at `off`. */
-export function parsePacket(dg: Uint8Array, off: number, keys: PacketKeys, keyLen = 16): ParsedPacket {
+/** Remove header protection + decrypt one long-header packet at `off`. `largest` = the largest
+ *  packet number received so far in this space (decodes the truncated pn). */
+export function parsePacket(dg: Uint8Array, off: number, keys: PacketKeys, keyLen = 16, largest = -1): ParsedPacket {
 	const start = off;
 	const first0 = dg[off];
 	const type = (first0! >> 4) & 0x03;
@@ -111,6 +125,7 @@ export function parsePacket(dg: Uint8Array, off: number, keys: PacketKeys, keyLe
 		pnBytes[i] = dg[pnOffset + i]! ^ mask[1 + i]!;
 		pn = pn * 256 + pnBytes[i]!;
 	}
+	pn = decodePn(largest, pn, pnLen);
 	const ctStart = pnOffset + pnLen;
 	const ctLen = lenField.value - pnLen;
 	const ct = dg.subarray(ctStart, ctStart + ctLen);
@@ -149,8 +164,9 @@ export function buildShort(dcid: Uint8Array, payload: Uint8Array, pn: number, ke
 	return out;
 }
 
-/** Parse + decrypt a short-header packet. dcidLen is known from the connection. */
-export function parseShort(dg: Uint8Array, off: number, dcidLen: number, keys: PacketKeys, keyLen = 16): { pn: number; payload: Uint8Array } {
+/** Parse + decrypt a short-header packet. dcidLen is known from the connection; `largest` =
+ *  the largest 1-RTT packet number received so far (decodes the truncated pn). */
+export function parseShort(dg: Uint8Array, off: number, dcidLen: number, keys: PacketKeys, keyLen = 16, largest = -1): { pn: number; payload: Uint8Array } {
 	const start = off;
 	const first0 = dg[off];
 	off += 1 + dcidLen;
@@ -165,6 +181,7 @@ export function parseShort(dg: Uint8Array, off: number, dcidLen: number, keys: P
 		pnBytes[i] = dg[pnOffset + i]! ^ mask[1 + i]!;
 		pn = pn * 256 + pnBytes[i]!;
 	}
+	pn = decodePn(largest, pn, pnLen);
 	const ctStart = pnOffset + pnLen;
 	const ct = dg.subarray(ctStart); // short header: ciphertext runs to end of datagram
 	const aad = Uint8Array.from(dg.subarray(start, ctStart));

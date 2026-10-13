@@ -127,9 +127,82 @@ export function streamFrame(id: number, offset: number, data: Uint8Array, fin: b
 	return concat(writeVarint(type), writeVarint(id), writeVarint(offset), writeVarint(data.length), data);
 }
 
-/** ACK frame acknowledging 0..largest contiguously (one range). */
-export function ackFrame(largest: number, delay = 0): Uint8Array {
-	return concat(Uint8Array.of(0x02), writeVarint(largest), writeVarint(delay), writeVarint(0), writeVarint(largest));
+/** Packet numbers received in one number space, as disjoint [lo, hi] ranges, highest first.
+ *  ACKs must name exactly these: acknowledging a packet that never arrived tells the peer not
+ *  to resend it, leaving a permanent hole in the stream. */
+export class PnRanges {
+	private r: [number, number][] = [];
+	private static readonly MAX = 64; // older ranges are forgotten (and no longer acked)
+
+	get largest(): number {
+		return this.r.length ? this.r[0]![1] : -1;
+	}
+
+	/** Record `pn`; false when it was already received (a duplicate to ignore). */
+	add(pn: number): boolean {
+		const r = this.r;
+		let i = 0;
+		while (i < r.length && r[i]![0] > pn) i++; // first range whose lo ≤ pn
+		if (i < r.length && r[i]![1] >= pn) return false; // inside an existing range
+		const joinsAbove = i > 0 && r[i - 1]![0] === pn + 1;
+		const joinsBelow = i < r.length && r[i]![1] === pn - 1;
+		if (joinsAbove && joinsBelow) {
+			r[i - 1]![0] = r[i]![0];
+			r.splice(i, 1);
+		} else if (joinsAbove) r[i - 1]![0] = pn;
+		else if (joinsBelow) r[i]![1] = pn;
+		else {
+			r.splice(i, 0, [pn, pn]);
+			if (r.length > PnRanges.MAX) r.pop();
+		}
+		return true;
+	}
+
+	/** ACK frame (RFC 9000 §19.3) for exactly the received packets. */
+	ackFrame(delay = 0): Uint8Array {
+		const r = this.r;
+		const parts: Uint8Array[] = [Uint8Array.of(0x02), writeVarint(r[0]![1]), writeVarint(delay), writeVarint(r.length - 1), writeVarint(r[0]![1] - r[0]![0])];
+		for (let k = 1; k < r.length; k++) parts.push(writeVarint(r[k - 1]![0] - r[k]![1] - 2), writeVarint(r[k]![1] - r[k]![0])); // gap, range length
+		return concat(...parts);
+	}
 }
+
+/** Reorders STREAM / CRYPTO data into contiguous bytes. Tolerates duplicates and data resent
+ *  cut at different boundaries — a retransmission rarely matches the original frame's
+ *  offsets, so waiting for a frame that starts exactly at `consumed` can stall forever. */
+export class Reassembler {
+	consumed = 0;
+	private pending = new Map<number, Uint8Array>();
+
+	push(offset: number, data: Uint8Array): void {
+		if (!data.length || offset + data.length <= this.consumed) return; // nothing new
+		const have = this.pending.get(offset);
+		if (!have || have.length < data.length) this.pending.set(offset, data);
+	}
+
+	/** Every byte now contiguous from `consumed` (advancing it); empty when none. */
+	take(): Uint8Array {
+		const parts: Uint8Array[] = [];
+		for (let progressed = true; progressed && this.pending.size; ) {
+			progressed = false;
+			for (const [off, data] of this.pending) {
+				const end = off + data.length;
+				if (end <= this.consumed) this.pending.delete(off);
+				else if (off <= this.consumed) {
+					parts.push(data.subarray(this.consumed - off));
+					this.consumed = end;
+					this.pending.delete(off);
+					progressed = true;
+				}
+			}
+		}
+		return parts.length === 1 ? parts[0]! : concat(...parts);
+	}
+}
+
+/** MAX_DATA: connection-level flow-control credit. */
+export const maxDataFrame = (max: number): Uint8Array => concat(Uint8Array.of(0x10), writeVarint(max));
+/** MAX_STREAM_DATA: flow-control credit for one stream. */
+export const maxStreamDataFrame = (id: number, max: number): Uint8Array => concat(Uint8Array.of(0x11), writeVarint(id), writeVarint(max));
 
 export const pingFrame = (): Uint8Array => Uint8Array.of(0x01);
