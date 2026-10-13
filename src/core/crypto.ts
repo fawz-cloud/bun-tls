@@ -2,13 +2,15 @@
 // HKDF + Expand-Label + key schedule + AEAD (AES-GCM; ChaCha lives in chacha.ts
 // if the server picks it). All validated against RFC 8448 vectors in test/.
 import crypto from 'node:crypto';
-import { Writer, concat } from './bytes';
+import { concat } from './bytes';
 
 export type HashAlg = 'sha256' | 'sha384';
 export const hashLen = (h: HashAlg): number => (h === 'sha256' ? 32 : 48);
 export const sha = (h: HashAlg, data: Uint8Array): Uint8Array => new Uint8Array(crypto.createHash(h).update(data).digest());
+// Bun's native hasher: ~0.5 µs per small HMAC vs ~0.7 µs for node:crypto createHmac (a full
+// handshake runs ~18 of them).
 const hmac = (h: HashAlg, key: Uint8Array, data: Uint8Array): Uint8Array =>
-	new Uint8Array(crypto.createHmac(h, key).update(data).digest());
+	new Uint8Array(new Bun.CryptoHasher(h, key).update(data).digest());
 
 export const hkdfExtract = (h: HashAlg, salt: Uint8Array, ikm: Uint8Array): Uint8Array => hmac(h, salt, ikm);
 
@@ -24,21 +26,48 @@ export function hkdfExpand(h: HashAlg, prk: Uint8Array, info: Uint8Array, length
 	return out.subarray(0, length);
 }
 
-/** HKDF-Expand-Label (RFC 8446 §7.1). */
+const EMPTY = new Uint8Array(0);
+const LABELS = new Map<string, Uint8Array>(); // "tls13 " + label, encoded once per (constant) label
+
+/** HKDF-Expand-Label (RFC 8446 §7.1). Every TLS 1.3 / QUIC label asks for ≤ Hash.length bytes,
+ *  which is ONE HMAC over HkdfLabel || 0x01 — built straight into a single buffer. */
 export function expandLabel(h: HashAlg, secret: Uint8Array, label: string, context: Uint8Array, length: number): Uint8Array {
-	const info = new Writer()
-		.u16(length)
-		.block(1, (w) => w.bytes(Buffer.from('tls13 ' + label)))
-		.block(1, (w) => w.bytes(context))
-		.build();
-	return hkdfExpand(h, secret, info, length);
+	let lab = LABELS.get(label);
+	if (!lab) LABELS.set(label, (lab = new Uint8Array(Buffer.from('tls13 ' + label))));
+	// HkdfLabel = uint16 length || opaque label<7..255> || opaque context<0..255>, then the counter
+	const info = new Uint8Array(4 + lab.length + context.length + 1);
+	info[0] = length >> 8;
+	info[1] = length & 0xff;
+	info[2] = lab.length;
+	info.set(lab, 3);
+	info[3 + lab.length] = context.length;
+	info.set(context, 4 + lab.length);
+	if (length > hashLen(h)) return hkdfExpand(h, secret, info.subarray(0, info.length - 1), length);
+	info[info.length - 1] = 1;
+	const t = hmac(h, secret, info);
+	return length === t.length ? t : t.subarray(0, length);
 }
 
 /** Derive-Secret(secret, label, messages) — messages are hashed first. */
 export const deriveSecret = (h: HashAlg, secret: Uint8Array, label: string, msgs: Uint8Array): Uint8Array =>
 	expandLabel(h, secret, label, sha(h, msgs), hashLen(h));
 
+// Per-hash constants of the schedule, computed once: Hash(""), and the 0-PSK early_secret +
+// its "derived" secret (every full handshake starts from these).
+const consts = new Map<HashAlg, { zero: Uint8Array; emptyHash: Uint8Array; early0: Uint8Array; derived0: Uint8Array }>();
+function k(h: HashAlg) {
+	let c = consts.get(h);
+	if (!c) {
+		const zero = new Uint8Array(hashLen(h));
+		const emptyHash = sha(h, EMPTY);
+		const early0 = hkdfExtract(h, zero, zero);
+		consts.set(h, (c = { zero, emptyHash, early0, derived0: expandLabel(h, early0, 'derived', emptyHash, hashLen(h)) }));
+	}
+	return c;
+}
+
 // ── TLS 1.3 key schedule (RFC 8446 §7.1) ──────────────────────────────────────
+// Functions below take Transcript-Hash values (the caller keeps a running hash), not messages.
 export interface Schedule {
 	h: HashAlg;
 	handshake: Uint8Array;
@@ -47,69 +76,68 @@ export interface Schedule {
 	sHs: Uint8Array;
 }
 
-/** Stage 1: after we have the ECDHE shared secret + transcript CH..SH. `early` =
+/** Stage 1: after we have the ECDHE shared secret + Transcript-Hash(CH..SH). `early` =
  *  a precomputed early_secret (from a resumption PSK); omitted → the 0-PSK one. */
-export function deriveHandshake(h: HashAlg, ecdhe: Uint8Array, transcriptCHSH: Uint8Array, early?: Uint8Array): Schedule {
-	const zero = new Uint8Array(hashLen(h));
-	const earlyS = early ?? hkdfExtract(h, zero, zero);
-	const derived = deriveSecret(h, earlyS, 'derived', new Uint8Array(0));
+export function deriveHandshake(h: HashAlg, ecdhe: Uint8Array, thCHSH: Uint8Array, early?: Uint8Array): Schedule {
+	const c = k(h);
+	const hl = hashLen(h);
+	const derived = early ? expandLabel(h, early, 'derived', c.emptyHash, hl) : c.derived0;
 	const handshake = hkdfExtract(h, derived, ecdhe);
-	const cHs = deriveSecret(h, handshake, 'c hs traffic', transcriptCHSH);
-	const sHs = deriveSecret(h, handshake, 's hs traffic', transcriptCHSH);
-	const derived2 = deriveSecret(h, handshake, 'derived', new Uint8Array(0));
-	const master = hkdfExtract(h, derived2, zero);
+	const cHs = expandLabel(h, handshake, 'c hs traffic', thCHSH, hl);
+	const sHs = expandLabel(h, handshake, 's hs traffic', thCHSH, hl);
+	const derived2 = expandLabel(h, handshake, 'derived', c.emptyHash, hl);
+	const master = hkdfExtract(h, derived2, c.zero);
 	return { h, handshake, master, cHs, sHs };
 }
 
-/** Stage 2: app traffic secrets, transcript CH..server Finished. */
-export function appSecrets(s: Schedule, transcriptToServerFin: Uint8Array): { cAp: Uint8Array; sAp: Uint8Array } {
+/** Stage 2: app traffic secrets, Transcript-Hash(CH..server Finished). */
+export function appSecrets(s: Schedule, thToServerFin: Uint8Array): { cAp: Uint8Array; sAp: Uint8Array } {
 	return {
-		cAp: deriveSecret(s.h, s.master, 'c ap traffic', transcriptToServerFin),
-		sAp: deriveSecret(s.h, s.master, 's ap traffic', transcriptToServerFin)
+		cAp: expandLabel(s.h, s.master, 'c ap traffic', thToServerFin, hashLen(s.h)),
+		sAp: expandLabel(s.h, s.master, 's ap traffic', thToServerFin, hashLen(s.h))
 	};
 }
 
 /** key + iv from a traffic secret. */
 export function trafficKey(h: HashAlg, secret: Uint8Array, keyLen: number): { key: Uint8Array; iv: Uint8Array } {
 	return {
-		key: expandLabel(h, secret, 'key', new Uint8Array(0), keyLen),
-		iv: expandLabel(h, secret, 'iv', new Uint8Array(0), 12)
+		key: expandLabel(h, secret, 'key', EMPTY, keyLen),
+		iv: expandLabel(h, secret, 'iv', EMPTY, 12)
 	};
 }
 
 /** Finished verify_data = HMAC(finished_key, Transcript-Hash). */
-export function finishedVerify(h: HashAlg, baseSecret: Uint8Array, transcript: Uint8Array): Uint8Array {
-	const fk = expandLabel(h, baseSecret, 'finished', new Uint8Array(0), hashLen(h));
-	return hmac(h, fk, sha(h, transcript));
+export function finishedVerify(h: HashAlg, baseSecret: Uint8Array, thash: Uint8Array): Uint8Array {
+	const fk = expandLabel(h, baseSecret, 'finished', EMPTY, hashLen(h));
+	return hmac(h, fk, thash);
 }
 
 // ── Resumption + 0-RTT (RFC 8446 §4.6.1, §7.1) ────────────────────────────────
 /** early_secret = HKDF-Extract(0, PSK). PSK omitted → the 0-PSK early secret. */
 export function earlySecret(h: HashAlg, psk?: Uint8Array): Uint8Array {
-	const zero = new Uint8Array(hashLen(h));
-	return hkdfExtract(h, zero, psk ?? zero);
+	return psk ? hkdfExtract(h, k(h).zero, psk) : k(h).early0;
 }
 /** resumption_master_secret = Derive-Secret(master, "res master", CH..client Finished). */
-export const resumptionMaster = (h: HashAlg, master: Uint8Array, transcriptToClientFin: Uint8Array): Uint8Array =>
-	deriveSecret(h, master, 'res master', transcriptToClientFin);
+export const resumptionMaster = (h: HashAlg, master: Uint8Array, thToClientFin: Uint8Array): Uint8Array =>
+	expandLabel(h, master, 'res master', thToClientFin, hashLen(h));
 /** A ticket's PSK = HKDF-Expand-Label(res master, "resumption", ticket_nonce). */
 export const resumptionPsk = (h: HashAlg, resMaster: Uint8Array, nonce: Uint8Array): Uint8Array =>
 	expandLabel(h, resMaster, 'resumption', nonce, hashLen(h));
 /** binder_key = Derive-Secret(early_secret, "res binder", ""). */
-export const binderKey = (h: HashAlg, early: Uint8Array): Uint8Array => deriveSecret(h, early, 'res binder', new Uint8Array(0));
+export const binderKey = (h: HashAlg, early: Uint8Array): Uint8Array => expandLabel(h, early, 'res binder', k(h).emptyHash, hashLen(h));
 /** PSK binder = HMAC(finished_key(binder_key), Transcript-Hash(truncated ClientHello)). */
-export function pskBinder(h: HashAlg, bKey: Uint8Array, truncatedTranscript: Uint8Array): Uint8Array {
-	const fk = expandLabel(h, bKey, 'finished', new Uint8Array(0), hashLen(h));
-	return hmac(h, fk, sha(h, truncatedTranscript));
+export function pskBinder(h: HashAlg, bKey: Uint8Array, thTruncated: Uint8Array): Uint8Array {
+	const fk = expandLabel(h, bKey, 'finished', EMPTY, hashLen(h));
+	return hmac(h, fk, thTruncated);
 }
 /** client_early_traffic_secret = Derive-Secret(early_secret, "c e traffic", ClientHello). */
-export const clientEarlyTraffic = (h: HashAlg, early: Uint8Array, transcriptCH: Uint8Array): Uint8Array =>
-	deriveSecret(h, early, 'c e traffic', transcriptCH);
+export const clientEarlyTraffic = (h: HashAlg, early: Uint8Array, thCH: Uint8Array): Uint8Array =>
+	expandLabel(h, early, 'c e traffic', thCH, hashLen(h));
 
 /** application_traffic_secret_N+1 = HKDF-Expand-Label(secret, "traffic upd", "", Hash.len)
  *  — the post-handshake KeyUpdate rotation (RFC 8446 §7.2). */
 export const updateTraffic = (h: HashAlg, secret: Uint8Array): Uint8Array =>
-	expandLabel(h, secret, 'traffic upd', new Uint8Array(0), hashLen(h));
+	expandLabel(h, secret, 'traffic upd', EMPTY, hashLen(h));
 
 // ── TLS 1.2 PRF (RFC 5246 §5) ─────────────────────────────────────────────────
 /** P_hash(secret, seed) = HMAC(secret, A(1)+seed) | HMAC(secret, A(2)+seed) | …

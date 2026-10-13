@@ -49,9 +49,9 @@ assert.equal(hex(early), '9b2188e9b2fc6d64d71dc329900e20bb41915000f678aa839cbb79
 const bKey = binderKey(h, early);
 assert.equal(hex(bKey), '69fe131a3bbad5d63c64eebcc30e395b9d8107726a13d074e389dbc8a4e47256', 'binder_key');
 assert.equal(hex(expandLabel(h, bKey, 'finished', new Uint8Array(0), 32)), '5588673e72cb59c87d220caffe94f2dea9a3b1609f7d50e90a48227db9ed7eaa', 'finished_key');
-assert.equal(hex(pskBinder(h, bKey, PREFIX)), '3add4fb2d8fdf822a0ca3cf7678ef5e88dae990141c5924d57bb6fa31b9e5f9d', 'PSK binder');
+assert.equal(hex(pskBinder(h, bKey, sha(h, PREFIX))), '3add4fb2d8fdf822a0ca3cf7678ef5e88dae990141c5924d57bb6fa31b9e5f9d', 'PSK binder');
 
-const cet = clientEarlyTraffic(h, early, CH);
+const cet = clientEarlyTraffic(h, early, sha(h, CH));
 assert.equal(hex(cet), '3fbbe6a60deb66c30a32795aba0eff7eaa10105586e7be5c09678d63b6caab62', 'client_early_traffic_secret');
 
 const tk = trafficKey(h, cet, 16);

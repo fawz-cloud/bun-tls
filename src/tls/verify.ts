@@ -9,7 +9,6 @@ import crypto from 'node:crypto';
 import tls from 'node:tls';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { HashAlg, sha } from '../core/crypto';
 import { concat } from '../core/bytes';
 import { verifyOcsp, fetchOcsp } from './ocsp';
 import { enforceConstraints } from './x509';
@@ -168,16 +167,11 @@ export function verifyOpts(alg: number, pub: crypto.KeyObject): { hash: string; 
 
 const CV_CONTEXT = concat(new Uint8Array(64).fill(0x20), new Uint8Array(Buffer.from('TLS 1.3, server CertificateVerify')), Uint8Array.of(0));
 
-/** CertificateVerify: signature over (64 spaces || label || 0x00 || Hash(transcript up to Certificate)). */
-export function verifyCertificateVerify(
-	leafDer: Uint8Array,
-	alg: number,
-	signature: Uint8Array,
-	hash: HashAlg,
-	transcriptBeforeCV: Uint8Array
-): void {
+/** CertificateVerify: signature over (64 spaces || label || 0x00 || Transcript-Hash up to
+ *  Certificate) — `thBeforeCV` is that hash. */
+export function verifyCertificateVerify(leafDer: Uint8Array, alg: number, signature: Uint8Array, thBeforeCV: Uint8Array): void {
 	const leaf = new crypto.X509Certificate(Buffer.from(leafDer));
-	const content = concat(CV_CONTEXT, sha(hash, transcriptBeforeCV));
+	const content = concat(CV_CONTEXT, thBeforeCV);
 	const { hash: h, key } = verifyOpts(alg, leaf.publicKey);
 	if (!crypto.verify(h, Buffer.from(content), key, Buffer.from(signature)))
 		throw new Error('CertificateVerify failed — server does not hold the cert private key (possible MITM)');

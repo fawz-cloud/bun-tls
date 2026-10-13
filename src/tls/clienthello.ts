@@ -4,7 +4,7 @@ import crypto from 'node:crypto';
 import { Reader, Writer, concat } from '../core/bytes';
 import { Ext, GREASE, Group, TLS12, isGrease } from '../core/consts';
 import { grease as greaseExt, pskKeyExchangeModes, earlyData, cookie as cookieExt, type Extension, type ExtCtx } from './extensions';
-import { x25519Keypair, earlySecret, binderKey, pskBinder } from '../core/crypto';
+import { x25519Keypair, earlySecret, binderKey, pskBinder, sha } from '../core/crypto';
 import type { Ticket } from './resumption';
 
 const pickGrease = (not?: number | null): number => {
@@ -76,10 +76,13 @@ function pskExtension(ticket: Ticket): Extension {
 	};
 }
 
-/** Fisher-Yates shuffle (crypto RNG). */
+/** Fisher-Yates shuffle from ONE crypto RNG draw (a randomInt per swap cost ~28 µs per
+ *  ClientHello). `% (i + 1)` on a 32-bit draw is biased by < 2^-27 for any extension count —
+ *  negligible for an extension-order permutation. */
 function shuffle<T>(xs: T[]): T[] {
+	const r = crypto.randomFillSync(new Uint32Array(xs.length));
 	for (let i = xs.length - 1; i > 0; i--) {
-		const j = crypto.randomInt(i + 1);
+		const j = r[i]! % (i + 1);
 		[xs[i], xs[j]] = [xs[j]!, xs[i]!];
 	}
 	return xs;
@@ -118,8 +121,9 @@ export function buildClientHello(fp: Fingerprint, host: string, resume?: ResumeS
 	const greaseA = fp.grease ? pickGrease() : null;
 	const greaseB = fp.grease ? pickGrease(greaseA) : null;
 	const ctx: ExtCtx = { host, shares, grease: greaseA };
-	const random = retry?.random ?? new Uint8Array(crypto.randomBytes(32));
-	const sessionId = retry?.sessionId ?? new Uint8Array(crypto.randomBytes(32)); // TLS1.3 middlebox-compat (kept across HRR)
+	const rnd = retry ? null : new Uint8Array(crypto.randomBytes(64)); // random || session_id, one draw
+	const random = retry?.random ?? rnd!.subarray(0, 32);
+	const sessionId = retry?.sessionId ?? rnd!.subarray(32); // TLS1.3 middlebox-compat (kept across HRR)
 
 	const ciphers = greaseA != null ? [greaseA, ...fp.ciphers] : fp.ciphers;
 	// Resumption needs psk_key_exchange_modes present, plus early_data for 0-RTT. A
@@ -169,12 +173,27 @@ export function buildClientHello(fp: Fingerprint, host: string, resume?: ResumeS
 		early = earlySecret(resume.ticket.hash, resume.ticket.psk);
 		// On a retry the binder transcript is (synthetic CH1 || HRR || truncated CH2).
 		const truncated = concat(retry?.binderPrefix ?? new Uint8Array(0), bytes.subarray(0, bytes.length - (3 + hLen)));
-		const binder = pskBinder(resume.ticket.hash, binderKey(resume.ticket.hash, early), truncated);
+		const binder = pskBinder(resume.ticket.hash, binderKey(resume.ticket.hash, early), sha(resume.ticket.hash, truncated));
 		bytes.set(binder, bytes.length - hLen);
 	}
 
-	const j = ja3FromClientHello(bytes);
-	return { bytes, privs, random, sessionId, ...j, ja4: ja4FromClientHello(bytes), earlySecret: early };
+	// JA3/JA4 are informational (parsed back out of `bytes`, ~14 µs): computed on first read, so
+	// building and sending a ClientHello never waits on them.
+	let j: ReturnType<typeof ja3FromClientHello> | undefined;
+	let j4: string | undefined;
+	const ja3s = () => (j ??= ja3FromClientHello(bytes));
+	return {
+		bytes,
+		privs,
+		random,
+		sessionId,
+		earlySecret: early,
+		get ja3() { return ja3s().ja3; },
+		get ja3Hash() { return ja3s().ja3Hash; },
+		get ja3n() { return ja3s().ja3n; },
+		get ja3nHash() { return ja3s().ja3nHash; },
+		get ja4() { return (j4 ??= ja4FromClientHello(bytes)); }
+	};
 }
 
 /** Parse a ClientHello (handshake msg) → JA3 + JA3N (sorted exts), each + MD5.

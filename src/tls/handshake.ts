@@ -94,7 +94,11 @@ export interface TlsConn {
 export class TlsClient {
 	private rr = new RecordReader();
 	private hsbuf: Uint8Array = new Uint8Array(0); // handshake message reassembly
+	// Transcript: messages are kept only until ServerHello fixes the hash; from then on one
+	// running hash absorbs each message once and th() snapshots it (no re-hash of the whole
+	// transcript at every checkpoint).
 	private transcript: Uint8Array[] = [];
+	private thash: crypto.Hash | null = null;
 	private suite!: Suite;
 	private sched!: Schedule;
 	private readDir!: AeadDir; // server→client (active once keys exist)
@@ -179,10 +183,12 @@ export class TlsClient {
 	}
 
 	private addTranscript(raw: Uint8Array) {
-		this.transcript.push(raw);
+		if (this.thash) this.thash.update(raw);
+		else this.transcript.push(raw);
 	}
+	/** Transcript-Hash of every message so far (the running hash continues). */
 	private th(): Uint8Array {
-		return concat(...this.transcript);
+		return new Uint8Array(this.thash!.copy().digest());
 	}
 
 	async handshake(): Promise<void> {
@@ -199,11 +205,6 @@ export class TlsClient {
 		}
 		// 1) ClientHello (+ pre_shared_key + early_data when resuming)
 		let ch = buildClientHello(this.opts.fingerprint, this.opts.host, resume, undefined, prebuilt);
-		this.ja3 = ch.ja3;
-		this.ja3Hash = ch.ja3Hash;
-		this.ja3n = ch.ja3n;
-		this.ja3nHash = ch.ja3nHash;
-		this.ja4 = ch.ja4;
 		this.addTranscript(ch.bytes);
 		this.t.write(plaintextRecord(ContentType.handshake, ch.bytes));
 
@@ -215,13 +216,20 @@ export class TlsClient {
 			const t = resume.ticket;
 			const suite = SUITES[t.cipher];
 			if (suite && this.opts.earlyData.length <= t.maxEarlyData) {
-				const cet = clientEarlyTraffic(suite.hash, ch.earlySecret, ch.bytes);
+				const cet = clientEarlyTraffic(suite.hash, ch.earlySecret, sha(suite.hash, ch.bytes));
 				const k = trafficKey(suite.hash, cet, suite.keyLen);
 				earlyWrite = new AeadDir(suite.aead(k.key), k.iv);
 				this.t.write(earlyWrite.encryptMany(ContentType.applicationData, this.opts.earlyData, 16384 - 1));
 				sentEarly = true;
 			}
 		}
+
+		// The ClientHello is on the wire: compute its fingerprints while the server answers.
+		this.ja3 = ch.ja3;
+		this.ja3Hash = ch.ja3Hash;
+		this.ja3n = ch.ja3n;
+		this.ja3nHash = ch.ja3nHash;
+		this.ja4 = ch.ja4;
 
 		// 2) ServerHello — may be a HelloRetryRequest asking for a different key-share group.
 		let sh = await this.nextHandshakeMsg(false);
@@ -235,8 +243,11 @@ export class TlsClient {
 			sentEarly = false; // early data (if any was sent) is dropped across a retry
 			earlyWrite = null;
 		}
-		this.addTranscript(sh.raw);
 		this.suite = SUITES[server.cipher] ?? (() => { throw new Error('unsupported cipher: 0x' + server.cipher.toString(16)); })();
+		this.thash = crypto.createHash(this.suite.hash); // the suite fixes the transcript hash
+		for (const m of this.transcript) this.thash.update(m);
+		this.transcript = [];
+		this.addTranscript(sh.raw);
 		if (!server.keyShare) throw new Error('ServerHello without key_share');
 		// PSK accepted iff the server echoed pre_shared_key AND the suite hash matches
 		// the ticket's (the binder/PSK are bound to that hash).
@@ -303,7 +314,7 @@ export class TlsClient {
 		if (!pskAccepted && this.opts.verify !== false) {
 			verifyChain(certs, this.opts.host);
 			if (!cv) throw new Error('server did not send CertificateVerify');
-			verifyCertificateVerify(certs[0]!, cv.alg, cv.sig, this.suite.hash, thBeforeCV);
+			verifyCertificateVerify(certs[0]!, cv.alg, cv.sig, thBeforeCV);
 			await checkRevocation(certs, staple, this.opts.ocsp ?? 'off');
 		}
 		this.resumed = pskAccepted;

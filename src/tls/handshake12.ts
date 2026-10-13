@@ -147,14 +147,14 @@ export class Tls12Client {
 		// 1) ClientHello (reuse the builder; the tls12 preset carries no key_share /
 		//    supported_versions, so the server negotiates TLS 1.2 from legacy_version).
 		const ch = buildClientHello(this.opts.fingerprint, this.opts.host);
-		this.ja3 = ch.ja3;
+		const clientRandom = ch.random;
+		this.transcript.push(ch.bytes);
+		this.t.write(plaintextRecord(ContentType.handshake, ch.bytes));
+		this.ja3 = ch.ja3; // computed while the server answers
 		this.ja3Hash = ch.ja3Hash;
 		this.ja3n = ch.ja3n;
 		this.ja3nHash = ch.ja3nHash;
 		this.ja4 = ch.ja4;
-		const clientRandom = ch.random;
-		this.transcript.push(ch.bytes);
-		this.t.write(plaintextRecord(ContentType.handshake, ch.bytes));
 
 		// 2) Server flight: ServerHello, Certificate, [CertificateStatus], ServerKeyExchange,
 		//    [CertificateRequest], ServerHelloDone.

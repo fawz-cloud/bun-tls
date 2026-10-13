@@ -287,7 +287,7 @@ export class QuicConnection {
 			if (this.keyLen === 32 && sh.cipher === Cipher.TLS_CHACHA20_POLY1305_SHA256) throw new Error('QUIC: ChaCha20 suite not supported (header protection differs)');
 			if (!sh.keyShare) throw new Error('QUIC ServerHello without key_share');
 			const ecdhe = ecdheShared(sh.keyShare.group, this.priv, sh.keyShare.pub);
-			this.sched = deriveHandshake(this.hash, ecdhe, concat(...this.transcript));
+			this.sched = deriveHandshake(this.hash, ecdhe, this.th());
 			this.keys.handshake = { c: packetKeys(this.hash, this.sched.cHs, this.keyLen), s: packetKeys(this.hash, this.sched.sHs, this.keyLen) };
 			this.shDone = true;
 			break;
@@ -299,6 +299,11 @@ export class QuicConnection {
 	private thBeforeCV: Uint8Array = new Uint8Array(0);
 	private serverFinSeen = false;
 
+	/** Transcript-Hash of the messages so far. */
+	private th(): Uint8Array {
+		return sha(this.hash, concat(...this.transcript));
+	}
+
 	private maybeFinishHandshake(gotHandshakePkt: boolean): void {
 		if (!this.shDone || this.hsComplete) return;
 		for (const msg of this.tlsMessages('handshake')) {
@@ -307,16 +312,16 @@ export class QuicConnection {
 			} else if (msg.type === HandshakeType.certificate) {
 				this.certs = parseCert(msg.body);
 				this.transcript.push(msg.raw);
-				this.thBeforeCV = concat(...this.transcript);
+				this.thBeforeCV = this.th();
 			} else if (msg.type === HandshakeType.compressedCertificate) {
 				this.certs = parseCompressedCert(msg.body);
 				this.transcript.push(msg.raw);
-				this.thBeforeCV = concat(...this.transcript);
+				this.thBeforeCV = this.th();
 			} else if (msg.type === HandshakeType.certificateVerify) {
 				this.cv = { alg: msg.body.u16(), sig: new Uint8Array(msg.body.block(2).buf) };
 				this.transcript.push(msg.raw);
 			} else if (msg.type === HandshakeType.finished) {
-				const expect = finishedVerify(this.hash, this.sched.sHs, concat(...this.transcript));
+				const expect = finishedVerify(this.hash, this.sched.sHs, this.th());
 				const got = new Uint8Array(msg.body.bytes(msg.body.rem));
 				if (!crypto.timingSafeEqual(expect, got)) throw new Error('QUIC: server Finished mismatch');
 				this.transcript.push(msg.raw);
@@ -330,10 +335,11 @@ export class QuicConnection {
 		// Verify the certificate chain + CertVerify, derive app keys, send our Finished.
 		verifyChain(this.certs, this.host);
 		if (!this.cv) throw new Error('QUIC: no CertificateVerify');
-		verifyCertificateVerify(this.certs[0]!, this.cv.alg, this.cv.sig, this.hash, this.thBeforeCV);
-		const app = appSecrets(this.sched, concat(...this.transcript));
+		verifyCertificateVerify(this.certs[0]!, this.cv.alg, this.cv.sig, this.thBeforeCV);
+		const th = this.th(); // CH..server Finished: app secrets + our Finished (no client cert here)
+		const app = appSecrets(this.sched, th);
 		this.keys.app = { c: packetKeys(this.hash, app.cAp, this.keyLen), s: packetKeys(this.hash, app.sAp, this.keyLen) };
-		const verify = finishedVerify(this.hash, this.sched.cHs, concat(...this.transcript));
+		const verify = finishedVerify(this.hash, this.sched.cHs, th);
 		const fin = concat(Uint8Array.of(HandshakeType.finished), Uint8Array.of(0, 0, hashLen(this.hash)), verify);
 		// Send: ACK(handshake) + our Finished in a Handshake packet.
 		const hsPayload = concat(ackFrame(this.largest.handshake), cryptoFrame(0, fin));
