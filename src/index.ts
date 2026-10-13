@@ -35,6 +35,8 @@ export { connectWebSocket, BunTlsWebSocket } from './http/ws';
 export type { WsOptions, WsMessage } from './http/ws';
 export { fetch } from './http/fetchlike';
 export type { FetchInit } from './http/fetchlike';
+export { scrape } from './http/scrape';
+export type { ScrapeResult, ScrapeOptions } from './http/scrape';
 export { startProxy } from './proxy';
 export type { ProxyOptions } from './proxy';
 export * as ext from './tls/extensions';

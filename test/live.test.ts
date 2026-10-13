@@ -252,5 +252,16 @@ assert.ok(ja3nSet.size >= 5, 'client fingerprints distinct (edge==chrome collaps
 	assert.equal(g.alpn, 'h2', 'Google selected h2');
 }
 
+// 17) LLM-ready scraping: token-cheap structured data (JSON-LD/OpenGraph) + clean Markdown.
+{
+	const { scrape } = await import('../src/http/scrape');
+	const r = await scrape('https://www.ikea.com/', { as: 'auto', maxChars: 3000, timeoutMs: 20000 });
+	assert.equal(r.status, 200, 'scrape fetched the page');
+	assert.ok(r.title.length > 0, 'extracted a title');
+	assert.ok(r.og.site_name || r.jsonld.length > 0, 'extracted structured data (og/jsonld)');
+	assert.ok(r.markdown.length > 0 && !/\{color-scheme|font-family:/.test(r.markdown), 'markdown present, no style leakage');
+	console.log(`scrape → ${r.status} title="${r.title.slice(0, 28)}" jsonld=${r.jsonld.length} og.site=${r.og.site_name ?? '-'} md=${r.markdown.length}B links=${r.links.length}`);
+}
+
 console.log('live: OK');
 process.exit(0);
