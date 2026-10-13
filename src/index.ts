@@ -39,6 +39,7 @@ export { scrape } from './http/scrape';
 export type { ScrapeResult, ScrapeOptions } from './http/scrape';
 export { crawl, map, batch } from './http/crawl';
 export type { CrawlOptions, MapOptions } from './http/crawl';
+export { startMcp } from './mcp';
 export { startProxy } from './proxy';
 export type { ProxyOptions } from './proxy';
 export * as ext from './tls/extensions';
