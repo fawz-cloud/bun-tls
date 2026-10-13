@@ -82,6 +82,10 @@ s.close();
 - **Fingerprint proxy** — `bun src/cli.ts proxy --persona chrome`, then point any tool's
   `HTTP_PROXY` at it to borrow the persona from any language (the tool's own User-Agent never
   leaks over the browser TLS). ([details](DOCS.md#fingerprint-proxy-any-tool-any-language))
+- **Scraping for LLMs** — `scrape(url, { as: 'llm' })` returns a page in the fewest tokens that
+  keep its content: title, JSON-LD, and the main text with its headings, tables and code. Plus
+  CSS and LLM extraction, `crawl` / `map` / `batch`, and an MCP server for agents. No browser.
+  ([details](DOCS.md#scraping-for-llms))
 
 **No additional native dependency** — a TypeScript source tree on Bun. From-scratch TLS,
 **not audited**.
@@ -89,7 +93,8 @@ s.close();
 ## Documentation
 
 **Full API reference → [DOCS.md](DOCS.md)** — every option, `Session`, fingerprints,
-TLS features, OCSP, HTTP/2, proxies, cookies, the low-level API and the architecture.
+TLS features, OCSP, HTTP/2, proxies, cookies, scraping and the MCP server, the low-level API
+and the architecture.
 
 ## Benchmarks
 
@@ -120,6 +125,23 @@ and each client's spread between rounds is wider than the gaps between clients: 
 measured 31.1, 22.8 and 25.1 ms on reused connections. CPU and memory tables:
 [bench/compare/out.md](bench/compare/out.md). Run the scripts on your own machine.
 
+## Scraping for LLMs
+
+```ts
+import { scrape } from './src';
+
+const r = await scrape('https://en.wikipedia.org/wiki/Transport_Layer_Security', { as: 'llm' });
+r.llm;    // title, JSON-LD, main text — the URLs move to r.links
+```
+
+![tokens](assets/tokens.svg)
+
+The same 8 pages in cl100k tokens: 63k for the `llm` view, 139k for Jina Reader, 127k for
+readable Markdown with links. Every heading and every sentence of 60+ characters of that
+Markdown is kept. Agents can use it as an MCP server:
+`claude mcp add bun-tls -- bun /abs/path/to/bun-tls/src/mcp.ts`
+([details](DOCS.md#scraping-for-llms)).
+
 ## How it compares
 
 ![comparison](assets/comparison.svg)
@@ -131,7 +153,7 @@ ship a patched native library or are a Go package. The ones with nothing extra t
 ## Test
 
 ```bash
-bun test/all.ts          # offline: crypto, chacha, resumption vs RFC vectors, cookies
+bun test/all.ts          # offline: crypto, chacha, resumption vs RFC vectors, cookies, scrape rendering
 bun test/all.ts --live   # + network: handshake, JA3/JA4 echo, POST, resumption, h2, OCSP, TLS 1.2
 ```
 

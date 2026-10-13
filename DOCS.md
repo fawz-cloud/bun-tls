@@ -10,14 +10,20 @@ intro see the [README](README.md); this file is the complete API.
 - [Quick start](#quick-start)
 - [`request()`](#request)
 - [`Session`](#session)
+- [`SessionPool` — many cores](#sessionpool--many-cores)
 - [Fingerprints](#fingerprints)
+- [Personas](#personas)
 - [JA3 / JA3N / JA4](#ja3--ja3n--ja4)
 - [TLS features](#tls-features)
 - [Certificate verification & OCSP](#certificate-verification--ocsp)
 - [HTTP/2](#http2)
 - [Proxies](#proxies)
+- [Fingerprint proxy](#fingerprint-proxy-any-tool-any-language)
 - [Cookies](#cookies)
 - [Compression](#compression)
+- [Scraping for LLMs](#scraping-for-llms)
+- [Crawling](#crawling)
+- [MCP server](#mcp-server)
 - [Low-level API](#low-level-api)
 - [Exports](#exports)
 - [Architecture](#architecture)
@@ -567,6 +573,243 @@ automatically (via Bun's `zlib`). The decoded bytes are in `response.body`.
 
 ---
 
+## Scraping for LLMs
+
+`scrape()` fetches a page through bun-tls — same fingerprints and personas, so it gets past
+the TLS / HTTP fingerprint checks of bot walls — and returns it in forms a language model can
+read cheaply instead of raw HTML. No browser and no dependency: the HTML is parsed by Bun's
+built-in `HTMLRewriter`.
+
+```ts
+import { scrape } from './src';
+
+const r = await scrape('https://news.ycombinator.com/', { as: 'llm' });
+r.llm;        // title, structured data, main text: the cheapest view that keeps the content
+r.links[0];   // { href, text } — every link, absolute
+r.jsonld;     // every JSON-LD block, parsed
+```
+
+### `ScrapeOptions`
+
+| field | type | default | notes |
+|---|---|---|---|
+| `as` | `'llm' \| 'data' \| 'markdown' \| 'readable' \| 'auto'` | `'auto'` | shorthand for `formats`, see below |
+| `formats` | `Format[]` | from `as` | what to render, see below |
+| `onlyMainContent` | `boolean` | `false` | drop page chrome from `markdown` / `html` (`true` with `'readable'`) |
+| `extract` | `CssSchema` | — | [CSS extraction](#css-extraction--extract) into `extracted` |
+| `fit` | `boolean` | `false` | prune link-dense blocks from `markdown`, see [`fitMarkdown`](#fitmarkdownmd) |
+| `maxChars` | `number` | — | truncate `markdown` and `llm` |
+| …every `fetch()` option except `method` / `body` | | `persona: 'chrome'` | `persona`, `fingerprint`, `proxy`, `http2`, `http3`, `headers`, `timeoutMs`, `signal`, … |
+
+| `as` | formats |
+|---|---|
+| `'auto'` | `markdown`, `json`, `links` |
+| `'llm'` | `llm` |
+| `'data'` | `json` |
+| `'markdown'` | `markdown`, `json` |
+| `'readable'` | `readable`, `json` |
+
+| format | fills |
+|---|---|
+| `llm` | `llm` — [the LLM view](#the-llm-view) |
+| `markdown` (or `text`) | `markdown` — the page body as Markdown, links absolute, tables as ` \| `-separated rows, code fenced |
+| `readable` | `markdown` without page chrome: `nav`, `aside`, `footer`, dialogs, `role=navigation / contentinfo / search`, language-switcher links (`hreflang`) |
+| `html` | `html` — cleaned HTML: scripts, styles and form controls removed, `class` / `style` / `on*` / `data-*` attributes stripped |
+| `json`, `links` | nothing extra: title, meta, OpenGraph, JSON-LD, links and images are always extracted (one cheap pass) |
+
+### `ScrapeResult`
+
+| field | type | notes |
+|---|---|---|
+| `url`, `status` | `string`, `number` | |
+| `title`, `description`, `canonical` | `string` | document `<title>`, meta description, `link[rel=canonical]` (absolute) |
+| `og`, `twitter`, `meta` | `Record<string, string>` | `og:*` / `twitter:*` without the prefix; other `<meta name>` values |
+| `jsonld` | `unknown[]` | every JSON-LD block, parsed and untouched |
+| `links` | `{ href, text }[]` | absolute, with their anchor text |
+| `images` | `{ src, alt }[]` | absolute |
+| `markdown` | `string` | empty unless a Markdown format was asked for |
+| `llm` | `string?` | with `'llm'` |
+| `html` | `string?` | with `'html'` |
+| `extracted` | `Record<string, string>[]?` | with `extract` |
+
+### The `llm` view
+
+```
+# <title>
+<meta description — only when the text does not already contain it>
+<structured>
+<the page's JSON-LD, condensed>
+</structured>
+<the main content>
+```
+
+**Kept:** every heading, paragraph, list item, table row and code block of the main content
+(code fenced, indentation verbatim), and the structured data most scrapers drop — the
+JSON-LD with a product's price and availability or an article's author and dates.
+
+**Dropped:**
+
+- URLs. The anchor text stays where it was; the URLs are in `links`.
+- Emphasis markers, and the page chrome `readable` drops.
+- In-page navigation: citation markers (`[1]`), heading permalinks (`#`, `¶`),
+  back-references, "Skip to content".
+- Repeats: consecutive duplicate lines, a line that repeats its heading, a sentence of 80+
+  characters seen before, a whole block seen before. A short line is never removed on its
+  own — "2 hrs ago" or "€4" legitimately repeats once per item.
+- Citation bookkeeping on citation lines (English, CS1 style as on Wikipedia): archive and
+  access dates, database IDs (doi, ISSN, S2CID, …). Titles, authors and dates stay.
+- From the JSON-LD: navigation and media blocks (`BreadcrumbList`, `WebSite`, `WebPage`,
+  `ImageObject`, …), URL values, `@context` / `@id`, and strings the text already contains.
+  schema.org enums are shortened (`https://schema.org/InStock` → `InStock`).
+
+![tokens](assets/tokens.svg)
+
+Measured 2026-10-14 on the 8 pages above, in cl100k tokens: 63,398 for the `llm` view,
+138,628 for Jina Reader, 127,222 for readable Markdown with links (the shape Firecrawl-style
+scrapers return). Every heading and every sentence of 60+ characters of that Markdown is also
+in the `llm` view; on Hacker News, all 30 stories. It is not always the smallest: on the Bun
+release post Jina Reader comes out lower because it drops most of the page's code blocks.
+
+### `scrapeHtml` — HTML you already have
+
+```ts
+import { scrapeHtml } from './src';
+const r = await scrapeHtml(html, 'https://example.com/page', { as: 'llm' });
+```
+
+The same output without a request, for HTML from a cache, a browser or a file. The URL
+resolves relative links; an optional fourth argument sets `status` (default 200).
+
+### CSS extraction — `extract`
+
+```ts
+const r = await scrape('https://news.ycombinator.com/', {
+  formats: [],
+  extract: {
+    baseSelector: 'tr.athing',
+    fields: [
+      { name: 'rank', selector: '.rank' },
+      { name: 'title', selector: '.titleline > a' },
+      { name: 'url', selector: '.titleline > a', attr: 'href' },
+    ],
+  },
+});
+r.extracted; // [{ rank: '1.', title: '…', url: 'https://…' }, …] — 30 records
+```
+
+One record per `baseSelector` match. Each field reads its `selector` inside the record (the
+record element itself when omitted): the text, or the attribute named by `attr`, as written
+in the HTML (a relative `href` stays relative). Selectors are the ones `HTMLRewriter`
+supports — tag, `.class`, `#id`, attribute matchers, descendant and `>` child combinators,
+`:nth-child()`, `:first-child`, `:not()` — so no sibling combinators and no `:has()`.
+
+### LLM extraction — `extractLLM`
+
+```ts
+import { extractLLM } from './src';
+
+const product = await extractLLM('https://www.ikea.com/ee/et/p/zebrasaev-laelamp-valge-plast-10522481/', {
+  schema: { type: 'object', properties: { name: { type: 'string' }, price: { type: 'number' } } },
+  prompt: 'Extract the product name and its price.',
+  llm: { endpoint: 'http://localhost:11434/v1/chat/completions', model: 'llama3.2' }, // Ollama
+});
+
+// …or any model behind a function
+await extractLLM(url, { schema, llm: (prompt) => myModel.complete(prompt) });
+```
+
+The page is scraped, rendered, and handed to your model with the schema; the reply is parsed
+as JSON. A reply that is not valid JSON is searched for its first `{…}` object, and failing
+that comes back as `{ _raw: reply }`.
+
+| `ExtractLLMOptions` | type | default | notes |
+|---|---|---|---|
+| `llm` | `LlmFn \| LlmConfig` | — | **required**. `(prompt) => Promise<string>`, or `{ endpoint, apiKey?, model }` for any OpenAI-compatible chat-completions endpoint (sent with `temperature: 0` and `response_format: { type: 'json_object' }`) |
+| `schema` | `object` | — | JSON Schema the answer must match |
+| `prompt` | `string` | a generic instruction | what to extract |
+| `from` | `'llm' \| 'markdown' \| 'html'` | `'llm'` | what the model reads; `'markdown'` when the schema or prompt mentions url / link / href, since the `llm` view has no URLs |
+| `maxChars` | `number` | `16000` | content budget |
+| `onlyMainContent` | `boolean` | `true` | |
+| …every `scrape()` option | | | |
+
+### `fitMarkdown(md)`
+
+The heuristic behind `fit: true`: drops short blocks that are mostly links (menus). It can
+also drop link lists that *are* the content — a news front page's headlines — which is why
+the `llm` view does not use it.
+
+---
+
+## Crawling
+
+```ts
+import { crawl, map, batch } from './src';
+
+const { pages } = await crawl('https://bun.sh/blog', { limit: 10, depth: 1, formats: ['llm'], allow: /\/blog\// });
+const { links } = await map('https://bun.sh/', { search: 'blog' });
+const results = await batch(links.slice(0, 20), { as: 'llm', concurrency: 5 });
+```
+
+Every request carries the persona's fingerprint (`persona: 'chrome'` unless given).
+
+### `crawl(start, opts?)` → `{ pages: ScrapeResult[], count }`
+
+Breadth-first over the links of each page, `concurrency` pages at a time. URLs are compared
+without their `#fragment`; a page that fails to load is skipped.
+
+| `CrawlOptions` | type | default | notes |
+|---|---|---|---|
+| `limit` | `number` | `20` | pages to return |
+| `depth` | `number` | `2` | link depth from the start page |
+| `concurrency` | `number` | `5` | pages fetched in parallel |
+| `sameOrigin` | `boolean` | `true` | stay on the start page's origin |
+| `allow` | `RegExp` | — | follow only matching URLs |
+| `deny` | `RegExp` | — | never follow matching URLs |
+| …every `scrape()` option | | `formats: ['markdown', 'json', 'links']` | |
+
+### `map(url, opts?)` → `{ links: string[] }`
+
+A site's URLs without fetching its pages: the `Sitemap:` lines of `robots.txt` (or
+`/sitemap.xml`), sitemap indexes followed down to page URLs (at most 40 sitemap fetches), then
+the links on the start page. `search` moves URLs that contain it (case-insensitive) to the
+front; `limit` defaults to 5000. Gzipped sitemap files (`.xml.gz`) are not unpacked.
+
+### `batch(urls, opts?)` → `ScrapeResult[]`
+
+Scrapes a list with `concurrency` (default 5) requests in flight. Results come back in input
+order; a URL that fails yields `status: 0` with empty fields.
+
+---
+
+## MCP server
+
+`src/mcp.ts` is a [Model Context Protocol](https://modelcontextprotocol.io) server on stdio
+(JSON-RPC 2.0, newline-delimited, no dependency), so an agent — Claude Code, Claude Desktop,
+Cursor — can call bun-tls itself.
+
+```bash
+claude mcp add bun-tls -- bun /abs/path/to/bun-tls/src/mcp.ts
+```
+
+Other clients take the same command in their MCP config:
+
+```json
+{ "mcpServers": { "bun-tls": { "command": "bun", "args": ["/abs/path/to/bun-tls/src/mcp.ts"] } } }
+```
+
+| tool | arguments | returns |
+|---|---|---|
+| `scrape` | `url`, `formats` (default `['llm']`), `onlyMainContent`, `fit`, `persona` (`chrome` / `edge` / `firefox` / `safari`), `maxChars` | the `llm` view as plain text under a `url (status)` line; JSON for other formats |
+| `crawl` | `url`, `limit` (15), `depth` (2), `persona` | each page's `llm` view, separated by `---` |
+| `map` | `url`, `limit` (2000), `search` | JSON `{ links }` |
+| `extract` | `url`, `baseSelector`, `fields` | JSON `{ url, status, records }` — [CSS extraction](#css-extraction--extract) |
+
+The `llm` view goes out as plain text, not inside a JSON string: escaping its newlines and
+quotes would cost ~8% more tokens (14% on code-heavy pages). The server exits when stdin
+closes. `startMcp()` is exported to run it from your own entry point.
+
+---
+
 ## Low-level API
 
 The pieces `request`/`Session` are built from, for when you need the raw handshake.
@@ -615,6 +858,13 @@ Everything below is re-exported from `./src` (`index.ts`):
 |---|---|---|
 | `request` | fn | one-shot request |
 | `Session`, `CookieJar` | class | stateful client + cookie jar |
+| `SessionPool` | class | `Session`s on N worker threads |
+| `fetch` | fn | Web-standard `fetch()` with persona / fingerprint control, streamed body, HTTP/3 |
+| `connectWebSocket`, `BunTlsWebSocket` | fn/class | WebSocket (RFC 6455) over the fingerprinted TLS |
+| `QuicConnection`, `h3Request` | class/fn | QUIC v1 + HTTP/3 |
+| `scrape`, `scrapeHtml`, `extractLLM`, `fitMarkdown` | fn | [scraping for LLMs](#scraping-for-llms) |
+| `crawl`, `map`, `batch` | fn | [crawling](#crawling) |
+| `startMcp` | fn | [MCP server](#mcp-server) on stdio |
 | `clients`, `JA3` | const | named presets + reference JA3 strings |
 | `personas`, `resolvePersona`, `randomPersona`, `personaHeaders` | const/fn | coherent browser personas |
 | `presets`, `modern`, `dart`, `chrome131`, `firefox148`, `tls12` | fn | raw `Fingerprint` presets |
@@ -630,8 +880,11 @@ Everything below is re-exported from `./src` (`index.ts`):
 | `ext` | namespace | extension builders |
 | `consts` | namespace | IANA numbers (below) |
 
-Types: `RequestOptions`, `ClientResponse`, `SessionOptions`, `Fingerprint`, `FromJa3Opts`,
-`Persona`, `OcspMode`, `OcspStatus`, `H2Request`, `H2Profile`, `TlsConn`.
+Types: `RequestOptions`, `ClientResponse`, `SessionOptions`, `PoolOptions`, `PoolRequest`,
+`PoolResponse`, `Fingerprint`, `FromJa3Opts`, `Persona`, `OcspMode`, `OcspStatus`, `H2Request`,
+`H2Profile`, `H3Response`, `TlsConn`, `FetchInit`, `WsOptions`, `WsMessage`, `ProxyOptions`,
+`ScrapeResult`, `ScrapeOptions`, `CssSchema`, `Format`, `LlmFn`, `LlmConfig`,
+`ExtractLLMOptions`, `CrawlOptions`, `MapOptions`.
 
 `consts` holds `ContentType`, `HandshakeType`, `Ext`, `Cipher`, `Cipher12`, `Group`,
 `SigAlg`, `TLS12`, `TLS13`, `GREASE`, `isGrease`.
@@ -642,17 +895,22 @@ Types: `RequestOptions`, `ClientResponse`, `SessionOptions`, `Fingerprint`, `Fro
 
 ![architecture](assets/architecture.svg)
 
-Four layers, imports pointing down only:
+Five layers, each importing only from the ones below it:
 
 ```
-core/  bytes + crypto primitives (HKDF, key schedule, AES-GCM, ChaCha, ECDHE, PRF, ML-KEM, ASN.1)
+core/       bytes + crypto primitives (HKDF, key schedule, AES-GCM, ChaCha, ECDHE, PRF, ML-KEM)
   ↓
-tls/   handshake (1.3 + 1.2), record layer, cert verification + OCSP, transport
+tls/        handshake (1.3 + 1.2), record layer, X.509 + OCSP, transport
   ↓
-fp/    fingerprint presets + fromJa3
+fp/ quic/   fingerprint presets, replay, personas  ·  QUIC v1 for HTTP/3
   ↓
-http/  http1 + http2 + request() + Session
+http/       http1 + h2 + h3, request(), Session, fetch(), WebSocket, scrape(), crawl()
+  ↓
+mcp.ts proxy.ts cli.ts   MCP server, fingerprint proxy, command line
 ```
+
+One exception: `fp/personas.ts` reads each browser's HTTP/2 profile (data) from `http/h2.ts`;
+`http/h2.ts` imports nothing from `fp/`, so there is no cycle.
 
 The fingerprint is data (`Fingerprint` + `Extension[]`); the extension array order is the
 wire order and therefore the JA3/JA4. JA3/JA4 are computed by parsing the finished
@@ -672,17 +930,32 @@ ClientHello, so what is reported always equals what is sent.
 | `tls/handshake.ts` | TLS 1.3 client state machine |
 | `tls/handshake12.ts` | TLS 1.2 client (ECDHE + AEAD) |
 | `tls/verify.ts` | cert chain + hostname + CertificateVerify + OCSP gate |
+| `tls/x509.ts` | RFC 5280 constraints: EKU chaining, name constraints, path length, critical extensions |
+| `tls/resumption.ts` | session ticket store (resumption + 0-RTT) |
 | `tls/asn1.ts` | minimal DER reader + encoder |
 | `tls/ocsp.ts` | OCSP (RFC 6960) |
 | `tls/transport.ts` | Bun.connect byte stream + HTTP/SOCKS5 proxy |
 | `fp/fingerprints.ts` | presets |
 | `fp/clients.ts` | named registry |
 | `fp/ja3.ts` | `fromJa3` |
+| `fp/capture.ts` | `fromClientHello` (byte-exact replay) |
+| `fp/personas.ts` | coherent browser personas (TLS + h2 + headers) |
+| `quic/varint.ts`, `quic/frames.ts` | QUIC integers and frames |
+| `quic/crypto.ts`, `quic/packet.ts` | QUIC packet protection (RFC 9001) |
+| `quic/connection.ts` | QUIC v1 client: TLS 1.3 in CRYPTO frames, key spaces, ACK, Retry |
 | `http/http1.ts` | HTTP/1.1 + gzip/deflate/br/zstd |
 | `http/h2.ts` | HTTP/2 (frames + HPACK + flow control + multiplexing) |
+| `http/h3.ts` | HTTP/3 + QPACK (static table) |
 | `http/psl.ts` | Public Suffix List |
 | `http/client.ts` | `request()` + `openConnection` / `roundtrip` |
 | `http/session.ts` | `Session` |
+| `http/pool.ts`, `http/pool-worker.ts` | `SessionPool` |
+| `http/fetchlike.ts` | `fetch()` with a streaming body |
+| `http/ws.ts` | WebSocket |
+| `http/scrape.ts` | `scrape()`, `scrapeHtml()`, the LLM view, CSS + LLM extraction |
+| `http/crawl.ts` | `crawl()`, `map()`, `batch()` |
+| `mcp.ts` | MCP server |
+| `proxy.ts`, `cli.ts` | fingerprint proxy + its command line |
 
 ---
 
@@ -701,7 +974,7 @@ ClientHello, so what is reported always equals what is sent.
 ## Testing
 
 ```bash
-bun test/all.ts          # offline: crypto, chacha, resumption vs RFC vectors, cookies
+bun test/all.ts          # offline: crypto, chacha, resumption vs RFC vectors, cookies, scrape rendering
 bun test/all.ts --live   # + network: handshake, JA3/JA4 echo, POST, resumption, h2, OCSP, TLS 1.2
 ```
 

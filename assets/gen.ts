@@ -41,9 +41,10 @@ function hero(): string {
 		grid += `<text class="m" x="${gx + c * cellW}" y="${gy + r * cellH}" ${FM} font-size="15" fill="${hot ? C.accent : C.faint}" opacity="${hot ? 1 : 0.5}">${b}</text>`;
 	});
 	return frame(w, h, `
-<text x="64" y="118" ${FM} font-size="62" font-weight="700" fill="${C.text}" letter-spacing="-1">bun-tls</text>
-<text x="66" y="162" ${FS} font-size="21" fill="${C.dim}">A TLS 1.3 client written from scratch — with a fingerprint you control.</text>
-<text x="66" y="212" ${FS} font-size="15" fill="${C.faint}">Pure TypeScript on Bun. No Python, no Dart, no native .dll. Every ClientHello byte is yours.</text>
+<text x="64" y="112" ${FM} font-size="62" font-weight="700" fill="${C.text}" letter-spacing="-1">bun-tls</text>
+<text x="66" y="156" ${FS} font-size="21" fill="${C.dim}">HTTPS from scratch — with a fingerprint you control.</text>
+<text x="66" y="196" ${FS} font-size="15" fill="${C.text}">TLS 1.3 / 1.2 · HTTP/1.1, 2, 3 · browser personas · LLM-ready scraping + MCP</text>
+<text x="66" y="222" ${FS} font-size="15" fill="${C.faint}">TypeScript on Bun. No patched libcurl, no Python, nothing native to install.</text>
 <text x="66" y="276" ${FM} font-size="14" fill="${C.dim}">${esc(ja3cipher)}</text>
 <text x="66" y="298" ${FM} font-size="14" fill="${C.faint}">${esc(ja3rest)}</text>
 <rect x="66" y="252" width="520" height="1" fill="${C.line}"/>
@@ -55,32 +56,42 @@ ${grid}
 
 // ── 2. Architecture (layers, imports point down) ──────────────────────────────
 function architecture(): string {
-	const w = 1000, h = 430;
-	const layers = [
-		['http', 'request, session, http1', 'request() and Session — the public API'],
-		['fp', 'fingerprints, clients, ja3', 'browser presets, named clients, fromJa3()'],
-		['tls', 'clienthello, handshake, record, verify, extensions, transport', 'the TLS 1.3 state machine + records'],
-		['core', 'bytes, consts, crypto, chacha', 'byte I/O + crypto primitives']
+	const w = 1000, h = 580;
+	// One row per layer; a row with two entries is two sibling packages side by side.
+	const layers: [string, string, string][][] = [
+		[['apps', 'mcp, proxy, cli', 'MCP server, fingerprint proxy, command line']],
+		[['http', 'client, session, pool, http1, h2, h3, fetchlike, ws, scrape, crawl', 'request(), Session, fetch(), WebSocket, scrape()']],
+		[
+			['fp', 'fingerprints, clients, ja3, capture, personas', 'presets, replay, personas'],
+			['quic', 'connection, packet, frames, crypto, varint', 'QUIC v1 for HTTP/3']
+		],
+		[['tls', 'clienthello, handshake, handshake12, record, verify, x509, ocsp', 'TLS 1.3 + 1.2, certificates, OCSP']],
+		[['core', 'bytes, consts, crypto, cng, chacha, keypool', 'byte I/O + crypto primitives']]
 	];
-	const x = 60, bw = 760, bh = 72, gap = 22, top = 70;
+	const x = 60, bw = 760, bh = 72, gap = 22, top = 70, split = 16;
 	let bands = '';
-	layers.forEach((L, i) => {
+	layers.forEach((row, i) => {
 		const y = top + i * (bh + gap);
-		bands += `
-<rect x="${x}" y="${y}" width="${bw}" height="${bh}" rx="10" fill="${C.panel}" stroke="${C.line}"/>
-<text x="${x + 22}" y="${y + 31}" ${FM} font-size="19" font-weight="700" fill="${C.text}">${L[0]}</text>
-<text x="${x + 22}" y="${y + 55}" ${FM} font-size="14" fill="${C.text}">${esc(L[1]!)}</text>
-<text x="${x + bw - 16}" y="${y + bh - 14}" ${FS} font-size="12.5" fill="${C.dim}" text-anchor="end">${esc(L[2]!)}</text>`;
+		const cw = (bw - split * (row.length - 1)) / row.length;
+		row.forEach(([name, modules, what], j) => {
+			const cx = x + j * (cw + split);
+			bands += `
+<rect x="${cx}" y="${y}" width="${cw}" height="${bh}" rx="10" fill="${C.panel}" stroke="${C.line}"/>
+<text x="${cx + 22}" y="${y + 31}" ${FM} font-size="19" font-weight="700" fill="${C.text}">${name}</text>
+<text x="${cx + cw - 16}" y="${y + 30}" ${FS} font-size="12.5" fill="${C.dim}" text-anchor="end">${esc(what)}</text>
+<text x="${cx + 22}" y="${y + 55}" ${FM} font-size="${row.length > 1 ? 12 : 14}" fill="${C.text}">${esc(modules)}</text>`;
+		});
 	});
 	const ax = x + bw + 46;
-	const ay0 = top + 20, ay1 = top + 3 * (bh + gap) + bh - 20;
+	const ay0 = top + 20, ay1 = top + (layers.length - 1) * (bh + gap) + bh - 20;
 	return frame(w, h, `
-<text x="60" y="44" ${FS} font-size="20" font-weight="700" fill="${C.text}">Four layers, one direction</text>
+<text x="60" y="44" ${FS} font-size="20" font-weight="700" fill="${C.text}">Five layers, one direction</text>
 ${bands}
 <line x1="${ax}" y1="${ay0}" x2="${ax}" y2="${ay1}" stroke="${C.faint}" stroke-width="1.5"/>
 <path d="M ${ax - 5} ${ay1 - 10} L ${ax} ${ay1} L ${ax + 5} ${ay1 - 10}" fill="none" stroke="${C.faint}" stroke-width="1.5"/>
 <text x="${ax + 12}" y="${(ay0 + ay1) / 2 - 6}" ${FS} font-size="13" fill="${C.dim}">imports</text>
-<text x="${ax + 12}" y="${(ay0 + ay1) / 2 + 12}" ${FS} font-size="13" fill="${C.dim}">point down</text>`);
+<text x="${ax + 12}" y="${(ay0 + ay1) / 2 + 12}" ${FS} font-size="13" fill="${C.dim}">point down</text>
+<text x="60" y="${h - 24}" ${FS} font-size="12" fill="${C.faint}">One exception: fp/personas reads each browser's HTTP/2 profile (data) from http/h2.</text>`);
 }
 
 // ── 3. Full handshake vs 0-RTT (round trips) ──────────────────────────────────
@@ -126,16 +137,20 @@ ${panel(540, '0-RTT resumption', 'returning, with a cached ticket', [
 
 // ── 5. Comparison matrix vs other clients ─────────────────────────────────────
 function comparison(): string {
-	const w = 1000, h = 370;
+	const w = 1000, h = 446;
 	const cols = ['bun-tls', 'curl_cffi', 'utls', 'node fetch', 'requests'];
 	// true = yes, false = no, or a short string. Only properties checked for every column.
+	// bun-tls calls the OS crypto library (Windows CNG) through bun:ffi — nothing extra to
+	// install, but it is FFI, hence "no extra native library" rather than "no FFI".
 	const rows: [string, (string | boolean)[]][] = [
 		['Language', ['TypeScript', 'Python', 'Go', 'JavaScript', 'Python']],
-		['No FFI / extra native library', [true, false, true, true, true]],
+		['No extra native library', [true, false, true, true, true]],
 		['JA3 / JA4 control', [true, true, true, false, false]],
 		['Browser presets', [true, true, true, false, false]],
-		['HTTP/2', ['one-shot', true, 'TLS only', true, false]],
-		['Cert verification by default', [true, true, true, true, true]]
+		['HTTP/2', [true, true, 'TLS only', true, false]],
+		['HTTP/3 (QUIC)', [true, true, 'TLS only', false, false]],
+		['Cert verification by default', [true, true, true, true, true]],
+		['LLM-ready scraping + MCP server', [true, false, false, false, false]]
 	];
 	const lx = 60, labelW = 300, c0 = lx + labelW, cw = (w - c0 - 40) / cols.length;
 	const colX = (i: number) => c0 + cw * i + cw / 2;
@@ -159,10 +174,58 @@ function comparison(): string {
 	});
 	return frame(w, h, `
 <text x="60" y="44" ${FS} font-size="20" font-weight="700" fill="${C.text}">How it compares</text>
-<text x="60" y="68" ${FS} font-size="13" fill="${C.dim}">filled = yes, dash = no. utls is a TLS library; HTTP/2 comes from the HTTP layer you pair it with.</text>
+<text x="60" y="68" ${FS} font-size="13" fill="${C.dim}">filled = yes, dash = no. utls is a TLS library; HTTP/2 and HTTP/3 come from the HTTP layer you pair it with.</text>
 ${head}
 <line x1="${lx - 14}" y1="108" x2="${w - (lx - 14)}" y2="108" stroke="${C.line}"/>
 ${body}`);
+}
+
+// ── 6. Tokens per page: the 'llm' view vs Jina Reader vs Markdown ─────────────
+function tokens(): string {
+	const w = 1000, h = 652;
+	// cl100k tokens (gpt-tokenizer), measured 2026-10-14, each page fetched once per tool.
+	// llm = scrape(url, { as: 'llm' }); Jina = the r.jina.ai output; Markdown = bun-tls'
+	// readable Markdown with links, the shape Firecrawl-style scrapers return.
+	const rows: [string, number, number, number][] = [
+		['IKEA product page', 1011, 7744, 1113],
+		['bbc.com/news', 1484, 5262, 2509],
+		['Hacker News', 1082, 5400, 3916],
+		['Wikipedia article', 31215, 36327, 75148],
+		['MDN reference page', 463, 16184, 1169],
+		['GitHub repository', 3474, 8538, 10171],
+		['Bun release post *', 23960, 21770, 29928],
+		['ASOS category page', 709, 37403, 3268]
+	];
+	const sum = (k: 1 | 2 | 3) => rows.reduce((a, r) => a + r[k], 0);
+	rows.push(['All 8 pages', sum(1), sum(2), sum(3)]);
+	const series: [string, string][] = [['llm view', C.accent], ['Jina Reader', C.dim], ['Markdown', C.faint]];
+	const x0 = 250, barW = 560, bh = 9, bgap = 3, top = 122, step = 50;
+	let legend = '';
+	series.forEach(([name, color], i) => {
+		legend += `<rect x="${60 + i * 140}" y="86" width="13" height="13" rx="3" fill="${color}"/><text x="${80 + i * 140}" y="97" ${FS} font-size="13" fill="${i ? C.dim : C.text}">${name}</text>`;
+	});
+	let body = '';
+	rows.forEach((r, i) => {
+		const total = i === rows.length - 1;
+		const y = top + i * step + (total ? 14 : 0);
+		const max = Math.max(r[1], r[2], r[3]);
+		if (total) body += `<line x1="60" y1="${y - 18}" x2="${w - 60}" y2="${y - 18}" stroke="${C.line}"/>`;
+		body += `<text x="${x0 - 18}" y="${y + 17}" ${FS} font-size="14" font-weight="${total ? 700 : 400}" fill="${C.text}" text-anchor="end">${esc(r[0])}</text>`;
+		series.forEach(([, color], s) => {
+			const v = r[s + 1]!;
+			const by = y + s * (bh + bgap);
+			const bw = Math.max(2, (v / max) * barW);
+			body += `<rect x="${x0}" y="${by}" width="${bw}" height="${bh}" rx="2" fill="${color}"/>`;
+			body += `<text x="${x0 + bw + 8}" y="${by + 8.5}" ${FM} font-size="11.5" font-weight="${s ? 400 : 700}" fill="${s ? C.dim : C.accent}">${v.toLocaleString('en-US')}</text>`;
+		});
+	});
+	return frame(w, h, `
+<text x="60" y="44" ${FS} font-size="20" font-weight="700" fill="${C.text}">Tokens per page — the same content, less to read</text>
+<text x="60" y="68" ${FS} font-size="13" fill="${C.dim}">cl100k tokens; each row is scaled to its own largest bar. Fewer is better.</text>
+${legend}
+${body}
+<text x="60" y="${h - 46}" ${FS} font-size="12" fill="${C.faint}">Markdown = readable Markdown with links, as Firecrawl-style scrapers return it. Every heading and every sentence of 60+ characters</text>
+<text x="60" y="${h - 28}" ${FS} font-size="12" fill="${C.faint}">in it is also in the llm view. * Jina drops most of this page's code blocks; the llm view keeps them. Measured 2026-10-14.</text>`);
 }
 
 // ── 4. Throughput vs curl_cffi ────────────────────────────────────────────────
@@ -201,4 +264,5 @@ writeFileSync(`${out}/architecture.svg`, architecture());
 writeFileSync(`${out}/handshake.svg`, handshake());
 writeFileSync(`${out}/benchmark.svg`, benchmark());
 writeFileSync(`${out}/comparison.svg`, comparison());
-console.log('wrote hero.svg architecture.svg handshake.svg benchmark.svg comparison.svg');
+writeFileSync(`${out}/tokens.svg`, tokens());
+console.log('wrote hero.svg architecture.svg handshake.svg benchmark.svg comparison.svg tokens.svg');
