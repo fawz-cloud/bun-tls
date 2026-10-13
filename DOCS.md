@@ -32,8 +32,12 @@ intro see the [README](README.md); this file is the complete API.
 bun add github:fawz-cloud/bun-tls   # or: git clone, then import from ./src
 ```
 
-Requires Bun ≥ 1.1. No build step, no native addon — `node:crypto` (Bun's own OpenSSL)
-supplies the primitives; every ClientHello byte is assembled in TypeScript.
+Requires Bun ≥ 1.1. No build step, no native addon; every ClientHello byte is assembled in
+TypeScript. The primitives come from the OS on Windows — CNG (`bcrypt.dll`) through
+`bun:ffi`: AES-GCM and ChaCha20-Poly1305 with one key handle per traffic key, records sealed
+and opened in place, plus ML-KEM-768 — and from Bun's `node:crypto` / WebCrypto elsewhere.
+Each CNG algorithm passes a known-answer check before first use and falls back on its own;
+`BUN_TLS_CRYPTO=node` forces the fallback everywhere.
 
 ```ts
 import { request, Session, clients, fromJa3 } from './src';
@@ -655,7 +659,9 @@ ClientHello, so what is reported always equals what is sent.
 | `core/bytes.ts` | Reader / Writer / concat / hex |
 | `core/consts.ts` | IANA numbers + GREASE |
 | `core/crypto.ts` | HKDF, key schedule, AEAD, X25519, P-256/384, ML-KEM, TLS 1.2 PRF |
-| `core/chacha.ts` | ChaCha20-Poly1305 (pure TS) |
+| `core/cng.ts` | Windows CNG via `bun:ffi`: in-place AES-GCM / ChaCha20-Poly1305, AES-ECB, ML-KEM-768 |
+| `core/keypool.ts` | pre-generated, single-use key shares (keygen off the handshake path) |
+| `core/chacha.ts` | ChaCha20-Poly1305: CNG when present, else pure TS; WebCrypto for bulk |
 | `tls/extensions.ts` | one builder per extension |
 | `tls/clienthello.ts` | assemble CH + JA3/JA3N/JA4 + permute |
 | `tls/record.ts` | TLS 1.3 record layer + AEAD direction |

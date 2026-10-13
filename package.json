@@ -1,7 +1,7 @@
 {
   "name": "bun-tls",
   "version": "0.1.0",
-  "description": "Native Bun HTTPS client with a controllable TLS fingerprint (JA3/JA4) — like curl_cffi, pure TypeScript, no native deps.",
+  "description": "Native Bun HTTPS client with a controllable TLS fingerprint (JA3/JA4) — like curl_cffi, TypeScript on Bun, no native dependencies.",
   "type": "module",
   "module": "src/index.ts",
   "types": "src/index.ts",

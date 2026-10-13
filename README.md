@@ -4,10 +4,10 @@
 
 A TLS 1.3 / 1.2 HTTPS client written from scratch in TypeScript, with **control over the
 TLS fingerprint** (JA3 / JA3N / JA4). The handshake is assembled by hand on a raw
-`Bun.connect` socket; `node:crypto` is used only for primitives, so the ClientHello —
-cipher list, extensions, order, GREASE — is yours to set. **No additional native
-dependency**: no patched libcurl, no Python, no Dart, no `.dll` to build (it runs on Bun,
-which brings its own OpenSSL for `node:crypto`).
+`Bun.connect` socket and only the crypto primitives are native — the operating system's own
+library on Windows (CNG, through `bun:ffi`), Bun's `node:crypto` elsewhere — so the
+ClientHello — cipher list, extensions, order, GREASE — is yours to set. **No additional
+native dependency**: no patched libcurl, no Python, no Dart, no `.dll` to build or ship.
 
 ```ts
 import { request, clients } from './src';
@@ -92,24 +92,29 @@ TLS features, OCSP, HTTP/2, proxies, cookies, the low-level API and the architec
 
 ## Benchmarks
 
-![benchmark](assets/benchmark.svg)
+![speed](bench/compare/svg/speed.svg)
 
-Reproducible, not hand-picked — scripts in `bench/` (see [DOCS.md](DOCS.md#testing)). One
-interleaved run on localhost (Bun 1.4.2, curl_cffi 0.15.0, AES-128-GCM):
+Reproducible, not hand-picked — `bun bench/compare/run.ts` (see [DOCS.md](DOCS.md#testing)).
+Five clients impersonating Chrome over HTTP/1.1 against a local Go TLS 1.3 server (remote rows:
+example.com), every scenario in its own process, client order rotated per round, median of 3
+rounds. Windows 11, i5-14450HX, Bun 1.4.3, curl_cffi 0.15.0, impers 0.1.2, utls 1.8.2:
 
-| scenario | bun-tls | curl_cffi |
-|---|---|---|
-| latency, fresh connection | 3.4 ms | 4.7 ms |
-| latency, reused connection | 0.04 ms | 0.25 ms |
-| throughput, 1 connection | 11,618 req/s | 2,227 req/s |
-| throughput, 10 concurrent | 17,029 req/s | 3,020 req/s |
-| throughput, 50 concurrent | 5,848 req/s | 1,320 req/s |
-| upload 10 MB, reused | ~350 MB/s | ~420 MB/s |
+| scenario | bun-tls | impers (node) | impers (bun) | curl_cffi | go-utls |
+|---|---|---|---|---|---|
+| latency, new connection | **4.59 ms** | 5.65 | 5.28 | 5.09 | 5.48 |
+| latency, reused connection | **0.07 ms** | 0.28 | 0.19 | 0.24 | 0.10 |
+| throughput, 10 concurrent | **31,331 req/s** | 2,779 | 4,410 | 4,383 | 30,586 |
+| throughput, 100 concurrent | **16,022 req/s** | 2,834 | 6,234 | 4,300 | fail |
+| upload 10 MiB | 415 MB/s | 1,053 | 1,065 | **1,213** | 1,091 |
+| download 10 MiB | **501 MB/s** | 407 | 448 | 250 | 263 |
+| remote, new connection | **83.8 ms** | 90.8 | 85.1 | 94.6 | 107.7 |
+| remote, reused connection | 30.6 ms | **25.1** | 33.3 | 30.2 | 29.8 |
 
-On this localhost setup bun-tls is faster for one-shot and concurrent requests; curl keeps
-an edge on bulk upload (native AEAD). The numbers do **not** isolate a cause (both use
-connection reuse), and over a real network latency is round-trip-bound and the two converge.
-Run the scripts on your own machine.
+go-utls reaches its throughput on 3.6 cores, bun-tls on ~1.5. Upload is the row where bun-tls
+trails: its rounds were 1,007, 335 and 415 MB/s (a dedicated `bench/crypto/ab.ts` run gives
+~1,165 MB/s), and the cost is the socket write path rather than the crypto (1.04 ms CPU/MB vs
+curl_cffi's 0.77). Remote rows are round-trip-bound. CPU and memory tables:
+[bench/compare/out.md](bench/compare/out.md). Run the scripts on your own machine.
 
 ## How it compares
 

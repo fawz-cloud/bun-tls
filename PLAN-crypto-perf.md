@@ -8,7 +8,30 @@ Measured 2026-10-13 on Windows 11 (26200), i5-14450HX, Bun 1.4.2 (Bun is 1.4.3 n
 re-baseline before C1). Benchmark scripts were throwaway session files; recreate them
 under `bench/crypto/` when C1 starts.
 
-## Where we lose today (`bench/compare/out-optimized.md`)
+## Status (2026-10-13): C1–C5 done, C6 not started
+
+Each row was measured A/B against the commit before it (`bench/crypto/ab.ts`, interleaved
+rounds, CPU per unit, or an in-process micro-benchmark where the change sits below the
+e2e noise of ±3–5%).
+
+| phase | commit | measured |
+|---|---|---|
+| C3 pure-TS trims | `eb8b7ba` | `buildClientHello` (chrome) 65–80 → 48 µs; key schedule with the transcript work of a full handshake 67–71 → 17–19 µs |
+| C1 CNG AEAD, in-place records | `11a01d9` | node:crypto vs CNG, same tree: new-connection CPU 1763 → 1624 µs/req; 10 concurrent 30.7k → 34.6k req/s (CPU 46.3 → 43.1 µs/req); upload 10 MiB 1086 → 1214 MB/s (1.27 → 1.05 ms CPU/MB); download 528 → 624 MB/s (2.90 → 2.45 ms CPU/MB); a 16 KiB record inside a real download 8.1 → 4.4 µs |
+| C2 key pool + CNG ML-KEM | `86bcef4` | chrome persona, time before the ClientHello can be written 236–266 → 116–119 µs; CPU unchanged (keygen moves into idle gaps); Cloudflare trace shows `kex=X25519MLKEM768` |
+| C4 cert parse-once | `cbd40b3` | repeat handshake, chain check + CertificateVerify key 20–21 → 1.7–2.1 µs |
+| C5 QUIC per-key ciphers | `3cf9ef2` | 1200-byte 1-RTT packet: build 5.2–5.5 → 1.9 µs, parse 6.3–6.7 → 1.1–1.7 µs |
+
+Not done:
+- C6 (Linux libcrypto): optional.
+- The Firefox hybrid-key-reuse fidelity check: needs a real Firefox capture.
+- A sync CNG path for small ChaCha records inside the parallel download queue: that queue
+  stays on WebCrypto.
+
+With CNG, a real 10 MiB download spends 13% of wall time in decryption (node:crypto: 22%).
+Bulk speed is now bound by the socket and HTTP layers, not crypto.
+
+## Where we lost before this work (`bench/compare/out-optimized.md`)
 
 | scenario | bun-tls | best other |
 |---|---|---|
@@ -64,9 +87,9 @@ Never use it in a speculative queue (the ChaCha path re-decrypts after a KeyUpda
 **7. QUIC builds a new AEAD key object and a new AES-ECB header-protection cipher for every
 packet.** This costs 2.65–3.14 µs of crypto per 1200-byte packet, about 400 MB/s.
 
-## Decision needed
+## Decision (approved 2026-10-13; PLAN.md design rules updated)
 
-Today's design rule (PLAN.md) is "node:crypto only, no native `.dll`". C1, C2 and the CNG
+The design rule used to be "node:crypto only, no native `.dll`". C1, C2 and the CNG
 part of C5 call Windows' own `bcrypt.dll` through `bun:ffi`. That means no download, no
 addon, the OS's FIPS-validated SymCrypt, and automatic fallback to the current node path.
 If the answer is no, only C3, C4 and the cache-only part of C5 apply, and the bulk and

@@ -1,9 +1,9 @@
 # bun-tls — plan & status
 
 Native Bun HTTPS client with a controllable TLS fingerprint (JA3/JA4), like
-`curl_cffi` but with no Python/Dart/native `.dll`. Hand-written TLS 1.3 on a raw
-`Bun.connect` socket, `node:crypto` only for primitives, so every ClientHello byte
-is ours.
+`curl_cffi` but with no Python/Dart/native `.dll` to ship. Hand-written TLS 1.3 on a raw
+`Bun.connect` socket; only the primitives are native (the OS crypto library on Windows,
+`node:crypto` elsewhere), so every ClientHello byte is ours.
 
 ## Why
 
@@ -20,6 +20,11 @@ via a patched libcurl (C); we do it in TS.
   state machine. Extension array order = wire order = JA3/JA4.
 - JA3/JA4 are computed by PARSING the finished ClientHello → "what we claim" always
   equals "what we send" (verified live against tls.peet.ws).
+- Crypto primitives: the OS library when present — Windows CNG (`bcrypt.dll`, shipped with
+  Windows) through `bun:ffi` — else `node:crypto` / WebCrypto / pure TS. Same bytes either way:
+  each CNG algorithm passes a known-answer check before first use and falls back on its own;
+  `BUN_TLS_CRYPTO=node` forces the fallback. Nothing native is bundled or built.
+  (PLAN-crypto-perf.md has the measurements.)
 
 ## Modules (`src/`, grouped by layer)
 
@@ -27,8 +32,10 @@ via a patched libcurl (C); we do it in TS.
 |------|---------|
 | `core/bytes.ts` | Reader/Writer/concat/hex |
 | `core/consts.ts` | IANA numbers + GREASE |
-| `core/crypto.ts` | HKDF, expand-label, key schedule, AES-GCM, X25519, P-256/384 ECDHE, nonce |
-| `core/chacha.ts` | ChaCha20-Poly1305 (pure TS; Bun lacks it) |
+| `core/crypto.ts` | HKDF, expand-label, key schedule, AES-GCM, X25519, P-256/384 ECDHE, ML-KEM, nonce |
+| `core/cng.ts` | Windows CNG via `bun:ffi`: in-place AES-GCM / ChaCha20-Poly1305, AES-ECB, ML-KEM-768 |
+| `core/keypool.ts` | pre-generated, single-use key shares (keygen off the handshake path) |
+| `core/chacha.ts` | ChaCha20-Poly1305: CNG when present, else pure TS (node:crypto lacks it); WebCrypto for bulk |
 | `tls/extensions.ts` | one builder per extension (order = JA3/JA4) |
 | `tls/clienthello.ts` | assemble CH + compute JA3/JA3N + JA4; extension permute |
 | `tls/record.ts` | record layer + AEAD direction (seq, nonce, inner type) |
