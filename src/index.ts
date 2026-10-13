@@ -5,6 +5,8 @@ export { request } from './http/client';
 export type { RequestOptions, ClientResponse } from './http/client';
 export { Session, CookieJar } from './http/session';
 export type { SessionOptions } from './http/session';
+export { SessionPool } from './http/pool';
+export type { PoolOptions, PoolRequest, PoolResponse } from './http/pool';
 export { PRESETS as presets, modern, dart, chrome131, firefox148, tls12 } from './fp/fingerprints';
 export { clients, JA3 } from './fp/clients';
 export { personas, resolvePersona, randomPersona, personaHeaders } from './fp/personas';

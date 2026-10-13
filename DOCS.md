@@ -166,6 +166,44 @@ Per-request `RequestOptions` override the session defaults where both apply.
 
 ---
 
+## `SessionPool` — many cores
+
+A single `Session` runs on one CPU core. For a few thousand small requests per second that
+is plenty — one core already keeps up — but a workload that is **CPU-bound per request**,
+above all many large concurrent downloads (the response AEAD decrypt is the bottleneck), is
+capped by that one core. `SessionPool` spreads the work over N Bun Workers, each with its own
+`Session`, and round-robins requests across them.
+
+```ts
+import { SessionPool } from './src';
+
+const pool = new SessionPool({ workers: 8, persona: 'chrome' });
+const files = await Promise.all(urls.map((u) => pool.get(u)));  // downloaded across 8 cores
+for (const r of files) save(r.body);
+pool.close();
+```
+
+`PoolOptions` is `SessionOptions` plus `workers` (default: `hardwareConcurrency`, capped at 8),
+but a **persona must be given by name** (`'chrome' | 'edge' | 'firefox' | 'safari'`) and a
+`fingerprint` object is rejected — neither a `Persona` nor a `Fingerprint` can cross a worker
+boundary, because they carry functions. `request` / `get` / `post` take and return the same
+shapes as `Session` (the response body is transferred from the worker, not copied).
+
+**What it is and isn't for.** Measured on one 10-core machine, 16 concurrent 10 MiB downloads
+scale from ~720 MB/s on a single `Session` to ~1.15 GB/s with 4 workers and ~1.47 GB/s with 8 —
+the decrypt work parallelises across cores. **Small requests do not scale this way**: every
+request still crosses the main thread to be dispatched and its response resolved, and that
+coordination is comparable to the request's own work, so a single `Session` is as fast or
+faster for high-rate tiny requests. Use a pool when each request is heavy, not when there are
+merely many of them.
+
+Each worker keeps its **own** cookie jar, keep-alive pool and resumption tickets, so a pool is
+for stateless fan-out, not a flow that depends on shared cookies. Streaming, `fetch()` and
+WebSocket are not routed through the pool. A worker that crashes has its in-flight requests
+rejected and is replaced; `close()` terminates every worker and rejects anything outstanding.
+
+---
+
 ## Fingerprints
 
 A `Fingerprint` is the JA3/JA4 control surface — it is *data*, never baked into the state
