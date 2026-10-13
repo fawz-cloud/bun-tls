@@ -74,11 +74,13 @@ const chainCache = new Map<string, Verified>();
 const CHAIN_CACHE_MAX = 1024;
 
 /** Match the leaf against the requested host — by IP SAN for an IP literal, by DNS SAN
- *  otherwise. `checkHost` does not match IP addresses, so an IP target needs `checkIP`. */
+ *  otherwise. `checkHost` does not match IP addresses, so an IP target needs `checkIP`.
+ *  SAN only, never the subject CN (as browsers do): a CN-only name would also slip past
+ *  NameConstraints, which apply to the SAN. */
 function matchesHost(leaf: crypto.X509Certificate, host: string): boolean {
 	const h = host.replace(/^\[|\]$/g, ''); // strip IPv6 brackets
 	if (/^\d{1,3}(\.\d{1,3}){3}$/.test(h) || h.includes(':')) return !!leaf.checkIP(h);
-	return !!leaf.checkHost(host);
+	return !!leaf.checkHost(host, { subject: 'never' });
 }
 
 /** Verify the chain for `host`; returns the leaf's public key (for CertificateVerify /

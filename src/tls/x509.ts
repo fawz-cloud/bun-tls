@@ -1,7 +1,11 @@
 // X.509 path-validation constraints beyond "signed by a CA" (RFC 5280 §4.2): unknown
-// critical extensions, leaf Extended Key Usage, basicConstraints pathLenConstraint, and
-// NameConstraints (DNS + IP). node:crypto's X509Certificate does not expose these, so we
-// parse them with the DER reader. verifyChain calls enforceConstraints over the chain.
+// critical extensions, Extended Key Usage on the leaf AND on every intermediate (EKU chaining,
+// as browsers and OpenSSL enforce), basicConstraints pathLenConstraint, and NameConstraints
+// over every certificate below the constraining CA — dNSName, iPAddress, rfc822Name (email),
+// URI and directoryName. A constrained name form we cannot evaluate (otherName, x400Address,
+// ediPartyName, registeredID) fails closed when a certificate carries such a name.
+// node:crypto's X509Certificate does not expose these, so we parse them with the DER reader.
+// verifyChain calls enforceConstraints.
 import crypto from 'node:crypto';
 import { der, children, oid } from './asn1';
 
@@ -12,9 +16,16 @@ const SAN = '2.5.29.17';
 const NAME_CONSTRAINTS = '2.5.29.30';
 const SERVER_AUTH = '1.3.6.1.5.5.7.3.1';
 const ANY_EKU = '2.5.29.37.0';
+const EMAIL_ATTR = '1.2.840.113549.1.9.1'; // PKCS#9 emailAddress inside a subject DN
 // Critical extensions we actually process — a critical extension outside this set must be
 // rejected (RFC 5280 §4.2: a client that cannot process a critical extension must reject).
 const PROCESSED = new Set([BASIC_CONSTRAINTS, KEY_USAGE, EKU, SAN, NAME_CONSTRAINTS]);
+// GeneralName tags (RFC 5280 §4.2.1.6) we evaluate; any other form is "unsupported".
+const GN_EMAIL = 0x81;
+const GN_DNS = 0x82;
+const GN_DIR = 0xa4;
+const GN_URI = 0x86;
+const GN_IP = 0x87;
 
 interface Ext {
 	oid: string;
@@ -22,9 +33,15 @@ interface Ext {
 	value: Uint8Array; // the extnValue OCTET STRING content = the extension's own DER
 }
 
+/** TBSCertificate fields after the optional [0] version: serial, signature, issuer,
+ *  validity, subject, subjectPublicKeyInfo, … */
+function tbsFields(cert: crypto.X509Certificate) {
+	const f = children(children(der(cert.raw).content)[0]!.content);
+	return f[0]?.tag === 0xa0 ? f.slice(1) : f;
+}
+
 function extensions(cert: crypto.X509Certificate): Ext[] {
-	const tbs = children(der(cert.raw).content)[0]!;
-	const extField = children(tbs.content).find((e) => e.tag === 0xa3); // [3] EXPLICIT Extensions
+	const extField = tbsFields(cert).find((e) => e.tag === 0xa3); // [3] EXPLICIT Extensions
 	if (!extField) return [];
 	const out: Ext[] = [];
 	for (const e of children(children(extField.content)[0]!.content)) {
@@ -40,26 +57,57 @@ function extensions(cert: crypto.X509Certificate): Ext[] {
 	return out;
 }
 
-/** dNSName (0x82) and iPAddress (0x87) GeneralNames from a SAN or NameConstraints body. */
-function generalNames(seq: Uint8Array): { dns: string[]; ip: Uint8Array[] } {
-	const dns: string[] = [];
-	const ip: Uint8Array[] = [];
-	for (const g of children(seq)) {
-		if (g.tag === 0x82) dns.push(Buffer.from(g.content).toString('latin1').toLowerCase());
-		else if (g.tag === 0x87) ip.push(g.content);
-	}
-	return { dns, ip };
+const text = (b: Uint8Array): string => Buffer.from(b).toString('latin1');
+/** A Name as its RDNs (each the raw SET bytes), outermost first. */
+const rdns = (nameContent: Uint8Array): Uint8Array[] => children(nameContent).map((r) => r.raw);
+
+/** Names of one form-set: what a certificate carries, or what a constraint subtree lists. */
+interface Names {
+	dns: string[];
+	ip: Uint8Array[];
+	email: string[];
+	uri: string[];
+	dn: Uint8Array[][];
+	other: Set<number>; // tags of name forms present that we do not evaluate
+}
+const noNames = (): Names => ({ dns: [], ip: [], email: [], uri: [], dn: [], other: new Set() });
+
+function addName(n: Names, g: { tag: number; content: Uint8Array }): void {
+	if (g.tag === GN_DNS) n.dns.push(text(g.content).toLowerCase());
+	else if (g.tag === GN_IP) n.ip.push(g.content);
+	else if (g.tag === GN_EMAIL) n.email.push(text(g.content));
+	else if (g.tag === GN_URI) n.uri.push(text(g.content));
+	else if (g.tag === GN_DIR) n.dn.push(rdns(der(g.content).content)); // [4] EXPLICIT Name
+	else n.other.add(g.tag);
 }
 
-/** RFC 5280 §4.2.1.10 DNS match: constraint is a suffix on a label boundary (an empty
- *  constraint matches everything; "example.com" matches "example.com" and any subdomain). */
+/** Every name NameConstraints apply to (RFC 5280 §4.2.1.10): the SAN entries plus the subject
+ *  DN when non-empty — and, with no SAN at all, emailAddress attributes in the subject DN. */
+function certNames(cert: crypto.X509Certificate): Names {
+	const n = noNames();
+	const subject = tbsFields(cert)[4]!;
+	const subj = rdns(subject.content);
+	if (subj.length) n.dn.push(subj);
+	const san = extensions(cert).find((e) => e.oid === SAN);
+	if (san) for (const g of children(der(san.value).content)) addName(n, g);
+	else
+		for (const rdn of children(subject.content))
+			for (const atv of children(rdn.content)) {
+				const [t, v] = children(atv.content);
+				if (t && v && oid(t.content) === EMAIL_ATTR) n.email.push(text(v.content));
+			}
+	return n;
+}
+
+/** DNS: constraint is a suffix on a label boundary (empty matches everything; "example.com"
+ *  matches "example.com" and any subdomain). */
 function dnsInSubtree(name: string, constraint: string): boolean {
 	const c = constraint.replace(/^\./, '').toLowerCase();
 	if (c === '') return true;
 	return name === c || name.endsWith('.' + c);
 }
 
-/** IP match: constraint = address || mask (4+4 for v4, 16+16 for v6). */
+/** IP: constraint = address || mask (4+4 for v4, 16+16 for v6). */
 function ipInSubtree(ip: Uint8Array, constraint: Uint8Array): boolean {
 	const n = constraint.length / 2;
 	if (ip.length !== n) return false;
@@ -67,96 +115,136 @@ function ipInSubtree(ip: Uint8Array, constraint: Uint8Array): boolean {
 	return true;
 }
 
-function leafNames(leaf: crypto.X509Certificate): { dns: string[]; ip: Uint8Array[] } {
-	const ext = extensions(leaf).find((e) => e.oid === SAN);
-	return ext ? generalNames(der(ext.value).content) : { dns: [], ip: [] };
+/** rfc822Name: "local@host" = that mailbox, "host" = any mailbox on that host, ".domain" = any
+ *  mailbox on a host inside the domain. Hosts compare case-insensitively. */
+function emailInSubtree(mail: string, c: string): boolean {
+	const at = mail.lastIndexOf('@');
+	if (at < 0) return false; // not a mailbox: inside no subtree
+	const local = mail.slice(0, at);
+	const host = mail.slice(at + 1).toLowerCase();
+	const cat = c.lastIndexOf('@');
+	if (cat >= 0) return local === c.slice(0, cat) && host === c.slice(cat + 1).toLowerCase();
+	const ch = c.toLowerCase();
+	return ch.startsWith('.') ? host.endsWith(ch) : host === ch;
 }
 
+/** URI: the constraint names the host ("example.com" = exactly that host, ".example.com" =
+ *  any host inside the domain). A URI without a host is inside no subtree. */
+function uriInSubtree(uri: string, c: string): boolean {
+	let host: string;
+	try {
+		host = new URL(uri).hostname.toLowerCase();
+	} catch {
+		return false;
+	}
+	const ch = c.toLowerCase();
+	return host !== '' && (ch.startsWith('.') ? host.endsWith(ch) : host === ch);
+}
+
+/** directoryName: the constraint's RDNs are a prefix of the name's (byte-equal RDNs — a
+ *  differently encoded but equivalent name fails closed). */
+const dnInSubtree = (name: Uint8Array[], c: Uint8Array[]): boolean => c.length <= name.length && c.every((rdn, i) => Buffer.compare(Buffer.from(rdn), Buffer.from(name[i]!)) === 0);
+
 interface NameConstraints {
-	permittedDns: string[];
-	excludedDns: string[];
-	permittedIp: Uint8Array[];
-	excludedIp: Uint8Array[];
+	permitted: Names;
+	excluded: Names;
 }
 function parseNameConstraints(value: Uint8Array): NameConstraints {
-	const nc: NameConstraints = { permittedDns: [], excludedDns: [], permittedIp: [], excludedIp: [] };
+	const nc: NameConstraints = { permitted: noNames(), excluded: noNames() };
 	for (const sub of children(der(value).content)) {
 		// permittedSubtrees [0] (0xa0), excludedSubtrees [1] (0xa1); each = SEQ OF GeneralSubtree.
-		const permitted = sub.tag === 0xa0;
 		if (sub.tag !== 0xa0 && sub.tag !== 0xa1) continue;
-		for (const gs of children(sub.content)) {
-			const base = children(gs.content)[0]!; // GeneralSubtree.base = GeneralName
-			if (base.tag === 0x82) (permitted ? nc.permittedDns : nc.excludedDns).push(Buffer.from(base.content).toString('latin1').toLowerCase());
-			else if (base.tag === 0x87) (permitted ? nc.permittedIp : nc.excludedIp).push(base.content);
-		}
+		const into = sub.tag === 0xa0 ? nc.permitted : nc.excluded;
+		for (const gs of children(sub.content)) addName(into, children(gs.content)[0]!); // GeneralSubtree.base
 	}
 	return nc;
 }
 
-function applyNameConstraints(nc: NameConstraints, names: { dns: string[]; ip: Uint8Array[] }): void {
-	for (const d of names.dns) {
-		if (nc.excludedDns.some((c) => dnsInSubtree(d, c))) throw new Error(`certificate name ${d} is in an excluded NameConstraints subtree`);
-		if (nc.permittedDns.length && !nc.permittedDns.some((c) => dnsInSubtree(d, c))) throw new Error(`certificate name ${d} is not in any permitted NameConstraints subtree`);
+function within<T>(form: string, names: T[], permitted: T[], excluded: T[], inTree: (n: T, c: T) => boolean, show: (n: T) => string): void {
+	for (const n of names) {
+		if (excluded.some((c) => inTree(n, c))) throw new Error(`certificate ${form} ${show(n)} is in an excluded NameConstraints subtree`);
+		if (permitted.length && !permitted.some((c) => inTree(n, c))) throw new Error(`certificate ${form} ${show(n)} is not in any permitted NameConstraints subtree`);
 	}
-	for (const a of names.ip) {
-		if (nc.excludedIp.some((c) => ipInSubtree(a, c))) throw new Error('certificate IP is in an excluded NameConstraints subtree');
-		if (nc.permittedIp.length && !nc.permittedIp.some((c) => ipInSubtree(a, c))) throw new Error('certificate IP is not in any permitted NameConstraints subtree');
-	}
+}
+
+function applyNameConstraints(nc: NameConstraints, n: Names): void {
+	const { permitted: p, excluded: x } = nc;
+	within('DNS name', n.dns, p.dns, x.dns, dnsInSubtree, (d) => d);
+	within('IP address', n.ip, p.ip, x.ip, ipInSubtree, (a) => Buffer.from(a).toString('hex'));
+	within('email', n.email, p.email, x.email, emailInSubtree, (e) => e);
+	within('URI', n.uri, p.uri, x.uri, uriInSubtree, (u) => u);
+	within('directory name', n.dn, p.dn, x.dn, dnInSubtree, () => '(subject)');
+	for (const tag of n.other)
+		if (p.other.has(tag) || x.other.has(tag)) throw new Error(`NameConstraints constrain a name form we cannot check (tag 0x${tag.toString(16)}) — rejected`);
+}
+
+/** EKU, when present, must allow serverAuth (or anyExtendedKeyUsage). */
+function checkEku(exts: Ext[], what: string): void {
+	const eku = exts.find((e) => e.oid === EKU);
+	if (!eku) return;
+	const purposes = children(der(eku.value).content).map((o) => oid(o.content));
+	if (!purposes.includes(SERVER_AUTH) && !purposes.includes(ANY_EKU)) throw new Error(`${what} EKU does not permit serverAuth (${purposes.join(', ')})`);
 }
 
 /**
  * Enforce path-validation constraints over a built chain (leaf = chain[0] up to the cert
  * just below the trusted anchor at index `anchor`). Throws on any violation:
  *  - a critical extension we do not process (on any cert),
- *  - the leaf's EKU not permitting serverAuth,
+ *  - an EKU (leaf or intermediate) that does not permit serverAuth,
  *  - a CA's pathLenConstraint exceeded,
- *  - the leaf's names outside any CA's NameConstraints (permitted/excluded, DNS + IP).
+ *  - a name of any certificate below a CA outside that CA's NameConstraints. Self-issued
+ *    intermediates are exempt, as RFC 5280 §6.1.3 says; the leaf never is.
  */
 export function enforceConstraints(chain: crypto.X509Certificate[], anchor: number): void {
-	const leaf = chain[0]!;
-	const names = leafNames(leaf);
+	const names: Names[] = [];
+	const namesOf = (j: number) => (names[j] ??= certNames(chain[j]!));
 
 	for (let i = 0; i <= anchor; i++) {
-		const exts = extensions(chain[i]!);
-		for (const e of exts) if (e.critical && !PROCESSED.has(e.oid)) throw new Error(`unhandled critical certificate extension ${e.oid} (${chain[i]!.subject})`);
+		const cert = chain[i]!;
+		const exts = extensions(cert);
+		for (const e of exts) if (e.critical && !PROCESSED.has(e.oid)) throw new Error(`unhandled critical certificate extension ${e.oid} (${cert.subject})`);
+		checkEku(exts, i === 0 ? 'leaf certificate' : `intermediate certificate (${cert.subject})`);
+		if (i === 0) continue;
 
-		if (i === 0) {
-			// Leaf EKU: if present, it must allow serverAuth (or anyExtendedKeyUsage).
-			const eku = exts.find((e) => e.oid === EKU);
-			if (eku) {
-				const purposes = children(der(eku.value).content).map((o) => oid(o.content));
-				if (!purposes.includes(SERVER_AUTH) && !purposes.includes(ANY_EKU))
-					throw new Error(`leaf certificate EKU does not permit serverAuth (${purposes.join(', ')})`);
+		// CA cert: pathLenConstraint limits the number of non-self-issued CAs below it.
+		const bc = exts.find((e) => e.oid === BASIC_CONSTRAINTS);
+		if (bc) {
+			const pathLen = children(der(bc.value).content).find((p) => p.tag === 0x02); // INTEGER pathLenConstraint
+			if (pathLen) {
+				const max = pathLen.content.reduce((a, b) => a * 256 + b, 0);
+				const below = i - 1; // intermediate CAs between this CA and the leaf
+				if (below > max) throw new Error(`pathLenConstraint ${max} exceeded (${below} CAs below ${cert.subject})`);
 			}
-		} else {
-			// CA cert: pathLenConstraint limits the number of non-self-issued CAs below it.
-			const bc = exts.find((e) => e.oid === BASIC_CONSTRAINTS);
-			if (bc) {
-				const parts = children(der(bc.value).content);
-				const pathLen = parts.find((p) => p.tag === 0x02); // INTEGER pathLenConstraint
-				if (pathLen) {
-					const max = pathLen.content.reduce((a, b) => a * 256 + b, 0);
-					const below = i - 1; // intermediate CAs between this CA and the leaf
-					if (below > max) throw new Error(`pathLenConstraint ${max} exceeded (${below} CAs below ${chain[i]!.subject})`);
-				}
-			}
-			// NameConstraints on this CA must contain the leaf's names.
-			const nc = exts.find((e) => e.oid === NAME_CONSTRAINTS);
-			if (nc) applyNameConstraints(parseNameConstraints(nc.value), names);
+		}
+		// NameConstraints on this CA bind every certificate below it.
+		const ncExt = exts.find((e) => e.oid === NAME_CONSTRAINTS);
+		if (ncExt) {
+			const nc = parseNameConstraints(ncExt.value);
+			for (let j = 0; j < i; j++) if (j === 0 || chain[j]!.subject !== chain[j]!.issuer) applyNameConstraints(nc, namesOf(j));
 		}
 	}
 }
 
-// Self-check: a DNS subtree match + an excluded-name rejection. Run: bun src/tls/x509.ts
+// Self-check: subtree matching per name form. Run: bun src/tls/x509.ts
 if (import.meta.main) {
-	if (!dnsInSubtree('host.example.com', 'example.com') || dnsInSubtree('evil.com', 'example.com')) throw new Error('dnsInSubtree self-check failed');
-	const nc: NameConstraints = { permittedDns: [], excludedDns: ['localhost'], permittedIp: [], excludedIp: [] };
+	const ok = (c: boolean, m: string) => {
+		if (!c) throw new Error('x509 self-check failed: ' + m);
+	};
+	ok(dnsInSubtree('host.example.com', 'example.com') && !dnsInSubtree('evil.com', 'example.com'), 'dns');
+	ok(emailInSubtree('a@example.com', 'example.com') && !emailInSubtree('a@sub.example.com', 'example.com'), 'email host');
+	ok(emailInSubtree('a@sub.example.com', '.example.com') && !emailInSubtree('a@example.com', '.example.com'), 'email domain');
+	ok(emailInSubtree('a@EXAMPLE.com', 'a@example.com') && !emailInSubtree('b@example.com', 'a@example.com'), 'email mailbox');
+	ok(uriInSubtree('https://x.example.com/p', '.example.com') && !uriInSubtree('https://evil.com/', '.example.com') && !uriInSubtree('urn:x', 'example.com'), 'uri');
 	let threw = false;
 	try {
-		applyNameConstraints(nc, { dns: ['localhost'], ip: [] });
+		const n = noNames();
+		n.other.add(0xa0);
+		const nc = { permitted: noNames(), excluded: noNames() };
+		nc.permitted.other.add(0xa0);
+		applyNameConstraints(nc, n);
 	} catch {
 		threw = true;
 	}
-	if (!threw) throw new Error('excluded-subtree self-check failed');
+	ok(threw, 'unsupported constrained form fails closed');
 	console.log('x509 constraints self-check ok');
 }
