@@ -15,6 +15,9 @@ import type { Fingerprint } from '../tls/clienthello';
 import type { OcspMode } from '../tls/verify';
 import type { TlsConn } from '../tls/handshake';
 import { concat } from '../core/bytes';
+import zlib2 from 'node:zlib';
+import { QuicConnection } from '../quic/connection';
+import { h3Request } from './h3';
 
 export interface FetchInit {
 	method?: string;
@@ -28,6 +31,8 @@ export interface FetchInit {
 	ocsp?: OcspMode;
 	tls12?: boolean;
 	http2?: boolean;
+	/** Use HTTP/3 (QUIC). Opens a fresh QUIC connection; body is buffered. */
+	http3?: boolean;
 	timeoutMs?: number;
 	/** Abort the request (standard AbortSignal). */
 	signal?: AbortSignal;
@@ -173,6 +178,30 @@ export async function fetch(input: string | URL, init: FetchInit = {}): Promise<
 	const baseFp = init.fingerprint ?? P?.fingerprint();
 	const open: OpenOptions = { host, port, proxy: init.proxy, fingerprint: useH2 ? withH2(baseFp ?? modern()) : baseFp, verify: init.verify, ocsp: init.ocsp, tls12: init.tls12, timeoutMs: init.timeoutMs };
 
+	if (init.http3) {
+		const conn = new QuicConnection(host, port);
+		await conn.connect(init.timeoutMs ?? 10000);
+		try {
+			const hs = { ...(P ? personaHeaders(P) : { 'user-agent': 'bun-tls/0.1' }), ...toHeaderObject(init.headers) };
+			const extra: [string, string][] = [];
+			for (const [k, v] of Object.entries(hs)) if (k.toLowerCase() !== 'host') extra.push([k.toLowerCase(), v]);
+			const r = await h3Request(conn, method, u.port ? `${host}:${u.port}` : host, u.pathname + u.search, extra, bodyBytes, init.timeoutMs ?? 10000);
+			let body = r.body;
+			const enc = (Array.isArray(r.headers['content-encoding']) ? (r.headers['content-encoding'] as string[]).join(',') : (r.headers['content-encoding'] as string) ?? '').toLowerCase();
+			try {
+				if (enc.includes('zstd') && typeof (zlib2 as { zstdDecompressSync?: unknown }).zstdDecompressSync === 'function') body = new Uint8Array((zlib2 as unknown as { zstdDecompressSync(b: Uint8Array): Buffer }).zstdDecompressSync(body));
+				else if (enc.includes('br')) body = new Uint8Array(zlib2.brotliDecompressSync(body));
+				else if (enc.includes('gzip')) body = new Uint8Array(zlib2.gunzipSync(body));
+				else if (enc.includes('deflate')) body = new Uint8Array(zlib2.inflateSync(body));
+			} catch { /* as-is */ }
+			const headers = new Headers();
+			for (const [k, v] of Object.entries(r.headers)) { if (k === 'content-encoding' || k === 'content-length') continue; for (const one of Array.isArray(v) ? v : [v]) headers.append(k, one); }
+			const ab = body.length ? (body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength) as ArrayBuffer) : null;
+			return new Response(ab, { status: r.status, statusText: '', headers });
+		} finally {
+			conn.close();
+		}
+	}
 	const tls = await openConnection(open);
 	if (init.signal) init.signal.addEventListener('abort', () => tls.close(), { once: true });
 

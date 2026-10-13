@@ -228,5 +228,15 @@ assert.ok(ja3nSet.size >= 5, 'client fingerprints distinct (edge==chrome collaps
 	console.log(`websocket → echo ok, ja3=${ws.fp.ja3Hash}`);
 }
 
+// 16) HTTP/3 (QUIC, RFC 9000/9001/9114) end to end: a real GET returns 200 with a body.
+{
+	const { fetch } = await import('../src/http/fetchlike');
+	const r = await fetch('https://cloudflare-quic.com/', { http3: true, timeoutMs: 15000 });
+	const body = await r.text();
+	console.log(`http/3 → ${r.status} ${body.length}B ctype=${r.headers.get('content-type')} server=${r.headers.get('server')}`);
+	assert.equal(r.status, 200, 'HTTP/3 GET returns 200');
+	assert.ok(body.length > 0, 'HTTP/3 response has a body');
+}
+
 console.log('live: OK');
 process.exit(0);

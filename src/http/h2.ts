@@ -42,7 +42,7 @@ HUFF.split(' ').forEach((tok, sym) => {
 	m.set(parseInt(hex!, 16), sym);
 });
 
-function huffmanDecode(b: Uint8Array): string {
+export function huffmanDecode(b: Uint8Array): string {
 	// Accumulate the whole bitstream (header strings are short) then decode MSB-first.
 	let acc = 0n;
 	let n = 0n;

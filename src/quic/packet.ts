@@ -21,7 +21,7 @@ function nonce(iv: Uint8Array, pn: number): Uint8Array {
 }
 
 /** Build a protected long-header packet (Initial or Handshake). pnLen fixed at 4. */
-export function buildPacket(type: number, dcid: Uint8Array, scid: Uint8Array, token: Uint8Array, payload: Uint8Array, pn: number, keys: PacketKeys): Uint8Array {
+export function buildPacket(type: number, dcid: Uint8Array, scid: Uint8Array, token: Uint8Array, payload: Uint8Array, pn: number, keys: PacketKeys, keyLen = 16): Uint8Array {
 	const pnLen = 4;
 	const first = 0xc0 | (type << 4) | (pnLen - 1); // long, fixed bit, type, pnlen
 	const pnBytes = Uint8Array.of((pn >>> 24) & 0xff, (pn >>> 16) & 0xff, (pn >>> 8) & 0xff, pn & 0xff);
@@ -37,7 +37,7 @@ export function buildPacket(type: number, dcid: Uint8Array, scid: Uint8Array, to
 		lengthField,
 		pnBytes
 	);
-	const aead = aesGcm(16)(keys.key);
+	const aead = aesGcm(keyLen === 32 ? 32 : 16)(keys.key);
 	const ct = aead.seal(nonce(keys.iv, pn), header, payload); // ciphertext + 16-byte tag
 	// Header protection: sample 16 bytes of ciphertext starting 4 bytes into the PN field.
 	const pnOffset = header.length - pnLen;
@@ -59,7 +59,7 @@ export interface ParsedPacket {
 }
 
 /** Remove header protection + decrypt one long-header packet at `off`. */
-export function parsePacket(dg: Uint8Array, off: number, keys: PacketKeys): ParsedPacket {
+export function parsePacket(dg: Uint8Array, off: number, keys: PacketKeys, keyLen = 16): ParsedPacket {
 	const start = off;
 	const first0 = dg[off];
 	const type = (first0! >> 4) & 0x03;
@@ -94,7 +94,7 @@ export function parsePacket(dg: Uint8Array, off: number, keys: PacketKeys): Pars
 	const aad = Uint8Array.from(dg.subarray(start, ctStart));
 	aad[0] = first;
 	for (let i = 0; i < pnLen; i++) aad[pnOffset - start + i] = pnBytes[i]!;
-	const aead = aesGcm(16)(keys.key);
+	const aead = aesGcm(keyLen === 32 ? 32 : 16)(keys.key);
 	const payload = aead.open(nonce(keys.iv, pn), aad, ct);
 	return { type, dcid: new Uint8Array(dcid), scid: new Uint8Array(scid), pn, payload, end: ctStart + ctLen };
 }
@@ -109,4 +109,63 @@ if (import.meta.main) {
 	const parsed = parsePacket(pkt, 0, client);
 	if (parsed.pn !== 2 || Buffer.compare(Buffer.from(parsed.payload), Buffer.from(payload)) !== 0) throw new Error('packet round-trip failed');
 	console.log('quic packet protect/parse round-trip ok (pn', parsed.pn, 'payload', parsed.payload.length, 'bytes)');
+}
+
+/** Build a protected short-header (1-RTT) packet. dcid has no length prefix on the wire. */
+export function buildShort(dcid: Uint8Array, payload: Uint8Array, pn: number, keys: PacketKeys, keyLen = 16): Uint8Array {
+	const pnLen = 4;
+	const first = 0x40 | (pnLen - 1); // short header, fixed bit, pnlen
+	const pnBytes = Uint8Array.of((pn >>> 24) & 0xff, (pn >>> 16) & 0xff, (pn >>> 8) & 0xff, pn & 0xff);
+	const header = concat(Uint8Array.of(first), dcid, pnBytes);
+	const aead = aesGcm(keyLen === 32 ? 32 : 16)(keys.key);
+	const ct = aead.seal(nonce(keys.iv, pn), header, payload);
+	const pnOffset = header.length - pnLen;
+	const mask = hpMask(keys.hp, ct.subarray(4 - pnLen, 4 - pnLen + 16));
+	const out = concat(header, ct);
+	out[0] ^= mask[0]! & 0x1f; // short header: low 5 bits
+	for (let i = 0; i < pnLen; i++) out[pnOffset + i] ^= mask[1 + i]!;
+	return out;
+}
+
+/** Parse + decrypt a short-header packet. dcidLen is known from the connection. */
+export function parseShort(dg: Uint8Array, off: number, dcidLen: number, keys: PacketKeys, keyLen = 16): { pn: number; payload: Uint8Array } {
+	const start = off;
+	const first0 = dg[off];
+	off += 1 + dcidLen;
+	const pnOffset = off;
+	const mask = hpMask(keys.hp, dg.subarray(pnOffset + 4, pnOffset + 20));
+	const first = first0! ^ (mask[0]! & 0x1f);
+	const pnLen = (first & 0x03) + 1;
+	let pn = 0;
+	const pnBytes = new Uint8Array(pnLen);
+	for (let i = 0; i < pnLen; i++) {
+		pnBytes[i] = dg[pnOffset + i]! ^ mask[1 + i]!;
+		pn = pn * 256 + pnBytes[i]!;
+	}
+	const ctStart = pnOffset + pnLen;
+	const ct = dg.subarray(ctStart); // short header: ciphertext runs to end of datagram
+	const aad = Uint8Array.from(dg.subarray(start, ctStart));
+	aad[0] = first;
+	for (let i = 0; i < pnLen; i++) aad[pnOffset - start + i] = pnBytes[i]!;
+	const aead = aesGcm(keyLen === 32 ? 32 : 16)(keys.key);
+	const payload = aead.open(nonce(keys.iv, pn), aad, ct);
+	return { pn, payload };
+}
+
+/** Long-header packet type (0=Initial,1=0-RTT,2=Handshake,3=Retry) from the first byte. */
+export const longPacketType = (dg: Uint8Array, off: number): number => (dg[off]! >> 4) & 0x03;
+
+/** End offset of a long-header packet (parses the cleartext header; no keys needed). */
+export function longPacketEnd(dg: Uint8Array, off: number): number {
+	const type = longPacketType(dg, off);
+	if (type === 0x03) return dg.length; // Retry has no length field — consumes the datagram
+	let i = off + 1 + 4; // first byte + version
+	i += 1 + dg[i]!; // dcid
+	i += 1 + dg[i]!; // scid
+	if (type === PKT.initial) {
+		const tok = readVarint(dg, i);
+		i += tok.len + tok.value;
+	}
+	const len = readVarint(dg, i);
+	return i + len.len + len.value;
 }
