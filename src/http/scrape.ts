@@ -27,6 +27,10 @@ export interface ScrapeResult {
 	html?: string;
 	/** Records from a CSS `extract` schema — only when `extract` is given. */
 	extracted?: Record<string, string>[];
+	/** The most token-efficient representation that still carries the full context: the
+	 *  structured data (JSON-LD/OG) first, then the main text with URLs stripped + deduped.
+	 *  Only when 'llm' is requested. */
+	llm?: string;
 }
 
 /** CSS-selector extraction (like crawl4ai's JsonCssExtractionStrategy): one record per
@@ -36,14 +40,15 @@ export interface CssSchema {
 	fields: { name: string; selector?: string; attr?: string }[];
 }
 
-export type Format = 'markdown' | 'readable' | 'html' | 'links' | 'json' | 'text';
+export type Format = 'markdown' | 'readable' | 'html' | 'links' | 'json' | 'text' | 'llm';
 
 export interface ScrapeOptions extends Omit<FetchInit, 'method' | 'body'> {
 	/** Firecrawl-style output selection. Default ['markdown']. 'json' = the structured data
 	 *  (jsonld/og/meta), 'html' = cleaned HTML, 'readable' = main-content Markdown. */
 	formats?: Format[];
-	/** Shorthand (back-compat): 'data'→['json'], 'markdown', 'readable', 'auto'→everything. */
-	as?: 'data' | 'markdown' | 'readable' | 'auto';
+	/** Shorthand: 'llm' = the token-cheapest full-context view (recommended for LLMs);
+	 *  'data' = structured only; 'markdown'/'readable'; 'auto' = everything. */
+	as?: 'llm' | 'data' | 'markdown' | 'readable' | 'auto';
 	/** Drop nav/header/footer/aside in the Markdown/HTML (main content only). */
 	onlyMainContent?: boolean;
 	/** CSS-schema extraction → ScrapeResult.extracted. */
@@ -226,7 +231,66 @@ export function fitMarkdown(md: string): string {
 		.trim();
 }
 
-const AS_FORMATS: Record<string, Format[]> = { data: ['json'], markdown: ['markdown', 'json'], readable: ['readable', 'json'], auto: ['markdown', 'json', 'links'] };
+/** Inline links `[text](url)` → `text`, images → alt. URLs are the biggest token sink and
+ *  carry little meaning for comprehension; the full hrefs stay in ScrapeResult.links. */
+const stripInlineUrls = (md: string): string =>
+	md.replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1').replace(/\[([^\]]*)\]\([^)]*\)/g, '$1');
+
+/** Drop consecutive duplicate lines and short exact-duplicate lines (repeated menus/labels). */
+function dedupeLines(s: string): string {
+	const seen = new Set<string>();
+	const out: string[] = [];
+	let prev = '';
+	for (const line of s.split('\n')) {
+		const t = line.trim();
+		if (t && t === prev) continue; // consecutive dup
+		if (t && t.length < 80 && seen.has(t)) continue; // short dup seen before (menu label)
+		out.push(line);
+		prev = t;
+		if (t && t.length < 80) seen.add(t);
+	}
+	return out.join('\n');
+}
+
+// Keys that are pure boilerplate or URL/media (tokens without text meaning) and whole
+// block @types that are navigation/media rather than content. Dropped from the LLM view —
+// the names/prices/descriptions/ratings that carry meaning stay; see ScrapeResult.jsonld
+// for the untouched data.
+const JSONLD_DROP_KEYS = new Set(['@context', '@id', 'url', 'image', 'logo', 'sameAs', 'contentUrl', 'thumbnailUrl', 'thumbnail', 'embedUrl', 'encoding', 'encodingFormat', 'potentialAction', 'mainEntityOfPage', 'isPartOf', 'publisher']);
+const JSONLD_DROP_TYPES = new Set(['BreadcrumbList', '3DModel', 'WebSite', 'WebPage', 'ImageObject', 'VideoObject', 'SearchAction', 'ListItem']);
+
+/** JSON-LD condensed for an LLM: drop boilerplate/URL/media keys + navigation blocks, minify.
+ *  Lossless for the SEMANTIC content (name/price/description/rating/author/date stay). */
+function minifyJsonld(blocks: unknown[]): string {
+	const strip = (v: unknown): unknown => {
+		if (Array.isArray(v)) return v.map(strip);
+		if (v && typeof v === 'object') {
+			const o: Record<string, unknown> = {};
+			for (const [k, val] of Object.entries(v)) if (!JSONLD_DROP_KEYS.has(k)) o[k] = strip(val);
+			return o;
+		}
+		return v;
+	};
+	const typeOf = (b: unknown): string => (b && typeof b === 'object' ? String((b as Record<string, unknown>)['@type'] ?? '') : '');
+	const flat = blocks.flatMap((b) => (b && typeof b === 'object' && '@graph' in (b as object) ? ((b as { '@graph': unknown[] })['@graph'] as unknown[]) : [b]));
+	const kept = flat.filter((b) => !JSONLD_DROP_TYPES.has(typeOf(b))).map(strip);
+	return JSON.stringify(kept.length === 1 ? kept[0] : kept);
+}
+
+/** The token-cheapest representation that keeps full context: title + structured data (the
+ *  JSON-LD/OG gold most scrapers drop) + main text with URLs stripped and lines deduped. */
+function buildLlm(r: ScrapeResult, body: string): string {
+	const out: string[] = [];
+	if (r.title) out.push('# ' + r.title);
+	const desc = r.description || r.og.description;
+	if (desc && !out[0]?.includes(desc)) out.push(desc);
+	if (r.jsonld.length) out.push('<structured>\n' + minifyJsonld(r.jsonld) + '\n</structured>');
+	const clean = dedupeLines(stripInlineUrls(body)).trim();
+	if (clean) out.push(clean);
+	return out.join('\n\n').trim();
+}
+
+const AS_FORMATS: Record<string, Format[]> = { llm: ['llm'], data: ['json'], markdown: ['markdown', 'json'], readable: ['readable', 'json'], auto: ['markdown', 'json', 'links'] };
 
 /** Fetch a URL via bun-tls and return LLM-ready output (Firecrawl-style `formats`). */
 export async function scrape(url: string, opts: ScrapeOptions = {}): Promise<ScrapeResult> {
@@ -245,6 +309,11 @@ export async function scrape(url: string, opts: ScrapeOptions = {}): Promise<Scr
 	const result: ScrapeResult = { url, status: r.status, markdown, ...data };
 	if (formats.has('html')) result.html = await cleanHtml(html, readable);
 	if (opts.extract) result.extracted = await extractSchema(html, opts.extract);
+	if (formats.has('llm')) {
+		let llm = buildLlm(result, fitMarkdown(await toMarkdown(html, true)));
+		if (opts.maxChars && llm.length > opts.maxChars) llm = llm.slice(0, opts.maxChars) + '\n…[truncated]';
+		result.llm = llm;
+	}
 	return result;
 }
 

@@ -14,7 +14,7 @@ const TOOLS = [
 			type: 'object',
 			properties: {
 				url: { type: 'string', description: 'The https URL to fetch.' },
-				formats: { type: 'array', items: { type: 'string', enum: ['markdown', 'readable', 'html', 'links', 'json', 'text'] }, description: 'Default ["markdown","json"].' },
+				formats: { type: 'array', items: { type: 'string', enum: ['llm', 'markdown', 'readable', 'html', 'links', 'json', 'text'] }, description: "Default [\"llm\"] = token-cheapest full-context view. Use [\"json\"] for structured-only, [\"markdown\"] for the full body." },
 				onlyMainContent: { type: 'boolean', description: 'Drop nav/header/footer/aside.' },
 				fit: { type: 'boolean', description: 'Prune nav/menu residue from the Markdown (token-cheaper).' },
 				persona: { type: 'string', enum: ['chrome', 'edge', 'firefox', 'safari'], description: 'Browser fingerprint (default chrome).' },
@@ -68,7 +68,7 @@ interface Args {
 async function runTool(name: string, a: Args): Promise<unknown> {
 	const persona = (a.persona as string) ?? 'chrome';
 	if (name === 'scrape') {
-		const r = await scrape(a.url as string, { formats: (a.formats as Format[]) ?? ['markdown', 'json'], onlyMainContent: a.onlyMainContent as boolean, fit: a.fit as boolean, persona, maxChars: a.maxChars as number });
+		const r = await scrape(a.url as string, { formats: (a.formats as Format[]) ?? ['llm'], onlyMainContent: a.onlyMainContent as boolean, fit: a.fit as boolean, persona, maxChars: a.maxChars as number });
 		return slim(r);
 	}
 	if (name === 'crawl') {
@@ -88,6 +88,12 @@ async function runTool(name: string, a: Args): Promise<unknown> {
 // Compact, token-cheap view of a scrape result (drop empty fields).
 function slim(r: Awaited<ReturnType<typeof scrape>>): Record<string, unknown> {
 	const o: Record<string, unknown> = { url: r.url, status: r.status };
+	// The 'llm' view already folds title + structured data + text into one cheap string.
+	if (r.llm) {
+		o.content = r.llm;
+		if (r.extracted?.length) o.extracted = r.extracted;
+		return o;
+	}
 	if (r.title) o.title = r.title;
 	const desc = r.description || r.og.description;
 	if (desc) o.description = desc;
