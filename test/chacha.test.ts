@@ -28,17 +28,26 @@ assert.throws(
 );
 
 // Native (WebCrypto) bulk path must be byte-identical to the pure-TS seal/open and interop
-// both ways — the record layer uses one to produce what the other consumes.
+// both ways — the record layer uses one to produce what the other consumes. WebCrypto is the
+// reference oracle for the pure-TS ChaCha core + donna-16 Poly1305, across block-boundary
+// sizes and AAD lengths 0..33 (which exercise Poly1305's leftover/padTo16/finish paths).
 await (async () => {
 	assert.ok(aead.sealAsync && aead.openAsync, 'native ChaCha path present on this runtime');
-	for (const n of [0, 1, 63, 64, 65, 16383]) {
+	const sizes = [0, 1, 15, 16, 17, 31, 63, 64, 65, 127, 128, 129, 1000, 4096, 16383, 16384, 65536];
+	for (const n of sizes) {
 		const p = crypto.getRandomValues(new Uint8Array(n));
 		const nn = crypto.getRandomValues(new Uint8Array(12));
-		const natCt = new Uint8Array(await aead.sealAsync!(nn, aad, p));
-		assert.deepEqual(natCt, aead.seal(nn, aad, p), `native seal == pure seal (n=${n})`);
-		assert.deepEqual(aead.open(nn, aad, natCt), p, `pure open(native ct) (n=${n})`);
-		assert.deepEqual(new Uint8Array(await aead.openAsync!(nn, aad, aead.seal(nn, aad, p))), p, `native open(pure ct) (n=${n})`);
+		for (const al of [0, 1, 5, 15, 16, 17, 33]) {
+			const ad = crypto.getRandomValues(new Uint8Array(al));
+			const natCt = new Uint8Array(await aead.sealAsync!(nn, ad, p));
+			assert.deepEqual(aead.seal(nn, ad, p), natCt, `pure seal == webcrypto (n=${n} aad=${al})`);
+			assert.deepEqual(aead.open(nn, ad, natCt), p, `pure open(native ct) (n=${n} aad=${al})`);
+			assert.deepEqual(new Uint8Array(await aead.openAsync!(nn, ad, aead.seal(nn, ad, p))), p, `native open(pure ct) (n=${n} aad=${al})`);
+		}
 	}
+	// A tampered tag is rejected by the pure-TS open (constant-time compare).
+	const sealed = aead.seal(nonce, aad, new Uint8Array(pt));
+	assert.throws(() => aead.open(nonce, aad, Uint8Array.of(...sealed.subarray(0, sealed.length - 1), sealed[sealed.length - 1]! ^ 1)), 'tampered tag rejected');
 })();
 
 console.log('chacha: OK');
