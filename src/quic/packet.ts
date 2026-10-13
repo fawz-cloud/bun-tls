@@ -1,13 +1,38 @@
 // QUIC packet protection (RFC 9001 §5): build a protected Initial packet and parse/decrypt
 // an incoming long-header packet. AEAD over the unprotected header as AAD, then header
 // protection over the first byte + packet number using a ciphertext sample.
-import { aesGcm } from '../core/crypto';
+import { aesGcm, type Aead } from '../core/crypto';
 import { concat } from '../core/bytes';
 import { writeVarint, readVarint } from './varint';
-import { hpMask, type PacketKeys } from './crypto';
+import { hpCipher, type PacketKeys } from './crypto';
 
 const VERSION1 = Uint8Array.of(0, 0, 0, 1);
 export const PKT = { initial: 0x00, handshake: 0x02 } as const;
+
+// One AEAD + one header-protection cipher per key set, built on its first packet (rebuilding
+// both for every packet cost ~2-3 µs of the packet's crypto).
+const prot = new WeakMap<PacketKeys, { aead: Aead; hp: (sample: Uint8Array) => Uint8Array }>();
+function protection(keys: PacketKeys, keyLen: number) {
+	let p = prot.get(keys);
+	if (!p) prot.set(keys, (p = { aead: aesGcm(keyLen === 32 ? 32 : 16)(keys.key), hp: hpCipher(keys.hp) }));
+	return p;
+}
+
+/** header || payload sealed || tag in one buffer (sealed in place when the AEAD can). */
+function sealPacket(aead: Aead, nonce: Uint8Array, header: Uint8Array, payload: Uint8Array): Uint8Array {
+	const out = new Uint8Array(header.length + payload.length + 16);
+	out.set(header);
+	if (aead.sealInPlace) {
+		out.set(payload, header.length);
+		aead.sealInPlace(nonce, header, out, header.length, payload.length);
+	} else out.set(aead.seal(nonce, header, payload), header.length);
+	return out;
+}
+
+/** Open a packet body. In place when native: each datagram is a private copy (connection.ts)
+ *  whose packets are opened once, and an undecryptable packet is dropped, never retried. */
+const openPacket = (aead: Aead, nonce: Uint8Array, aad: Uint8Array, ct: Uint8Array): Uint8Array =>
+	aead.openInPlace ? aead.openInPlace(nonce, aad, ct) : aead.open(nonce, aad, ct);
 
 /** 12-byte AEAD nonce = iv XOR packet-number (right-aligned, big-endian). */
 function nonce(iv: Uint8Array, pn: number): Uint8Array {
@@ -37,13 +62,11 @@ export function buildPacket(type: number, dcid: Uint8Array, scid: Uint8Array, to
 		lengthField,
 		pnBytes
 	);
-	const aead = aesGcm(keyLen === 32 ? 32 : 16)(keys.key);
-	const ct = aead.seal(nonce(keys.iv, pn), header, payload); // ciphertext + 16-byte tag
+	const { aead, hp } = protection(keys, keyLen);
+	const out = sealPacket(aead, nonce(keys.iv, pn), header, payload);
 	// Header protection: sample 16 bytes of ciphertext starting 4 bytes into the PN field.
 	const pnOffset = header.length - pnLen;
-	const sampleStart = 4 - pnLen; // into ct
-	const mask = hpMask(keys.hp, ct.subarray(sampleStart, sampleStart + 16));
-	const out = concat(header, ct);
+	const mask = hp(out.subarray(pnOffset + 4, pnOffset + 20));
 	out[0] ^= mask[0]! & 0x0f;
 	for (let i = 0; i < pnLen; i++) out[pnOffset + i] ^= mask[1 + i]!;
 	return out;
@@ -77,8 +100,9 @@ export function parsePacket(dg: Uint8Array, off: number, keys: PacketKeys, keyLe
 	const lenField = readVarint(dg, off);
 	off += lenField.len;
 	const pnOffset = off;
+	const { aead, hp } = protection(keys, keyLen);
 	// Header protection removal: sample starts 4 bytes into the PN field.
-	const mask = hpMask(keys.hp, dg.subarray(pnOffset + 4, pnOffset + 20));
+	const mask = hp(dg.subarray(pnOffset + 4, pnOffset + 20));
 	const first = first0! ^ (mask[0]! & 0x0f);
 	const pnLen = (first & 0x03) + 1;
 	let pn = 0;
@@ -94,8 +118,7 @@ export function parsePacket(dg: Uint8Array, off: number, keys: PacketKeys, keyLe
 	const aad = Uint8Array.from(dg.subarray(start, ctStart));
 	aad[0] = first;
 	for (let i = 0; i < pnLen; i++) aad[pnOffset - start + i] = pnBytes[i]!;
-	const aead = aesGcm(keyLen === 32 ? 32 : 16)(keys.key);
-	const payload = aead.open(nonce(keys.iv, pn), aad, ct);
+	const payload = openPacket(aead, nonce(keys.iv, pn), aad, ct);
 	return { type, dcid: new Uint8Array(dcid), scid: new Uint8Array(scid), pn, payload, end: ctStart + ctLen };
 }
 
@@ -117,11 +140,10 @@ export function buildShort(dcid: Uint8Array, payload: Uint8Array, pn: number, ke
 	const first = 0x40 | (pnLen - 1); // short header, fixed bit, pnlen
 	const pnBytes = Uint8Array.of((pn >>> 24) & 0xff, (pn >>> 16) & 0xff, (pn >>> 8) & 0xff, pn & 0xff);
 	const header = concat(Uint8Array.of(first), dcid, pnBytes);
-	const aead = aesGcm(keyLen === 32 ? 32 : 16)(keys.key);
-	const ct = aead.seal(nonce(keys.iv, pn), header, payload);
+	const { aead, hp } = protection(keys, keyLen);
+	const out = sealPacket(aead, nonce(keys.iv, pn), header, payload);
 	const pnOffset = header.length - pnLen;
-	const mask = hpMask(keys.hp, ct.subarray(4 - pnLen, 4 - pnLen + 16));
-	const out = concat(header, ct);
+	const mask = hp(out.subarray(pnOffset + 4, pnOffset + 20));
 	out[0] ^= mask[0]! & 0x1f; // short header: low 5 bits
 	for (let i = 0; i < pnLen; i++) out[pnOffset + i] ^= mask[1 + i]!;
 	return out;
@@ -133,7 +155,8 @@ export function parseShort(dg: Uint8Array, off: number, dcidLen: number, keys: P
 	const first0 = dg[off];
 	off += 1 + dcidLen;
 	const pnOffset = off;
-	const mask = hpMask(keys.hp, dg.subarray(pnOffset + 4, pnOffset + 20));
+	const { aead, hp } = protection(keys, keyLen);
+	const mask = hp(dg.subarray(pnOffset + 4, pnOffset + 20));
 	const first = first0! ^ (mask[0]! & 0x1f);
 	const pnLen = (first & 0x03) + 1;
 	let pn = 0;
@@ -147,8 +170,7 @@ export function parseShort(dg: Uint8Array, off: number, dcidLen: number, keys: P
 	const aad = Uint8Array.from(dg.subarray(start, ctStart));
 	aad[0] = first;
 	for (let i = 0; i < pnLen; i++) aad[pnOffset - start + i] = pnBytes[i]!;
-	const aead = aesGcm(keyLen === 32 ? 32 : 16)(keys.key);
-	const payload = aead.open(nonce(keys.iv, pn), aad, ct);
+	const payload = openPacket(aead, nonce(keys.iv, pn), aad, ct);
 	return { pn, payload };
 }
 

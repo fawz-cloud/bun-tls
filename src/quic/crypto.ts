@@ -3,6 +3,7 @@
 // with QUIC's "quic key"/"quic iv"/"quic hp" labels. Reuses the TLS HKDF from core/crypto.
 import crypto from 'node:crypto';
 import { hkdfExtract, expandLabel, type HashAlg } from '../core/crypto';
+import { cngAesEcb } from '../core/cng';
 
 // QUIC v1 initial salt (RFC 9001 §5.2).
 const INITIAL_SALT = Uint8Array.from(Buffer.from('38762cf7f55934b34d179ae6a4c80cadccbb7f0a', 'hex'));
@@ -32,13 +33,19 @@ export function initialKeys(dcid: Uint8Array): { client: PacketKeys; server: Pac
 	return { client: packetKeys('sha256', clientSecret, 16), server: packetKeys('sha256', serverSecret, 16) };
 }
 
-/** Header-protection mask: AES-ECB(hp, sample)[0..5] for AES; sample is 16 bytes of ciphertext. */
-export function hpMask(hp: Uint8Array, sample: Uint8Array): Uint8Array {
+/** Header-protection cipher for one hp key (RFC 9001 §5.4.3): mask = AES-ECB(hp, sample), the
+ *  sample being 16 bytes of ciphertext; callers use mask[0..5]. Built once per key: a CNG key
+ *  handle, or one long-lived node ECB cipher (ECB keeps no state from block to block). */
+export function hpCipher(hp: Uint8Array): (sample: Uint8Array) => Uint8Array {
+	const native = cngAesEcb();
+	if (native) return native(hp);
 	const c = crypto.createCipheriv(hp.length === 16 ? 'aes-128-ecb' : 'aes-256-ecb', hp, null);
 	c.setAutoPadding(false);
-	return new Uint8Array(concatBuf(c.update(sample), c.final())).subarray(0, 5);
+	return (sample) => {
+		if (sample.length < 16) throw new RangeError('header-protection sample must be 16 bytes');
+		return new Uint8Array(c.update(sample.subarray(0, 16)));
+	};
 }
-const concatBuf = (a: Buffer, b: Buffer): Buffer => Buffer.concat([a, b]);
 
 if (import.meta.main) {
 	// RFC 9001 Appendix A.1 test vectors.

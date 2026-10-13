@@ -184,6 +184,44 @@ export function cngAesGcm(): ((key: Uint8Array) => Aead) | null {
 	return (gcm = mk);
 }
 
+let ecb: ((key: Uint8Array) => (block: Uint8Array) => Uint8Array) | null | undefined;
+/** Single-block AES-ECB over CNG (QUIC header protection: mask = AES-ECB(hp, sample)), one key
+ *  handle per hp key; or null → node:crypto. Checked against node:crypto once, on first use. */
+export function cngAesEcb(): ((key: Uint8Array) => (block: Uint8Array) => Uint8Array) | null {
+	if (ecb !== undefined) return ecb;
+	ecb = null;
+	const h = provider('AES', ['ChainingMode', 'ChainingModeECB']);
+	if (h === null) return null;
+	const B = bcrypt()!;
+	const res = new Uint32Array(1);
+	const mk = (key: Uint8Array) => {
+		if (key.length !== 16 && key.length !== 32) throw new Error('AES key must be 16 or 32 bytes');
+		if (B.BCryptGenerateSymmetricKey(h, ptr(handleOut), null, 0, key, key.length, 0) !== 0) throw new Error('BCryptGenerateSymmetricKey failed');
+		const hKey = Number(handleOut[0]) as Pointer;
+		const encryptBlock = (block: Uint8Array): Uint8Array => {
+			if (block.length < 16) throw new RangeError('AES block must be 16 bytes');
+			const out = new Uint8Array(16);
+			const st = B.BCryptEncrypt(hKey, block, 16, null, null, 0, out, 16, res, 0);
+			if (st !== 0) throw new Error(`CNG AES-ECB failed: 0x${(st >>> 0).toString(16)}`);
+			return out;
+		};
+		reaper.register(encryptBlock, hKey); // the handle lives as long as the function
+		return encryptBlock;
+	};
+	try {
+		for (const kl of [16, 32]) {
+			const key = nodeCrypto.randomBytes(kl);
+			const block = nodeCrypto.randomBytes(16);
+			const c = nodeCrypto.createCipheriv(kl === 16 ? 'aes-128-ecb' : 'aes-256-ecb', key, null);
+			c.setAutoPadding(false);
+			if (!same(mk(new Uint8Array(key))(new Uint8Array(block)), new Uint8Array(c.update(block)))) return null;
+		}
+	} catch {
+		return null;
+	}
+	return (ecb = mk);
+}
+
 // ── ML-KEM-768 (FIPS 203), synchronous: no async WebCrypto thread hop on the handshake path ──
 // Loaded separately from the AEAD symbols: these exports exist only on recent Windows 11 builds,
 // and a missing one must not take the AEADs down with it.
