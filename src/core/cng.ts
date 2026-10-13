@@ -184,6 +184,97 @@ export function cngAesGcm(): ((key: Uint8Array) => Aead) | null {
 	return (gcm = mk);
 }
 
+// ── ML-KEM-768 (FIPS 203), synchronous: no async WebCrypto thread hop on the handshake path ──
+// Loaded separately from the AEAD symbols: these exports exist only on recent Windows 11 builds,
+// and a missing one must not take the AEADs down with it.
+function openKem() {
+	return dlopen('bcrypt.dll', {
+		BCryptGenerateKeyPair: { args: [P, P, U32, U32], returns: FFIType.i32 },
+		BCryptFinalizeKeyPair: { args: [P, U32], returns: FFIType.i32 },
+		BCryptSetProperty: { args: [P, P, P, U32, U32], returns: FFIType.i32 },
+		BCryptExportKey: { args: [P, P, P, P, U32, P, U32], returns: FFIType.i32 },
+		BCryptDecapsulate: { args: [P, P, U32, P, U32, P, U32], returns: FFIType.i32 },
+		BCryptDestroyKey: { args: [P], returns: FFIType.i32 }
+	}).symbols;
+}
+
+/** An ML-KEM-768 key pair: the 1184-byte encapsulation key to send, and a one-shot
+ *  decapsulation (the private key is destroyed once used). */
+export interface KemKey {
+	ek: Uint8Array;
+	decapsulate(ct: Uint8Array): Uint8Array | Promise<Uint8Array>;
+	/** Drop an unused key now (the server picked another group). */
+	destroy?(): void;
+}
+
+let kem: (() => KemKey) | null | undefined;
+/** ML-KEM-768 over CNG, or null → WebCrypto. Checked once: a key must export a 1184-byte
+ *  encapsulation key and decapsulate a 1088-byte ciphertext to 32 bytes. (Interop with other
+ *  implementations is covered by test/cng.test.ts against WebCrypto, and a wrong secret could
+ *  only ever fail the handshake loudly — the Finished MACs would not match.) */
+export function cngMlkem768(): (() => KemKey) | null {
+	if (kem !== undefined) return kem;
+	kem = null;
+	const hAlg = provider('ML-KEM');
+	if (hAlg === null) return null;
+	let K: ReturnType<typeof openKem>;
+	try {
+		K = openKem();
+	} catch {
+		return null; // this Windows has the provider but not the KEM exports
+	}
+	const PS_NAME = wstr('ParameterSetName');
+	const PS_768 = wstr('768');
+	const BLOB = wstr('MLKEMPUBLICBLOB');
+	const out = new Uint8Array(1300);
+	const cb = new Uint32Array(1);
+	const kemReaper = new FinalizationRegistry<Pointer>((h) => K.BCryptDestroyKey(h));
+	const keypair = (): KemKey => {
+		if (K.BCryptGenerateKeyPair(hAlg, ptr(handleOut), 0, 0) !== 0) throw new Error('ML-KEM keygen failed');
+		const hKey = Number(handleOut[0]) as Pointer;
+		let live = true;
+		const destroy = () => {
+			if (!live) return;
+			live = false;
+			kemReaper.unregister(k);
+			K.BCryptDestroyKey(hKey);
+		};
+		const k: KemKey = { ek: new Uint8Array(0), decapsulate: () => new Uint8Array(0), destroy };
+		kemReaper.register(k, hKey, k);
+		if (K.BCryptSetProperty(hKey, PS_NAME, PS_768, PS_768.length, 0) !== 0 || K.BCryptFinalizeKeyPair(hKey, 0) !== 0) {
+			destroy();
+			throw new Error('ML-KEM-768 key setup failed');
+		}
+		// BCRYPT_MLKEM_KEY_BLOB: magic, cbParameterSet, cbKey, the parameter-set name, the key
+		const st = K.BCryptExportKey(hKey, null, BLOB, out, out.length, cb, 0);
+		const dv = new DataView(out.buffer);
+		const cbPs = dv.getUint32(4, true);
+		const cbKey = dv.getUint32(8, true);
+		if (st !== 0 || cbKey !== 1184 || 12 + cbPs + cbKey !== cb[0]) {
+			destroy();
+			throw new Error('ML-KEM-768 export failed');
+		}
+		k.ek = out.slice(12 + cbPs, 12 + cbPs + cbKey);
+		k.decapsulate = (ct) => {
+			if (!live) throw new Error('ML-KEM key already used');
+			if (ct.length !== 1088) throw new Error('ML-KEM-768 ciphertext must be 1088 bytes');
+			const ss = new Uint8Array(32);
+			const r = K.BCryptDecapsulate(hKey, ct, 1088, ss, 32, cb, 0);
+			destroy(); // one-shot: the private key is gone either way
+			if (r !== 0 || cb[0] !== 32) throw new Error('ML-KEM decapsulation failed');
+			return ss;
+		};
+		return k;
+	};
+	try {
+		const t = keypair();
+		if (t.ek.length !== 1184 || (t.decapsulate(new Uint8Array(1088).fill(7)) as Uint8Array).length !== 32) return null;
+	} catch {
+		return null;
+	}
+	return (kem = keypair);
+}
+
 let chacha: ((key: Uint8Array) => Aead) | null | undefined;
 /** ChaCha20-Poly1305 over CNG (newer Windows 11 builds), or null. Checked against the
  *  RFC 8439 §2.8.2 vector once, on first use. */

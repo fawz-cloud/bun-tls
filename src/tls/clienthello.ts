@@ -2,9 +2,10 @@
 // finished ClientHello (single source of truth: the hash == exactly what we send).
 import crypto from 'node:crypto';
 import { Reader, Writer, concat } from '../core/bytes';
-import { Ext, GREASE, Group, TLS12, isGrease } from '../core/consts';
+import { Ext, GREASE, TLS12, isGrease } from '../core/consts';
 import { grease as greaseExt, pskKeyExchangeModes, earlyData, cookie as cookieExt, type Extension, type ExtCtx } from './extensions';
-import { x25519Keypair, earlySecret, binderKey, pskBinder, sha } from '../core/crypto';
+import { earlySecret, binderKey, pskBinder, sha } from '../core/crypto';
+import { takeEcShare } from '../core/keypool';
 import type { Ticket } from './resumption';
 
 const pickGrease = (not?: number | null): number => {
@@ -88,18 +89,6 @@ function shuffle<T>(xs: T[]): T[] {
 	return xs;
 }
 
-function genShare(group: number): { priv: crypto.KeyObject; pub: Uint8Array } {
-	if (group === Group.x25519) return x25519Keypair();
-	if (group === Group.secp256r1 || group === Group.secp384r1) {
-		const curve = group === Group.secp256r1 ? 'prime256v1' : 'secp384r1';
-		const { privateKey, publicKey } = crypto.generateKeyPairSync('ec', { namedCurve: curve });
-		const der = publicKey.export({ type: 'spki', format: 'der' }) as Buffer;
-		const ptLen = group === Group.secp256r1 ? 65 : 97; // 0x04 + X + Y
-		return { priv: privateKey, pub: new Uint8Array(der.subarray(der.length - ptLen)) };
-	}
-	throw new Error(`group ${group} not supported for key_share`);
-}
-
 /** After a HelloRetryRequest the second ClientHello must keep CH1's random + session_id
  *  (RFC 8446 §4.1.2), and its PSK binder is computed over the FULL retry transcript
  *  (synthetic message_hash(CH1) || HelloRetryRequest || truncated CH2), passed as `binderPrefix`. */
@@ -114,7 +103,7 @@ export function buildClientHello(fp: Fingerprint, host: string, resume?: ResumeS
 	const shares = fp.keyShareGroups.map((group) => {
 		const pre = prebuilt?.get(group);
 		if (pre) return { group, pub: pre }; // caller supplied the public key (e.g. ML-KEM hybrid) and keeps its private part
-		const { priv, pub } = genShare(group);
+		const { priv, pub } = takeEcShare(group); // pre-generated, single-use
 		privs.set(group, priv);
 		return { group, pub };
 	});

@@ -11,7 +11,6 @@ import {
 	appSecrets,
 	finishedVerify,
 	ecdheShared,
-	x25519Keypair,
 	sha,
 	hashLen,
 	type HashAlg,
@@ -113,8 +112,6 @@ export class QuicConnection {
 	}
 
 	private buildCH(): Uint8Array {
-		const x = x25519Keypair();
-		this.priv = x.priv;
 		const tpParam = (id: number, val: Uint8Array) => concat(writeVarint(id), writeVarint(val.length), val);
 		const tp = concat(
 			tpParam(0x01, writeVarint(30000)),
@@ -142,8 +139,7 @@ export class QuicConnection {
 				E.grease(0x39, tp)
 			]
 		};
-		// Reuse the key_share private we generated, by injecting it: buildClientHello makes its
-		// own x25519 for keyShareGroups, so we instead read its priv back out.
+		// buildClientHello takes the x25519 key share (from the pool); read its private key back out.
 		const built = buildClientHello(fp as never, this.host);
 		this.priv = built.privs.get(Group.x25519)!;
 		let b = built.bytes;

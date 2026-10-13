@@ -22,11 +22,10 @@ import {
 	resumptionPsk,
 	clientEarlyTraffic,
 	updateTraffic,
-	x25519Keypair,
 	x25519Shared,
-	mlkem768Keypair,
-	mlkem768Decapsulate
+	type KemKey
 } from '../core/crypto';
+import { takeEcShare, takeMlkem768 } from '../core/keypool';
 import { chacha20Poly1305 } from '../core/chacha';
 import type { Fingerprint, ResumeSpec } from './clienthello';
 import { buildClientHello } from './clienthello';
@@ -193,14 +192,14 @@ export class TlsClient {
 
 	async handshake(): Promise<void> {
 		const resume = this.opts.resume;
-		// X25519MLKEM768 hybrid: ML-KEM keygen is async, so build the key_share up front
-		// (ek || X25519 pubkey) and keep both private parts for the shared-secret recovery.
-		let hybrid: { x: crypto.KeyObject; mlkem: CryptoKey } | null = null;
+		// X25519MLKEM768 hybrid: build the key_share up front (ek || X25519 pubkey) from pooled,
+		// single-use keys and keep both private parts for the shared-secret recovery.
+		let hybrid: { x: crypto.KeyObject; mlkem: KemKey } | null = null;
 		let prebuilt: Map<number, Uint8Array> | undefined;
 		if (this.opts.fingerprint.keyShareGroups.includes(Group.x25519mlkem768)) {
-			const x = x25519Keypair();
-			const mk = await mlkem768Keypair();
-			hybrid = { x: x.priv, mlkem: mk.priv };
+			const x = takeEcShare(Group.x25519);
+			const mk = await takeMlkem768();
+			hybrid = { x: x.priv, mlkem: mk };
 			prebuilt = new Map([[Group.x25519mlkem768, concat(mk.ek, x.pub)]]);
 		}
 		// 1) ClientHello (+ pre_shared_key + early_data when resuming)
@@ -258,10 +257,11 @@ export class TlsClient {
 		if (server.keyShare.group === Group.x25519mlkem768) {
 			if (!hybrid) throw new Error('server chose X25519MLKEM768 but no hybrid share was offered');
 			const ks = server.keyShare.pub; // ML-KEM-768 ciphertext (1088) || X25519 pubkey (32)
-			const mlShared = await mlkem768Decapsulate(hybrid.mlkem, ks.subarray(0, 1088));
+			const mlShared = await hybrid.mlkem.decapsulate(ks.subarray(0, 1088)); // sync on CNG
 			const xShared = x25519Shared(hybrid.x, ks.subarray(1088));
 			ecdhe = concat(mlShared, xShared); // combined secret = ML-KEM || X25519
 		} else {
+			hybrid?.mlkem.destroy?.(); // offered but not chosen (or dropped by a HelloRetryRequest)
 			const priv = ch.privs.get(server.keyShare.group);
 			if (!priv) throw new Error('server chose a group we did not offer: ' + server.keyShare.group);
 			ecdhe = ecdheShared(server.keyShare.group, priv, server.keyShare.pub);

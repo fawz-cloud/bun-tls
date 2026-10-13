@@ -7,7 +7,8 @@
 // OCSP and the AEAD primitives.
 import { Reader, Writer, concat, hex } from '../core/bytes';
 import { ContentType, HandshakeType, TLS12 } from '../core/consts';
-import { Aead, aesGcm, prf12, sha, ecdheShared, x25519Keypair } from '../core/crypto';
+import { Aead, aesGcm, prf12, sha, ecdheShared } from '../core/crypto';
+import { takeEcShare } from '../core/keypool';
 import { chacha20Poly1305 } from '../core/chacha';
 import type { Fingerprint } from './clienthello';
 import { buildClientHello } from './clienthello';
@@ -218,7 +219,8 @@ export class Tls12Client {
 		}
 
 		// 4) ECDHE: our key share for the server's group → premaster secret.
-		const { priv, pub } = genShare(ske.group);
+		if (ske.group !== 0x001d && ske.group !== 0x0017 && ske.group !== 0x0018) throw new Error('unsupported ECDHE group for TLS 1.2: ' + ske.group);
+		const { priv, pub } = takeEcShare(ske.group); // pre-generated, single-use
 		const pms = ecdheShared(ske.group, priv, ske.pub);
 
 		// 5) Client Certificate (empty) if asked, then ClientKeyExchange — both plaintext,
@@ -349,17 +351,6 @@ export class Tls12Client {
 
 function timingEqual(a: Uint8Array, b: Uint8Array): boolean {
 	return a.length === b.length && crypto.timingSafeEqual(a, b);
-}
-
-/** ECDHE key share for a named group (x25519 / P-256 / P-384). */
-function genShare(group: number): { priv: crypto.KeyObject; pub: Uint8Array } {
-	if (group === 0x001d) return x25519Keypair();
-	const curve = group === 0x0017 ? 'prime256v1' : group === 0x0018 ? 'secp384r1' : null;
-	if (!curve) throw new Error('unsupported ECDHE group for TLS 1.2: ' + group);
-	const { privateKey, publicKey } = crypto.generateKeyPairSync('ec', { namedCurve: curve });
-	const der = publicKey.export({ type: 'spki', format: 'der' }) as Buffer;
-	const ptLen = group === 0x0017 ? 65 : 97; // 0x04 || X || Y
-	return { priv: privateKey, pub: new Uint8Array(der.subarray(der.length - ptLen)) };
 }
 
 interface ParsedSH12 {

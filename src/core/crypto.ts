@@ -3,7 +3,9 @@
 // if the server picks it). All validated against RFC 8448 vectors in test/.
 import crypto from 'node:crypto';
 import { concat } from './bytes';
-import { cngAesGcm } from './cng';
+import { cngAesGcm, cngMlkem768, type KemKey } from './cng';
+
+export type { KemKey };
 
 export type HashAlg = 'sha256' | 'sha384';
 export const hashLen = (h: HashAlg): number => (h === 'sha256' ? 32 : 48);
@@ -156,31 +158,45 @@ export function prf12(hash: 'sha256' | 'sha384', secret: Uint8Array, label: stri
 	return out;
 }
 
-// ── ML-KEM-768 (FIPS 203) via WebCrypto, for the X25519MLKEM768 hybrid group ─────
+// ── ML-KEM-768 (FIPS 203), for the X25519MLKEM768 hybrid group ─────────────────
+// Windows CNG when present (synchronous); else WebCrypto, whose async ops each cost a thread
+// hop (measured in the real handshake: +235 µs CPU / +0.24 ms wall per connection).
 const subtle = globalThis.crypto.subtle;
 const MLKEM = { name: 'ML-KEM-768' } as const;
 
-/** Generate an ML-KEM-768 keypair: the 1184-byte encapsulation key (to send) + the
- *  decapsulation key (kept to recover the shared secret from the server's ciphertext). */
-export async function mlkem768Keypair(): Promise<{ ek: Uint8Array; priv: CryptoKey }> {
+/** A fresh ML-KEM-768 key pair: the 1184-byte encapsulation key to send, plus a one-shot
+ *  decapsulation of the server's 1088-byte ciphertext into the 32-byte shared secret. */
+export function mlkem768Keypair(): KemKey | Promise<KemKey> {
+	const native = cngMlkem768();
+	return native ? native() : webMlkem768();
+}
+
+async function webMlkem768(): Promise<KemKey> {
 	const kp = (await subtle.generateKey(MLKEM, true, ['encapsulateBits', 'decapsulateBits'])) as CryptoKeyPair;
 	const ek = new Uint8Array(await subtle.exportKey('raw-public' as 'raw', kp.publicKey));
-	return { ek, priv: kp.privateKey };
-}
-
-/** Recover the 32-byte ML-KEM-768 shared secret from the server's 1088-byte ciphertext. */
-export async function mlkem768Decapsulate(priv: CryptoKey, ciphertext: Uint8Array): Promise<Uint8Array> {
 	// @ts-expect-error — decapsulateBits is newer than the lib.dom types
-	return new Uint8Array(await subtle.decapsulateBits(MLKEM, priv, ciphertext));
+	return { ek, decapsulate: async (ct: Uint8Array) => new Uint8Array(await subtle.decapsulateBits(MLKEM, kp.privateKey, ct)) };
 }
 
-// ── X25519 ────────────────────────────────────────────────────────────────────
+// ── X25519 / P-256 / P-384 key shares ──────────────────────────────────────────
 const X25519_SPKI_PREFIX = Buffer.from('302a300506032b656e032100', 'hex');
 
 export function x25519Keypair(): { priv: crypto.KeyObject; pub: Uint8Array } {
 	const { privateKey, publicKey } = crypto.generateKeyPairSync('x25519');
 	const der = publicKey.export({ type: 'spki', format: 'der' }) as Buffer;
 	return { priv: privateKey, pub: new Uint8Array(der.subarray(der.length - 32)) };
+}
+
+/** An ECDHE key share for x25519 / secp256r1 / secp384r1: private key + the public value as
+ *  it goes on the wire (32 raw bytes, or the uncompressed point 0x04||X||Y). */
+export function ecShare(group: number): { priv: crypto.KeyObject; pub: Uint8Array } {
+	if (group === 0x001d) return x25519Keypair();
+	const curve = EC_CURVE[group];
+	if (!curve) throw new Error(`group ${group} not supported for key_share`);
+	const { privateKey, publicKey } = crypto.generateKeyPairSync('ec', { namedCurve: curve });
+	const der = publicKey.export({ type: 'spki', format: 'der' }) as Buffer;
+	const ptLen = group === 0x0017 ? 65 : 97;
+	return { priv: privateKey, pub: new Uint8Array(der.subarray(der.length - ptLen)) };
 }
 
 export function x25519Shared(priv: crypto.KeyObject, peerRaw32: Uint8Array): Uint8Array {

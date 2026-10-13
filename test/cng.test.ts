@@ -4,7 +4,7 @@
 // many keys. Run: bun test/cng.test.ts (skips off Windows or with BUN_TLS_CRYPTO=node).
 import assert from 'node:assert';
 import nodeCrypto from 'node:crypto';
-import { cngAesGcm, cngChaCha20Poly1305 } from '../src/core/cng';
+import { cngAesGcm, cngChaCha20Poly1305, cngMlkem768 } from '../src/core/cng';
 import { pureSeal, pureOpen } from '../src/core/chacha';
 import type { Aead } from '../src/core/crypto';
 
@@ -95,4 +95,24 @@ if (chacha) {
 	assert.ok(grew < 24, `20k create/destroy grew RSS by ${grew.toFixed(1)} MiB`);
 }
 
-console.log(`cng: OK (${checks} checks; aes-gcm${chacha ? ' + chacha20-poly1305' : ''})`);
+// ML-KEM-768: CNG decapsulates what WebCrypto encapsulates to the CNG-exported key; one-shot.
+const kem = cngMlkem768();
+if (kem) {
+	const ML = { name: 'ML-KEM-768' } as const;
+	for (let i = 0; i < 8; i++) {
+		const k = kem();
+		assert.equal(k.ek.length, 1184, 'ML-KEM-768 encapsulation key is 1184 bytes');
+		const pub = await crypto.subtle.importKey('raw-public' as 'raw', k.ek as unknown as ArrayBuffer, ML, true, ['encapsulateBits'] as never);
+		const enc = await crypto.subtle.encapsulateBits(ML, pub);
+		assert.equal(new Uint8Array(enc.ciphertext).length, 1088, 'ciphertext 1088 bytes');
+		assert.deepEqual(k.decapsulate(new Uint8Array(enc.ciphertext)), new Uint8Array(enc.sharedKey), `CNG decap == WebCrypto encap secret (${i})`);
+		assert.throws(() => k.decapsulate(new Uint8Array(enc.ciphertext)), /already used/, 'decapsulation is one-shot');
+	}
+	assert.throws(() => kem().decapsulate(new Uint8Array(1087)), /1088/, 'wrong ciphertext length rejected');
+	const a = kem(), b = kem();
+	assert.notDeepEqual(a.ek, b.ek, 'fresh key per call');
+	a.destroy!();
+	b.destroy!();
+} else console.log('cng: ML-KEM-768 not in this Windows build (WebCrypto path stays)');
+
+console.log(`cng: OK (${checks} checks; aes-gcm${chacha ? ' + chacha20-poly1305' : ''}${kem ? ' + ml-kem-768' : ''})`);
