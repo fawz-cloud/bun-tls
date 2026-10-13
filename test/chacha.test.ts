@@ -27,4 +27,18 @@ assert.throws(
 	'tampered tag rejected'
 );
 
+// Native (WebCrypto) bulk path must be byte-identical to the pure-TS seal/open and interop
+// both ways — the record layer uses one to produce what the other consumes.
+await (async () => {
+	assert.ok(aead.sealAsync && aead.openAsync, 'native ChaCha path present on this runtime');
+	for (const n of [0, 1, 63, 64, 65, 16383]) {
+		const p = crypto.getRandomValues(new Uint8Array(n));
+		const nn = crypto.getRandomValues(new Uint8Array(12));
+		const natCt = new Uint8Array(await aead.sealAsync!(nn, aad, p));
+		assert.deepEqual(natCt, aead.seal(nn, aad, p), `native seal == pure seal (n=${n})`);
+		assert.deepEqual(aead.open(nn, aad, natCt), p, `pure open(native ct) (n=${n})`);
+		assert.deepEqual(new Uint8Array(await aead.openAsync!(nn, aad, aead.seal(nn, aad, p))), p, `native open(pure ct) (n=${n})`);
+	}
+})();
+
 console.log('chacha: OK');
