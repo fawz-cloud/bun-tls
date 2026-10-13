@@ -209,8 +209,7 @@ export class Tls12Client {
 		// 3) Verify the chain, then the ServerKeyExchange signature (server proves it holds
 		//    the cert key, over client_random || server_random || ECDHE params — anti-MITM).
 		if (this.opts.verify !== false) {
-			verifyChain(this.peerCertificates, this.opts.host);
-			const leafPub = new crypto.X509Certificate(Buffer.from(this.peerCertificates[0]!)).publicKey;
+			const leafPub = verifyChain(this.peerCertificates, this.opts.host);
 			const signed = concat(clientRandom, serverRandom, ske.params);
 			const { hash, key } = verifyOpts(ske.sigAlg, leafPub);
 			if (!crypto.verify(hash, Buffer.from(signed), key, Buffer.from(ske.sig)))

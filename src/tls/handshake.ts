@@ -312,9 +312,9 @@ export class TlsClient {
 		this.peerCertificates = certs;
 		this.ocspStaple = staple;
 		if (!pskAccepted && this.opts.verify !== false) {
-			verifyChain(certs, this.opts.host);
+			const leafPub = verifyChain(certs, this.opts.host);
 			if (!cv) throw new Error('server did not send CertificateVerify');
-			verifyCertificateVerify(certs[0]!, cv.alg, cv.sig, thBeforeCV);
+			verifyCertificateVerify(leafPub, cv.alg, cv.sig, thBeforeCV);
 			await checkRevocation(certs, staple, this.opts.ocsp ?? 'off');
 		}
 		this.resumed = pskAccepted;

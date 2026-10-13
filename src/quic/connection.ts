@@ -329,9 +329,9 @@ export class QuicConnection {
 			return;
 		}
 		// Verify the certificate chain + CertVerify, derive app keys, send our Finished.
-		verifyChain(this.certs, this.host);
+		const leafPub = verifyChain(this.certs, this.host);
 		if (!this.cv) throw new Error('QUIC: no CertificateVerify');
-		verifyCertificateVerify(this.certs[0]!, this.cv.alg, this.cv.sig, this.thBeforeCV);
+		verifyCertificateVerify(leafPub, this.cv.alg, this.cv.sig, this.thBeforeCV);
 		const th = this.th(); // CH..server Finished: app secrets + our Finished (no client cert here)
 		const app = appSecrets(this.sched, th);
 		this.keys.app = { c: packetKeys(this.hash, app.cAp, this.keyLen), s: packetKeys(this.hash, app.sAp, this.keyLen) };

@@ -60,11 +60,18 @@ function anchoredByRoot(cert: crypto.X509Certificate): boolean {
 	return false;
 }
 
-// Cache of chains whose path-building already succeeded, keyed by the leaf cert's
-// exact bytes → the chain's earliest notAfter (ms). A repeat handshake to the same
-// server (same cert) then skips the expensive anchor scan; the hostname and expiry
-// are still checked every call, and a rotated cert (new bytes) misses the cache.
-const chainCache = new Map<string, number>();
+// Cache of chains whose path-building already succeeded, keyed by SHA-256 of the leaf
+// cert's exact bytes → the chain's earliest notAfter (ms) + the parsed leaf and its public
+// key. A repeat handshake to the same server (same cert) then skips the anchor scan and
+// every parse; the hostname and expiry are still checked every call, and a rotated cert
+// (new bytes) misses the cache. Oldest entries go first past CHAIN_CACHE_MAX.
+interface Verified {
+	until: number;
+	leaf: crypto.X509Certificate;
+	pub: crypto.KeyObject;
+}
+const chainCache = new Map<string, Verified>();
+const CHAIN_CACHE_MAX = 1024;
 
 /** Match the leaf against the requested host — by IP SAN for an IP literal, by DNS SAN
  *  otherwise. `checkHost` does not match IP addresses, so an IP target needs `checkIP`. */
@@ -74,17 +81,21 @@ function matchesHost(leaf: crypto.X509Certificate, host: string): boolean {
 	return !!leaf.checkHost(host);
 }
 
-export function verifyChain(certsDer: Uint8Array[], host: string, now = new Date()): void {
+/** Verify the chain for `host`; returns the leaf's public key (for CertificateVerify /
+ *  ServerKeyExchange), parsed once and cached with the chain. */
+export function verifyChain(certsDer: Uint8Array[], host: string, now = new Date()): crypto.KeyObject {
 	if (certsDer.length === 0) throw new Error('server sent no certificate');
-	const leaf = new crypto.X509Certificate(Buffer.from(certsDer[0]!));
-	if (!matchesHost(leaf, host)) throw new Error(`certificate is not for ${host} (subject ${leaf.subject})`);
-	const key = crypto.createHash('sha256').update(Buffer.from(certsDer[0]!)).digest('hex');
-	const cachedUntil = chainCache.get(key);
-	if (cachedUntil !== undefined) {
-		if (cachedUntil < now.getTime()) throw new Error(`certificate expired: ${leaf.subject}`);
-		return; // already path-built for these exact bytes; host + expiry checked above
+	const key = crypto.createHash('sha256').update(certsDer[0]!).digest('hex');
+	const hit = chainCache.get(key);
+	if (hit) {
+		// already path-built for these exact bytes; host + expiry still checked every time
+		if (!matchesHost(hit.leaf, host)) throw new Error(`certificate is not for ${host} (subject ${hit.leaf.subject})`);
+		if (hit.until < now.getTime()) throw new Error(`certificate expired: ${hit.leaf.subject}`);
+		return hit.pub;
 	}
 	const chain = certsDer.map((d) => new crypto.X509Certificate(Buffer.from(d)));
+	const leaf = chain[0]!;
+	if (!matchesHost(leaf, host)) throw new Error(`certificate is not for ${host} (subject ${leaf.subject})`);
 	// Path building (like browsers): anchor at the EARLIEST chain cert a trusted
 	// root vouches for — servers often append a legacy cross-signed root on top
 	// (GlobalSign R1, AAA Certificate Services) whose own issuer isn't trusted.
@@ -114,7 +125,10 @@ export function verifyChain(certsDer: Uint8Array[], host: string, now = new Date
 	}
 	// RFC 5280 constraints: unknown critical extensions, leaf EKU, pathLen, NameConstraints.
 	enforceConstraints(chain, anchor);
-	chainCache.set(key, validUntil);
+	if (chainCache.size >= CHAIN_CACHE_MAX) chainCache.delete(chainCache.keys().next().value!);
+	const pub = leaf.publicKey;
+	chainCache.set(key, { until: validUntil, leaf, pub });
+	return pub;
 }
 
 export type OcspMode = 'off' | 'soft' | 'hard';
@@ -168,11 +182,11 @@ export function verifyOpts(alg: number, pub: crypto.KeyObject): { hash: string; 
 const CV_CONTEXT = concat(new Uint8Array(64).fill(0x20), new Uint8Array(Buffer.from('TLS 1.3, server CertificateVerify')), Uint8Array.of(0));
 
 /** CertificateVerify: signature over (64 spaces || label || 0x00 || Transcript-Hash up to
- *  Certificate) — `thBeforeCV` is that hash. */
-export function verifyCertificateVerify(leafDer: Uint8Array, alg: number, signature: Uint8Array, thBeforeCV: Uint8Array): void {
-	const leaf = new crypto.X509Certificate(Buffer.from(leafDer));
+ *  Certificate) — `thBeforeCV` is that hash — checked with the leaf public key verifyChain
+ *  returned. */
+export function verifyCertificateVerify(leafPub: crypto.KeyObject, alg: number, signature: Uint8Array, thBeforeCV: Uint8Array): void {
 	const content = concat(CV_CONTEXT, thBeforeCV);
-	const { hash: h, key } = verifyOpts(alg, leaf.publicKey);
+	const { hash: h, key } = verifyOpts(alg, leafPub);
 	if (!crypto.verify(h, Buffer.from(content), key, Buffer.from(signature)))
 		throw new Error('CertificateVerify failed — server does not hold the cert private key (possible MITM)');
 }
