@@ -3,7 +3,7 @@
 import assert from 'node:assert';
 import crypto from 'node:crypto';
 import { fromHex, hex } from '../src/core/bytes';
-import { aeadNonce, aesGcm, deriveSecret, expandLabel, hkdfExtract, sha, x25519Keypair, x25519Shared } from '../src/core/crypto';
+import { aeadNonce, aesGcm, deriveSecret, expandLabel, hkdfExtract, seqNonce, sha, x25519Keypair, x25519Shared } from '../src/core/crypto';
 
 // ── x25519: node derives the RFC 8448 public key from its private key
 //    (proves the impl + our raw-key extraction) ──
@@ -51,5 +51,50 @@ assert.throws(() => gcm.open(aeadNonce(iv, 6n), aad, ct), 'wrong seq → tag fai
 // ── aeadNonce: iv XOR seq in the last 8 bytes ──
 assert.equal(hex(aeadNonce(fromHex('0102030405060708090a0b0c'), 0n)), '0102030405060708090a0b0c');
 assert.equal(hex(aeadNonce(fromHex('000000000000000000000000'), 0x0102n)), '000000000000000000000102');
+
+// ── seqNonce (Number) == aeadNonce (BigInt) for every value a TLS connection can reach ──
+for (const seq of [0, 1, 255, 256, 257, 65535, 65536, 2 ** 32 - 1, 2 ** 32, 2 ** 32 + 1, 2 ** 40 + 12345, 2 ** 53 - 2]) {
+	const riv = crypto.getRandomValues(new Uint8Array(12));
+	assert.equal(hex(seqNonce(riv, seq)), hex(aeadNonce(riv, BigInt(seq))), `seqNonce == aeadNonce @ ${seq}`);
+}
+
+// ── aesGcm.seal == WebCrypto AES-GCM (128-bit tag); sealParts == seal(concat); short ct throws ──
+for (const kl of [16, 32] as const) {
+	const raw = crypto.getRandomValues(new Uint8Array(kl));
+	const a = aesGcm(kl)(raw);
+	const wk = await crypto.subtle.importKey('raw', raw as unknown as ArrayBuffer, 'AES-GCM', false, ['encrypt']);
+	const nonce = crypto.getRandomValues(new Uint8Array(12));
+	const extra = crypto.getRandomValues(new Uint8Array(5));
+	for (const n of [0, 1, 15, 16, 17, 1000, 16384]) {
+		const m = crypto.getRandomValues(new Uint8Array(n));
+		for (const ad of [new Uint8Array(0), extra]) {
+			const mine = a.seal(nonce, ad, m);
+			const web = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv: nonce as unknown as ArrayBuffer, additionalData: ad as unknown as ArrayBuffer, tagLength: 128 }, wk, m as unknown as ArrayBuffer));
+			assert.deepEqual(mine, web, `aes-${kl * 8} seal==webcrypto n=${n} aad=${ad.length}`);
+			assert.deepEqual(a.open(nonce, ad, mine), m, `aes-${kl * 8} open n=${n}`);
+			if (a.sealParts && m.length >= 1) {
+				const out = new Uint8Array(m.length + 1 + 16);
+				const type = Uint8Array.of(23);
+				a.sealParts(nonce, ad, [m, type], out, 0);
+				assert.deepEqual(out, a.seal(nonce, ad, Buffer.concat([m, type])), `sealParts==seal n=${n}`);
+			}
+		}
+	}
+	assert.throws(() => a.open(nonce, extra, crypto.getRandomValues(new Uint8Array(10))), 'ct shorter than tag throws');
+}
+
+// ── 200 records decrypted, every output kept and rechecked at the end (catches buffer reuse) ──
+{
+	const a = aesGcm(16)(crypto.getRandomValues(new Uint8Array(16)));
+	const niv = crypto.getRandomValues(new Uint8Array(12));
+	const outs: Uint8Array[] = [];
+	const want: Uint8Array[] = [];
+	for (let i = 0; i < 200; i++) {
+		const m = crypto.getRandomValues(new Uint8Array(1 + (i % 300)));
+		want.push(m);
+		outs.push(a.open(niv, aad, a.seal(niv, aad, m)));
+	}
+	for (let i = 0; i < 200; i++) assert.deepEqual(outs[i], want[i], `kept output ${i} intact`);
+}
 
 console.log('crypto: OK');

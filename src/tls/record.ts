@@ -1,8 +1,12 @@
 // TLS 1.3 record layer. Plaintext (ClientHello) + AEAD (after keys exist). The
 // TLS1.3 inner plaintext = content || real_type(1) || padding(0). AAD = 5-byte header.
-import { Aead, aeadNonce } from '../core/crypto';
+import { Aead, seqNonce } from '../core/crypto';
 import { ContentType, TLS12 } from '../core/consts';
 import { concat } from '../core/bytes';
+
+// One cached 1-byte Uint8Array per content type (read-only, appended as the TLS 1.3 inner type).
+const TYPE_BYTE: Uint8Array[] = [];
+const typeByte = (t: number): Uint8Array => (TYPE_BYTE[t] ??= Uint8Array.of(t));
 
 interface Record {
 	type: number; // header ContentType (23 for ciphertext)
@@ -29,20 +33,26 @@ export class RecordReader {
 
 /** One AEAD direction (key+iv+seq). write = client→server, read = server→client. */
 export class AeadDir {
-	private seq = 0n;
+	private seq = 0; // Number, not BigInt: exact and nonce-safe for seq < 2^53 (see nextNonce)
 	constructor(
 		private aead: Aead,
 		private iv: Uint8Array
 	) {}
 
+	/** Nonce for the current record, then advance seq. A fresh buffer every call (async ChaCha
+	 *  reads it after an await). Past 2^53 seq++ would stall and reuse a nonce — fail closed. */
+	private nextNonce(): Uint8Array {
+		if (this.seq >= Number.MAX_SAFE_INTEGER) throw new Error('AEAD sequence number exhausted');
+		return seqNonce(this.iv, this.seq++);
+	}
+
 	/** Wrap `plaintext` as a TLSCiphertext (app_data 0x17). innerType = the real
 	 *  ContentType (handshake/app/alert), appended to the plaintext. */
 	encrypt(innerType: number, plaintext: Uint8Array): Uint8Array {
-		const inner = concat(plaintext, Uint8Array.of(innerType));
+		const inner = concat(plaintext, typeByte(innerType));
 		const len = inner.length + 16; // + tag
 		const header = Uint8Array.of(ContentType.applicationData, TLS12 >> 8, TLS12 & 0xff, (len >> 8) & 0xff, len & 0xff);
-		const ct = this.aead.seal(aeadNonce(this.iv, this.seq), header, inner);
-		this.seq++;
+		const ct = this.aead.seal(this.nextNonce(), header, inner);
 		return concat(header, ct);
 	}
 
@@ -52,7 +62,7 @@ export class AeadDir {
 	encryptMany(innerType: number, data: Uint8Array, maxFrag: number): Uint8Array {
 		const n = Math.ceil(data.length / maxFrag);
 		const out = new Uint8Array(data.length + n * (5 + 1 + 16)); // header + type byte + tag
-		const type = Uint8Array.of(innerType);
+		const type = typeByte(innerType);
 		let off = 0;
 		for (let p = 0; p < data.length; p += maxFrag) {
 			const frag = data.subarray(p, p + maxFrag);
@@ -63,7 +73,7 @@ export class AeadDir {
 			out[off + 3] = (len >> 8) & 0xff;
 			out[off + 4] = len & 0xff;
 			const header = out.subarray(off, off + 5);
-			const nonce = aeadNonce(this.iv, this.seq++);
+			const nonce = this.nextNonce();
 			if (this.aead.sealParts) {
 				off = this.aead.sealParts(nonce, header, [frag, type], out, off + 5);
 			} else {
@@ -86,7 +96,7 @@ export class AeadDir {
 	 *  socket write for the caller, and the native crypto runs off-thread at ~1 GB/s. */
 	async encryptManyAsync(innerType: number, data: Uint8Array, maxFrag: number): Promise<Uint8Array> {
 		if (!this.aead.sealAsync) return this.encryptMany(innerType, data, maxFrag);
-		const type = Uint8Array.of(innerType);
+		const type = typeByte(innerType);
 		const jobs: Promise<Uint8Array>[] = [];
 		const headers: Uint8Array[] = [];
 		for (let p = 0; p < data.length; p += maxFrag) {
@@ -94,7 +104,7 @@ export class AeadDir {
 			const len = frag.length + 1 + 16; // + type byte + tag
 			const header = Uint8Array.of(ContentType.applicationData, TLS12 >> 8, TLS12 & 0xff, (len >> 8) & 0xff, len & 0xff);
 			headers.push(header);
-			jobs.push(this.aead.sealAsync(aeadNonce(this.iv, this.seq++), header, concat(frag, type)));
+			jobs.push(this.aead.sealAsync(this.nextNonce(), header, concat(frag, type)));
 		}
 		const cts = await Promise.all(jobs);
 		let total = 0;
@@ -111,16 +121,14 @@ export class AeadDir {
 
 	/** Open a TLSCiphertext → { innerType, content } (trailing zero padding removed). */
 	decrypt(rec: Record): { innerType: number; content: Uint8Array } {
-		const inner = this.aead.open(aeadNonce(this.iv, this.seq), this.aad(rec), rec.fragment);
-		this.seq++;
-		return unpad(inner);
+		return unpad(this.aead.open(this.nextNonce(), this.aad(rec), rec.fragment));
 	}
 
-	/** Async form of decrypt (native AEAD). Used on the download hot path in readApp. */
+	/** Async form of decrypt (native AEAD). The nonce and seq++ happen BEFORE the await, so
+	 *  several decryptAsync can be dispatched back to back in wire order (P6 download queue). */
 	async decryptAsync(rec: Record): Promise<{ innerType: number; content: Uint8Array }> {
 		if (!this.aead.openAsync) return this.decrypt(rec);
-		const inner = await this.aead.openAsync(aeadNonce(this.iv, this.seq), this.aad(rec), rec.fragment);
-		this.seq++;
+		const inner = await this.aead.openAsync(this.nextNonce(), this.aad(rec), rec.fragment);
 		return unpad(inner);
 	}
 

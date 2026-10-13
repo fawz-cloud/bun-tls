@@ -197,6 +197,8 @@ export type Aead = {
 	keyLen: number;
 };
 
+const TAG16 = { authTagLength: 16 }; // reused per record instead of a fresh options object
+
 export function aesGcm(keyLen: 16 | 32): (key: Uint8Array) => Aead {
 	const algo = keyLen === 16 ? 'aes-128-gcm' : 'aes-256-gcm';
 	return (raw: Uint8Array): Aead => {
@@ -204,8 +206,8 @@ export function aesGcm(keyLen: 16 | 32): (key: Uint8Array) => Aead {
 		return {
 			keyLen,
 			seal(nonce, aad, pt) {
-				const c = crypto.createCipheriv(algo, key, nonce, { authTagLength: 16 });
-				c.setAAD(aad, { plaintextLength: pt.length });
+				const c = crypto.createCipheriv(algo, key, nonce, TAG16);
+				c.setAAD(aad); // plaintextLength only matters for CCM/OCB, not GCM
 				const body = c.update(pt); // GCM is a stream cipher: update() returns all ct
 				c.final(); // empty for GCM, but required
 				const out = new Uint8Array(body.length + 16);
@@ -214,10 +216,8 @@ export function aesGcm(keyLen: 16 | 32): (key: Uint8Array) => Aead {
 				return out;
 			},
 			sealParts(nonce, aad, parts, out, off) {
-				const c = crypto.createCipheriv(algo, key, nonce, { authTagLength: 16 });
-				let total = 0;
-				for (const p of parts) total += p.length;
-				c.setAAD(aad, { plaintextLength: total });
+				const c = crypto.createCipheriv(algo, key, nonce, TAG16);
+				c.setAAD(aad);
 				for (const p of parts) {
 					const enc = c.update(p);
 					out.set(enc, off);
@@ -230,12 +230,13 @@ export function aesGcm(keyLen: 16 | 32): (key: Uint8Array) => Aead {
 			open(nonce, aad, ct) {
 				const tag = ct.subarray(ct.length - 16);
 				const body = ct.subarray(0, ct.length - 16);
-				const d = crypto.createDecipheriv(algo, key, nonce, { authTagLength: 16 });
-				d.setAAD(aad, { plaintextLength: body.length });
+				const d = crypto.createDecipheriv(algo, key, nonce, TAG16); // length pin: a <16B ct gives a short tag → setAuthTag throws
+				d.setAAD(aad);
 				d.setAuthTag(tag);
 				const out = d.update(body); // all plaintext; d.final() only verifies the tag
 				d.final(); // throws on tag mismatch → we never return unverified plaintext
-				return new Uint8Array(out);
+				// View, not a copy: d.update already returned a fresh Buffer for this record.
+				return new Uint8Array(out.buffer, out.byteOffset, out.length);
 			}
 		};
 	};
@@ -247,5 +248,23 @@ export function aeadNonce(iv: Uint8Array, seq: bigint): Uint8Array {
 	for (let i = 0; i < 8; i++) {
 		n[11 - i] ^= Number((seq >> BigInt(8 * i)) & 0xffn);
 	}
+	return n;
+}
+
+/** Same nonce as aeadNonce, but from a Number sequence (no BigInt per record). Exact for
+ *  seq < 2^53, far beyond any per-key record count. Only the low 32 bits land in bytes 8..11
+ *  and the next 21 in bytes 4..7 — the IV's top 4 bytes are never touched (seq never reaches
+ *  2^53), matching aeadNonce for every value a TLS connection can produce. */
+export function seqNonce(iv: Uint8Array, seq: number): Uint8Array {
+	const n = new Uint8Array(iv);
+	const lo = seq >>> 0;
+	const hi = Math.floor(seq / 0x100000000); // < 2^21
+	n[11] ^= lo & 0xff;
+	n[10] ^= (lo >>> 8) & 0xff;
+	n[9] ^= (lo >>> 16) & 0xff;
+	n[8] ^= (lo >>> 24) & 0xff;
+	n[7] ^= hi & 0xff;
+	n[6] ^= (hi >>> 8) & 0xff;
+	n[5] ^= (hi >>> 16) & 0xff;
 	return n;
 }
