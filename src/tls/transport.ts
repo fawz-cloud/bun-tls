@@ -15,6 +15,43 @@ export interface Transport {
 	close(): void;
 }
 
+/** Settle with `p`, or reject with the signal's reason as soon as it aborts. A value that
+ *  arrives after the abort goes to `onLate` (close it — nothing in flight may leak). */
+function abortable<T>(p: Promise<T>, signal: AbortSignal | undefined, onLate?: (v: T) => void): Promise<T> {
+	if (!signal) return p;
+	if (signal.aborted) {
+		p.then((v) => onLate?.(v), () => {});
+		return Promise.reject(signal.reason);
+	}
+	return new Promise<T>((res, rej) => {
+		const stop = () => {
+			p.then((v) => onLate?.(v), () => {});
+			rej(signal.reason);
+		};
+		signal.addEventListener('abort', stop, { once: true });
+		p.then(
+			(v) => {
+				signal.removeEventListener('abort', stop);
+				if (signal.aborted) onLate?.(v);
+				else res(v);
+			},
+			(e) => {
+				signal.removeEventListener('abort', stop);
+				rej(signal.aborted ? signal.reason : e);
+			}
+		);
+	});
+}
+
+/** While a proxy handshake runs on `conn`, an abort closes it (its pending read then sees EOF
+ *  and the negotiation throws); returns the cleanup that detaches the listener. */
+function closeOnAbort(conn: RawConn, signal: AbortSignal | undefined): () => void {
+	if (!signal) return () => {};
+	const stop = () => conn.close();
+	signal.addEventListener('abort', stop, { once: true });
+	return () => signal.removeEventListener('abort', stop);
+}
+
 // DNS cache: a fresh connection per request otherwise re-resolves the host every
 // time (what curl avoids with its in-process cache). TTL 60s. IP literals skip it.
 const dnsCache = new Map<string, { ip: string; exp: number }>();
@@ -61,7 +98,8 @@ interface BunSock {
 	setNoDelay?(v: boolean): void;
 }
 
-async function rawConnect(host: string, port: number): Promise<RawConn> {
+async function rawConnect(host: string, port: number, signal?: AbortSignal): Promise<RawConn> {
+	signal?.throwIfAborted();
 	const q = new ByteQueue();
 	let closed = false;
 	// Outbound queue with backpressure: sock.write() returns the bytes accepted; the
@@ -87,8 +125,9 @@ async function rawConnect(host: string, port: number): Promise<RawConn> {
 			for (const f of w) f();
 		}
 	};
-	sock = (await Bun.connect({
-		hostname: await resolveHost(host),
+	const hostname = await abortable(resolveHost(host), signal);
+	const connecting = Bun.connect({
+		hostname,
 		port,
 		socket: {
 			binaryType: 'uint8array',
@@ -112,7 +151,9 @@ async function rawConnect(host: string, port: number): Promise<RawConn> {
 				console.error('[transport] socket error:', (e as Error)?.message ?? e);
 			}
 		}
-	})) as unknown as BunSock;
+	});
+	// A connect still pending when the caller gives up is closed the moment it lands.
+	sock = (await abortable(connecting, signal, (s) => s.end())) as unknown as BunSock;
 	// Disable Nagle: our handshake/request writes are small and latency-sensitive;
 	// Nagle + delayed-ACK can add tens of ms. (Guarded — older Bun may lack it.)
 	sock.setNoDelay?.(true);
@@ -143,7 +184,8 @@ async function rawConnect(host: string, port: number): Promise<RawConn> {
 	};
 }
 
-export const tcpConnect = (host: string, port: number): Promise<Transport> => rawConnect(host, port);
+/** TCP connect. `signal` aborts the DNS lookup + connect (a late socket is closed). */
+export const tcpConnect = (host: string, port: number, signal?: AbortSignal): Promise<Transport> => rawConnect(host, port, signal);
 
 /** Read exactly `n` bytes from a raw connection, buffering across chunks; any surplus is
  *  pushed back for the next reader. */
@@ -160,9 +202,10 @@ async function readExact(conn: RawConn, n: number): Promise<Uint8Array> {
 
 /** SOCKS5 proxy (RFC 1928, + RFC 1929 user/pass). The hostname is sent to the proxy to
  *  resolve (socks5h semantics). `proxyUrl` = socks5://[user:pass@]host:port. TLS on top. */
-export async function socks5Connect(proxyUrl: string, targetHost: string, targetPort: number): Promise<Transport> {
+export async function socks5Connect(proxyUrl: string, targetHost: string, targetPort: number, signal?: AbortSignal): Promise<Transport> {
 	const pu = new URL(proxyUrl);
-	const conn = await rawConnect(pu.hostname, Number(pu.port || 1080));
+	const conn = await rawConnect(pu.hostname, Number(pu.port || 1080), signal);
+	const detach = closeOnAbort(conn, signal); // a proxy that never answers cannot hang the dial
 	try {
 	const user = pu.username ? decodeURIComponent(pu.username) : '';
 	const pass = pu.password ? decodeURIComponent(pu.password) : '';
@@ -193,17 +236,20 @@ export async function socks5Connect(proxyUrl: string, targetHost: string, target
 	return { write: conn.write, writeAsync: conn.writeAsync, read: conn.read, close: conn.close };
 	} catch (e) {
 		conn.close(); // a failed negotiation must not leak the proxy socket
-		throw e;
+		throw signal?.aborted ? signal.reason : e;
+	} finally {
+		detach();
 	}
 }
 
 /** Tunnel through a proxy and return a byte transport for TLS to run on. Dispatches by
  *  scheme: `socks5://`/`socks5h://` → SOCKS5, otherwise HTTP `CONNECT`.
  *  `proxyUrl` = http|socks5://[user:pass@]host:port. */
-export async function proxyConnect(proxyUrl: string, targetHost: string, targetPort: number): Promise<Transport> {
-	if (/^socks/i.test(proxyUrl)) return socks5Connect(proxyUrl, targetHost, targetPort);
+export async function proxyConnect(proxyUrl: string, targetHost: string, targetPort: number, signal?: AbortSignal): Promise<Transport> {
+	if (/^socks/i.test(proxyUrl)) return socks5Connect(proxyUrl, targetHost, targetPort, signal);
 	const pu = new URL(proxyUrl);
-	const conn = await rawConnect(pu.hostname, Number(pu.port || 80));
+	const conn = await rawConnect(pu.hostname, Number(pu.port || 80), signal);
+	const detach = closeOnAbort(conn, signal); // a proxy that never answers cannot hang the dial
 	try {
 	const authority = `${targetHost}:${targetPort}`;
 	const lines = [`CONNECT ${authority} HTTP/1.1`, `Host: ${authority}`];
@@ -236,6 +282,8 @@ export async function proxyConnect(proxyUrl: string, targetHost: string, targetP
 	return { write: conn.write, writeAsync: conn.writeAsync, read: conn.read, close: conn.close };
 	} catch (e) {
 		conn.close(); // a failed CONNECT negotiation must not leak the proxy socket
-		throw e;
+		throw signal?.aborted ? signal.reason : e;
+	} finally {
+		detach();
 	}
 }

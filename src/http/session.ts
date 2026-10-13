@@ -1,7 +1,7 @@
 // Session, like curl_cffi/requests: a cookie jar + redirect following + default
 // headers/fingerprint/proxy/verify that persist across requests. The single-shot
 // request() in client.ts keeps no state; Session does.
-import { openConnection, roundtrip, serializeForEarly, withH2, type ClientResponse, type OpenOptions, type RoundtripOptions } from './client';
+import { openConnection, roundtrip, serializeForEarly, withH2, withDeadline, timeLeft, type ClientResponse, type OpenOptions, type RoundtripOptions } from './client';
 import type { RequestOptions } from './client';
 import { modern } from '../fp/fingerprints';
 import { resolvePersona, personaHeaders, type Persona } from '../fp/personas';
@@ -249,13 +249,13 @@ export class Session {
 	 *  that was already received by the server before the reset could be re-sent.) */
 	private async send(key: string, open: OpenOptions, rt: RoundtripOptions, keepAlive: boolean): Promise<ClientResponse> {
 		const idempotent = rt.method === 'GET' || rt.method === 'HEAD';
+		const deadline = open.timeoutMs ? Date.now() + open.timeoutMs : 0; // one budget: dial + handshake + roundtrip
 		// 1) Reuse a live pooled connection — no handshake at all (fastest, the common path).
 		const idle = this.pool.get(key);
 		while (idle && idle.length) {
 			const tls = idle.pop()!;
 			try {
-				const rtp = roundtrip(tls, rt);
-				return this.recycle(key, tls, await (open.timeoutMs ? this.timed(open.timeoutMs, tls, rtp) : rtp), keepAlive);
+				return this.recycle(key, tls, await withDeadline(deadline, roundtrip(tls, rt), () => tls.close()), keepAlive);
 			} catch (e) {
 				try {
 					tls.close();
@@ -274,9 +274,8 @@ export class Session {
 		const use0rtt = !!ticket && ticket.maxEarlyData > 0 && idempotent && (this.opts.zeroRtt ?? false);
 		const resume = ticket ? { ticket, earlyData: use0rtt } : undefined;
 		const earlyData = use0rtt ? serializeForEarly(rt) : undefined;
-		const tls = await openConnection({ ...open, resume, earlyData, onTicket: (t) => this.tickets.add(tkey, t) });
-		const rtp = roundtrip(tls, rt, tls.earlyAccepted);
-		return this.recycle(key, tls, await (open.timeoutMs ? this.timed(open.timeoutMs, tls, rtp) : rtp), keepAlive);
+		const tls = await openConnection({ ...open, timeoutMs: timeLeft(deadline), resume, earlyData, onTicket: (t) => this.tickets.add(tkey, t) });
+		return this.recycle(key, tls, await withDeadline(deadline, roundtrip(tls, rt, tls.earlyAccepted), () => tls.close()), keepAlive);
 	}
 
 	private recycle(key: string, tls: TlsConn, res: ClientResponse, keepAlive: boolean): ClientResponse {
@@ -293,6 +292,7 @@ export class Session {
 		req: { method: string; authority: string; path: string; headers: Record<string, string>; body?: Uint8Array },
 		profile?: H2Profile
 	): Promise<ClientResponse> {
+		const deadline = open.timeoutMs ? Date.now() + open.timeoutMs : 0; // one budget: dial + queue + stream
 		let entry = this.h2pool.get(key);
 		if (entry && entry.conn.closed) {
 			this.h2pool.delete(key);
@@ -303,43 +303,25 @@ export class Session {
 			// (otherwise each opens its own, defeating multiplexing — audit A06).
 			let dial = this.h2dial.get(key);
 			if (!dial) {
-				dial = this.dialH2(key, open, profile).finally(() => this.h2dial.delete(key));
+				dial = this.dialH2(key, { ...open, timeoutMs: timeLeft(deadline) }, profile).finally(() => this.h2dial.delete(key));
 				this.h2dial.set(key, dial);
 			}
-			const dialed = await dial;
+			// A shared dial may have been started by a request with a longer (or no) budget.
+			const dialed = await withDeadline(deadline, dial);
 			if (dialed === null) {
 				// server declined h2 on this host → serve this request over HTTP/1.1
-				const tls = await openConnection({ ...open });
-				const res = await roundtrip(tls, { method: req.method, host: open.host, path: req.path, headers: req.headers, body: req.body, keepAlive: false });
-				tls.close();
-				return res;
+				const tls = await openConnection({ ...open, timeoutMs: timeLeft(deadline) });
+				try {
+					return await withDeadline(deadline, roundtrip(tls, { method: req.method, host: open.host, path: req.path, headers: req.headers, body: req.body, keepAlive: false }), () => tls.close());
+				} finally {
+					tls.close();
+				}
 			}
 			entry = dialed;
 		}
-		const res = await entry.conn.request(req, open.timeoutMs); // per-stream deadline, not the whole conn
+		// The rest of the budget covers waiting for a free stream slot AND the stream itself.
+		const res = await entry.conn.request(req, timeLeft(deadline));
 		return Object.assign(res, entry.fp);
-	}
-
-	/** Race a roundtrip against a deadline that closes the (single) connection on expiry. */
-	private async timed<T>(ms: number | undefined, tls: TlsConn, p: Promise<T>): Promise<T> {
-		if (!ms) return p;
-		p.catch(() => {}); // the loser's later rejection is expected — don't leave it unhandled
-		let timer!: ReturnType<typeof setTimeout>;
-		const deadline = new Promise<never>((_, rej) => {
-			timer = setTimeout(() => {
-				try {
-					tls.close();
-				} catch {
-					/* already gone */
-				}
-				rej(new Error('request timed out'));
-			}, ms);
-		});
-		try {
-			return await Promise.race([p, deadline]);
-		} finally {
-			clearTimeout(timer);
-		}
 	}
 
 	/** Dial one HTTP/2 connection for `key`, pool it, and return its entry — or null if the

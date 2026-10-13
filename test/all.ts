@@ -5,7 +5,7 @@ import { join } from 'node:path';
 
 const here = import.meta.dir;
 const live = process.argv.includes('--live');
-const files = ['crypto.test.ts', 'chacha.test.ts', 'cng.test.ts', 'keypool.test.ts', 'record.test.ts', 'transport.test.ts', 'http1.test.ts', 'pool.test.ts', 'resumption.test.ts', 'cookie.test.ts', 'x509.test.ts', 'quic.test.ts', ...(live ? ['live.test.ts'] : [])];
+const files = ['crypto.test.ts', 'chacha.test.ts', 'cng.test.ts', 'keypool.test.ts', 'record.test.ts', 'transport.test.ts', 'http1.test.ts', 'pool.test.ts', 'timeouts.test.ts', 'resumption.test.ts', 'cookie.test.ts', 'x509.test.ts', 'quic.test.ts', ...(live ? ['live.test.ts'] : [])];
 let fail = 0;
 for (const f of files) {
 	const r = spawnSync('bun', [join(here, f)], { stdio: 'inherit' });

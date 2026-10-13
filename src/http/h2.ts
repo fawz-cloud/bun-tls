@@ -341,8 +341,27 @@ export class H2Connection {
 	/** Open a new stream for one request; resolves when that stream ends. Safe to call
 	 *  many times concurrently — the requests multiplex over the one connection. */
 	async request(req: H2Request, timeoutMs?: number): Promise<HttpResponse> {
+		// `timeoutMs` covers the wait for a free stream slot AND the stream itself.
+		const deadline = timeoutMs ? Date.now() + timeoutMs : 0;
 		// Respect the peer's SETTINGS_MAX_CONCURRENT_STREAMS: queue while at the limit.
-		while (!this.closed && this.streams.size >= this.peerMaxStreams) await new Promise<void>((r) => this.streamWaiters.push(r));
+		while (!this.closed && this.streams.size >= this.peerMaxStreams) {
+			if (deadline && Date.now() >= deadline) throw new Error('h2: request timed out waiting for a free stream');
+			await new Promise<void>((r) => {
+				const wake = () => {
+					clearTimeout(t);
+					r();
+				};
+				// on expiry leave the queue (so a later wake goes to someone still waiting) and recheck
+				const t = deadline
+					? setTimeout(() => {
+							const i = this.streamWaiters.indexOf(wake);
+							if (i >= 0) this.streamWaiters.splice(i, 1);
+							r();
+						}, deadline - Date.now())
+					: undefined;
+				this.streamWaiters.push(wake);
+			});
+		}
 		if (this.closed) throw new Error('h2: connection is closed');
 		const id = this.nextId;
 		this.nextId += 2;
@@ -368,7 +387,7 @@ export class H2Connection {
 			st.fail = rej;
 		});
 		// Per-stream deadline: cancel just this stream (RST_STREAM), not the shared connection.
-		if (timeoutMs) st.timer = setTimeout(() => this.cancelStream(id), timeoutMs);
+		if (deadline) st.timer = setTimeout(() => this.cancelStream(id), Math.max(0, deadline - Date.now()));
 		if (hasBody) void this.sendBody(id, st, req.body!);
 		return p;
 	}
