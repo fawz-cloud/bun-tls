@@ -196,5 +196,21 @@ assert.ok(ja3nSet.size >= 5, 'client fingerprints distinct (edge==chrome collaps
 	assert.equal(r.ja3Hash, '9225d95490794840d9d5f1f94d339285', 'capture replay reproduces the exact dart:io JA3');
 }
 
+// 14) fetch()-compatible API with a streaming body + fingerprint control.
+{
+	const { fetch } = await import('../src/http/fetchlike');
+	const fr = await fetch('https://example.com/');
+	assert.equal(fr.status, 200, 'fetch example.com 200');
+	assert.ok((await fr.text()).includes('Example Domain'), 'fetch body decoded');
+	const fj = await fetch('https://postman-echo.com/get?x=1', { persona: 'chrome' });
+	const jd = fj.status === 200 ? ((await fj.json()) as { args?: { x?: string }; headers?: Record<string,string> }) : {};
+	assert.equal(jd.args?.x, '1', 'fetch gzip+json decoded');
+	assert.ok((jd.headers?.['user-agent'] ?? '').includes('Chrome'), 'fetch persona UA applied');
+	const fs2 = await fetch('https://www.google.com/');
+	let bytes = 0; for await (const c of fs2.body as unknown as AsyncIterable<Uint8Array>) { bytes += c.length; if (bytes > 1000) break; }
+	assert.ok(bytes > 0, 'fetch body streams incrementally');
+	console.log(`fetch → example 200, persona json ok, stream ${bytes}+ bytes`);
+}
+
 console.log('live: OK');
 process.exit(0);
