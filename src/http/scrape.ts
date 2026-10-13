@@ -23,12 +23,31 @@ export interface ScrapeResult {
 	markdown: string;
 	links: { href: string; text: string }[];
 	images: { src: string; alt: string }[];
+	/** Cleaned HTML (script/style/boilerplate removed) — only when 'html' is requested. */
+	html?: string;
+	/** Records from a CSS `extract` schema — only when `extract` is given. */
+	extracted?: Record<string, string>[];
 }
 
+/** CSS-selector extraction (like crawl4ai's JsonCssExtractionStrategy): one record per
+ *  `baseSelector` match, each field read from a descendant selector (text, or an attribute). */
+export interface CssSchema {
+	baseSelector: string;
+	fields: { name: string; selector?: string; attr?: string }[];
+}
+
+export type Format = 'markdown' | 'readable' | 'html' | 'links' | 'json' | 'text';
+
 export interface ScrapeOptions extends Omit<FetchInit, 'method' | 'body'> {
-	/** What to produce: 'data' = structured only (cheapest); 'markdown'/'readable' add content
-	 *  (readable also drops nav/header/footer/aside); 'auto' (default) = everything. */
+	/** Firecrawl-style output selection. Default ['markdown']. 'json' = the structured data
+	 *  (jsonld/og/meta), 'html' = cleaned HTML, 'readable' = main-content Markdown. */
+	formats?: Format[];
+	/** Shorthand (back-compat): 'data'→['json'], 'markdown', 'readable', 'auto'→everything. */
 	as?: 'data' | 'markdown' | 'readable' | 'auto';
+	/** Drop nav/header/footer/aside in the Markdown/HTML (main content only). */
+	onlyMainContent?: boolean;
+	/** CSS-schema extraction → ScrapeResult.extracted. */
+	extract?: CssSchema;
 	/** Truncate the Markdown to this many characters (token budget). */
 	maxChars?: number;
 }
@@ -141,18 +160,57 @@ async function toMarkdown(html: string, readable: boolean): Promise<string> {
 		.trim();
 }
 
-/** Fetch a URL via bun-tls and return LLM-ready structured data + Markdown. */
+/** Cleaned HTML: boilerplate removed, noisy attributes (class, style, on-handlers, data-) stripped. */
+async function cleanHtml(html: string, readable: boolean): Promise<string> {
+	const rw = new HTMLRewriter()
+		.on(readable ? `${DROP},nav,aside` : DROP, { element: (e) => { e.remove(); } })
+		.on('*', { element: (e) => { for (const [k] of e.attributes) if (/^(class|style|on|data-)/i.test(k)) e.removeAttribute(k); } });
+	return (await rw.transform(new Response(html)).text()).replace(/\n{3,}/g, '\n\n').trim();
+}
+
+/** CSS-schema extraction: one record per baseSelector match; fields read as text or attr. */
+async function extractSchema(html: string, schema: CssSchema): Promise<Record<string, string>[]> {
+	const records: Record<string, string>[] = [];
+	let cur: Record<string, string> | null = null;
+	const rw = new HTMLRewriter().on(schema.baseSelector, {
+		element(e) {
+			cur = {};
+			records.push(cur);
+			e.onEndTag(() => { cur = null; });
+		}
+	});
+	for (const f of schema.fields) {
+		const sel = f.selector ? `${schema.baseSelector} ${f.selector}` : schema.baseSelector;
+		rw.on(sel, {
+			element(e) {
+				if (cur && f.attr) cur[f.name] = e.getAttribute(f.attr) ?? '';
+			},
+			text(t) {
+				if (cur && !f.attr) cur[f.name] = ((cur[f.name] ?? '') + t.text).trim();
+			}
+		});
+	}
+	await rw.transform(new Response(html)).arrayBuffer();
+	return records.map((r) => Object.fromEntries(Object.entries(r).map(([k, v]) => [k, decode(v).trim()])));
+}
+
+const AS_FORMATS: Record<string, Format[]> = { data: ['json'], markdown: ['markdown', 'json'], readable: ['readable', 'json'], auto: ['markdown', 'json', 'links'] };
+
+/** Fetch a URL via bun-tls and return LLM-ready output (Firecrawl-style `formats`). */
 export async function scrape(url: string, opts: ScrapeOptions = {}): Promise<ScrapeResult> {
-	const as = opts.as ?? 'auto';
+	const formats = new Set<Format>(opts.formats ?? AS_FORMATS[opts.as ?? 'auto']!);
+	const readable = opts.onlyMainContent ?? (opts.as === 'readable' || formats.has('readable'));
 	const r = await btFetch(url, { persona: opts.persona ?? 'chrome', http2: opts.http2, fingerprint: opts.fingerprint, proxy: opts.proxy, verify: opts.verify, tls12: opts.tls12, http3: opts.http3, headers: opts.headers, timeoutMs: opts.timeoutMs });
 	const html = await r.text();
-	const data = await extractData(html, url);
+	const data = await extractData(html, url); // structured data is cheap — always available
+
 	let markdown = '';
-	if (as === 'markdown' || as === 'readable' || as === 'auto') {
-		markdown = await toMarkdown(html, as === 'readable');
+	if (formats.has('markdown') || formats.has('readable') || formats.has('text')) {
+		markdown = await toMarkdown(html, readable);
 		if (opts.maxChars && markdown.length > opts.maxChars) markdown = markdown.slice(0, opts.maxChars) + '\n…[truncated]';
 	}
-	// fill anchor text into links for the top ones (cheap: from the markdown pass we skipped text;
-	// leave link.text empty — the href list is the useful part for crawl/LLM).
-	return { url, status: r.status, markdown, ...data };
+	const result: ScrapeResult = { url, status: r.status, markdown, ...data };
+	if (formats.has('html')) result.html = await cleanHtml(html, readable);
+	if (opts.extract) result.extracted = await extractSchema(html, opts.extract);
+	return result;
 }
