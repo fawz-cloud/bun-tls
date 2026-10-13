@@ -26,6 +26,8 @@ export type { H2Request, H2Profile } from './http/h2';
 export { publicSuffix, registrableDomain, isPublicSuffix } from './http/psl';
 export { tcpConnect, proxyConnect, socks5Connect } from './tls/transport';
 export type { Transport } from './tls/transport';
+export { connectWebSocket, BunTlsWebSocket } from './http/ws';
+export type { WsOptions, WsMessage } from './http/ws';
 export { fetch } from './http/fetchlike';
 export type { FetchInit } from './http/fetchlike';
 export { startProxy } from './proxy';

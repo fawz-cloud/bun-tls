@@ -212,5 +212,21 @@ assert.ok(ja3nSet.size >= 5, 'client fingerprints distinct (edge==chrome collaps
 	console.log(`fetch → example 200, persona json ok, stream ${bytes}+ bytes`);
 }
 
+// 15) WebSocket (RFC 6455) over the fingerprinted TLS channel.
+{
+	const { connectWebSocket } = await import('../src/http/ws');
+	const ws = await connectWebSocket('wss://echo.websocket.org/', { persona: 'chrome' });
+	ws.send('hello-bun-tls');
+	let echoed = false;
+	const guard = setTimeout(() => ws.close(), 6000);
+	for await (const m of ws.messages()) {
+		if (!m.binary && String(m.data).includes('hello-bun-tls')) { echoed = true; break; }
+	}
+	clearTimeout(guard);
+	ws.close();
+	assert.ok(echoed, 'WebSocket echoed our message back');
+	console.log(`websocket → echo ok, ja3=${ws.fp.ja3Hash}`);
+}
+
 console.log('live: OK');
 process.exit(0);
