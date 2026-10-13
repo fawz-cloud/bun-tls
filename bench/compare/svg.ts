@@ -35,10 +35,11 @@ const runs = (client: string, label: string): { ok: Run[]; total: number } => {
 	const all = res.results[client][label] as (Run | string)[];
 	return { ok: all.filter((x): x is Run => typeof x !== 'string'), total: all.length };
 };
-interface Row { client: string; v: number; lo: number; hi: number; note: string }
+interface Row { client: string; v: number; lo: number; hi: number; note: string; failed?: boolean }
 const rowsOf = (label: string, pick: (r: Run) => number): Row[] =>
 	CLIENTS.map((client) => {
 		const { ok, total } = runs(client, label);
+		if (ok.length === 0) return { client, v: NaN, lo: NaN, hi: NaN, note: `failed ${total}×`, failed: true };
 		const vals = ok.map(pick);
 		return { client, v: median(vals), lo: Math.min(...vals), hi: Math.max(...vals), note: ok.length < total ? `${ok.length}/${total} rounds` : '' };
 	});
@@ -58,12 +59,14 @@ interface Panel { title: string; note: string; rows: Row[]; fmt: (v: number) => 
 // One panel: title, note, five bars (median), thin line from fastest to slowest round.
 function panel(x: number, y: number, w: number, p: Panel): [string, number] {
 	const pad = 18, nameW = 104, rowH = 26, barH = 12, titleH = 46, axisH = 22;
-	const valW = Math.max(...p.rows.map((r) => (p.fmt(r.v).length + (r.note ? r.note.length + 1 : 0)) * 7.8)) + 10;
+	const valW = Math.max(...p.rows.map((r) => ((r.failed ? 0 : p.fmt(r.v).length) + (r.note ? r.note.length + 1 : 0)) * 7.8)) + 10;
 	const x0 = x + pad + nameW, x1 = x + w - pad - valW;
-	const max = niceMax(Math.max(...p.rows.map((r) => Math.max(r.v, r.hi))));
+	const finite = p.rows.flatMap((r) => (r.failed ? [] : [r.v, r.hi])); // ignore failed clients in the scale
+	const max = niceMax(Math.max(...finite, 1));
 	const sx = (v: number) => x0 + (v / max) * (x1 - x0);
 	const h = titleH + p.rows.length * rowH + axisH + pad;
-	const best = p.better ? (p.better === 'lower' ? Math.min : Math.max)(...p.rows.map((r) => r.v)) : NaN;
+	const okVals = p.rows.filter((r) => !r.failed).map((r) => r.v);
+	const best = p.better && okVals.length ? (p.better === 'lower' ? Math.min : Math.max)(...okVals) : NaN;
 	let s = `
 <rect x="${x}" y="${y}" width="${w}" height="${h}" rx="10" fill="${C.panel}" stroke="${C.line}"/>
 <text x="${x + pad}" y="${y + 26}" ${FS} font-size="14" font-weight="700" fill="${C.text}">${esc(p.title)}</text>
@@ -76,10 +79,15 @@ function panel(x: number, y: number, w: number, p: Panel): [string, number] {
 	p.rows.forEach((r, i) => {
 		const cy = top + i * rowH + rowH / 2;
 		const mine = r.client === 'bun-tls';
-		const isBest = r.v === best;
 		s += `
-<text x="${x0 - 12}" y="${cy + 4.5}" ${FS} font-size="13" fill="${mine ? C.text : C.dim}" text-anchor="end">${esc(r.client)}</text>
-<rect x="${x0}" y="${cy - barH / 2}" width="${Math.max(2, sx(r.v) - x0)}" height="${barH}" rx="3" fill="${mine ? C.accent : C.bar}"/>`;
+<text x="${x0 - 12}" y="${cy + 4.5}" ${FS} font-size="13" fill="${mine ? C.text : C.dim}" text-anchor="end">${esc(r.client)}</text>`;
+		if (r.failed) {
+			// No bar; a muted "failed N×" label at the axis start.
+			s += `<text x="${x0}" y="${cy + 4.5}" ${FM} font-size="13" fill="${C.faint}">${esc(r.note)}</text>`;
+			return;
+		}
+		const isBest = r.v === best;
+		s += `<rect x="${x0}" y="${cy - barH / 2}" width="${Math.max(2, sx(r.v) - x0)}" height="${barH}" rx="3" fill="${mine ? C.accent : C.bar}"/>`;
 		if (r.hi > r.lo)
 			s += `<path d="M${sx(r.lo)} ${cy}H${sx(r.hi)}M${sx(r.lo)} ${cy - 4}V${cy + 4}M${sx(r.hi)} ${cy - 4}V${cy + 4}" stroke="${C.text}" stroke-opacity="0.45" stroke-width="1.25" fill="none"/>`;
 		const vx = sx(Math.max(r.v, r.hi)) + 7;
