@@ -10,6 +10,7 @@ export { clients, JA3 } from './fp/clients';
 export { personas, resolvePersona, randomPersona, personaHeaders } from './fp/personas';
 export type { Persona } from './fp/personas';
 export { fromJa3, DEFAULT_SIGALGS } from './fp/ja3';
+export { fromClientHello } from './fp/capture';
 export type { FromJa3Opts } from './fp/ja3';
 export type { Fingerprint } from './tls/clienthello';
 export { buildClientHello, ja3FromClientHello, ja4FromClientHello } from './tls/clienthello';

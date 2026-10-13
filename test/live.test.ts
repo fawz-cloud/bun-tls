@@ -8,6 +8,9 @@ import { fromJa3 } from '../src/fp/ja3';
 import { dart, tls12 } from '../src/fp/fingerprints';
 import { clients } from '../src/fp/clients';
 import { verifyOcsp, fetchOcsp } from '../src/tls/ocsp';
+import { fromClientHello } from '../src/fp/capture';
+import { buildClientHello } from '../src/tls/clienthello';
+import { hex } from '../src/core/bytes';
 import crypto from 'node:crypto';
 
 // 1) example.com → 200 + body, cert verified (default)
@@ -180,6 +183,17 @@ assert.ok(ja3nSet.size >= 5, 'client fingerprints distinct (edge==chrome collaps
 	const akamai = ff.json<{ http2?: { akamai_fingerprint?: string } }>().http2?.akamai_fingerprint ?? '';
 	console.log('persona firefox akamai h2 =', akamai);
 	assert.ok(akamai.startsWith('1:65536;4:131072;5:16384'), 'firefox persona sends the Firefox h2 fingerprint, not Chrome');
+}
+
+// 13) Byte-exact capture replay: parse a ClientHello back into a Fingerprint and reproduce
+//     it. The replayed JA3 must equal both what the server echoes and the captured value.
+{
+	const ch = buildClientHello(dart(), 'tls.peet.ws'); // stand-in for a real captured CH
+	const fp = fromClientHello(hex(ch.bytes)); // accepts a hex string or raw bytes
+	const r = await request({ url: 'https://tls.peet.ws/api/clean', fingerprint: fp, timeoutMs: 20000 });
+	console.log(`capture replay → ja3=${r.ja3Hash}`);
+	assert.equal(r.json<{ ja3_hash?: string }>().ja3_hash, r.ja3Hash, 'replayed CH JA3 == what the server sees (byte-exact)');
+	assert.equal(r.ja3Hash, '9225d95490794840d9d5f1f94d339285', 'capture replay reproduces the exact dart:io JA3');
 }
 
 console.log('live: OK');

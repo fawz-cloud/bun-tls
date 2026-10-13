@@ -259,6 +259,23 @@ Extension builders (`import { ext } from './src'`), each `ext.<name>()`:
 `applicationSettings(protocols=['h2'], newCodepoint=false)`, `encryptedClientHelloGrease`,
 `delegatedCredentials(algs)`, `grease(type, body?)`.
 
+### 4. From a captured ClientHello — `fromClientHello`
+
+```ts
+import { fromClientHello } from './src';
+// hex copied from Wireshark / tcpdump / a proxy (the handshake message or the TLS record)
+const fp = fromClientHello('160301020001...');   // or a Uint8Array
+await request({ url, fingerprint: fp });
+```
+
+Unlike `fromJa3` (which is lossy — a JA3 drops extension order and every extension body),
+`fromClientHello` reproduces the capture **byte-for-byte**: the exact cipher list, extension
+order, and each extension's raw bytes, so the JA3 / JA3N / JA4 match the capture exactly.
+Capture a real client once, replay it forever. The inherently per-connection fields are
+regenerated (as every real client also varies them): client random, session_id, and the
+key_share public keys — none are in JA3/JA4. `server_name` is rewritten to the request's host,
+and session-specific extensions (`pre_shared_key`, `early_data`) are dropped.
+
 ---
 
 ## Personas
@@ -529,6 +546,7 @@ Everything below is re-exported from `./src` (`index.ts`):
 | `personas`, `resolvePersona`, `randomPersona`, `personaHeaders` | const/fn | coherent browser personas |
 | `presets`, `modern`, `dart`, `chrome131`, `firefox148`, `tls12` | fn | raw `Fingerprint` presets |
 | `fromJa3`, `DEFAULT_SIGALGS` | fn/const | build a fingerprint from a JA3 |
+| `fromClientHello` | fn | byte-exact replay from a captured ClientHello |
 | `buildClientHello`, `ja3FromClientHello`, `ja4FromClientHello` | fn | assemble / inspect a ClientHello |
 | `TlsClient`, `Tls12Client`, `TlsConn` | class/type | handshake state machines |
 | `verifyOcsp`, `fetchOcsp`, `ocspUrl`, `checkRevocation` | fn | OCSP |

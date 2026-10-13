@@ -42,6 +42,7 @@ via a patched libcurl (C); we do it in TS.
 | `fp/clients.ts` | named registry: `clients.{chrome,edge,firefox,dart,safari,okhttp}` |
 | `fp/personas.ts` | coherent personas (TLS + h2 + header order + UA per browser) |
 | `fp/ja3.ts` | `fromJa3(string)` → Fingerprint (impersonate from a JA3) |
+| `fp/capture.ts` | `fromClientHello` — byte-exact replay from a captured ClientHello |
 | `http/http1.ts` | HTTP/1.1 serialize/parse + gzip/deflate/br/zstd |
 | `http/h2.ts` | HTTP/2: frames + HPACK + flow control + multiplexed `H2Connection` |
 | `http/psl.ts` | Public Suffix List lookup (cookie supercookie guard) |
