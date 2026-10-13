@@ -103,17 +103,20 @@ rounds. Windows 11, i5-14450HX, Bun 1.4.3, curl_cffi 0.15.0, impers 0.1.2, utls 
 |---|---|---|---|---|---|
 | latency, new connection | **4.59 ms** | 5.65 | 5.28 | 5.09 | 5.48 |
 | latency, reused connection | **0.07 ms** | 0.28 | 0.19 | 0.24 | 0.10 |
-| throughput, 10 concurrent | **31,331 req/s** | 2,779 | 4,410 | 4,383 | 30,586 |
+| throughput, 10 concurrent | 31,331 req/s | 2,779 | 4,410 | 4,383 | 30,586 |
 | throughput, 100 concurrent | **16,022 req/s** | 2,834 | 6,234 | 4,300 | fail |
 | upload 10 MiB | 415 MB/s | 1,053 | 1,065 | **1,213** | 1,091 |
 | download 10 MiB | **501 MB/s** | 407 | 448 | 250 | 263 |
-| remote, new connection | **83.8 ms** | 90.8 | 85.1 | 94.6 | 107.7 |
-| remote, reused connection | 30.6 ms | **25.1** | 33.3 | 30.2 | 29.8 |
+| remote, new connection | 83.8 ms | 90.8 | 85.1 | 94.6 | 107.7 |
+| remote, reused connection | 30.6 ms | 25.1 | 33.3 | 30.2 | 29.8 |
 
-go-utls reaches its throughput on 3.6 cores, bun-tls on ~1.5. Upload is the row where bun-tls
-trails: its rounds were 1,007, 335 and 415 MB/s (a dedicated `bench/crypto/ab.ts` run gives
-~1,165 MB/s), and the cost is the socket write path rather than the crypto (1.04 ms CPU/MB vs
-curl_cffi's 0.77). Remote rows are round-trip-bound. CPU and memory tables:
+At 10 concurrent, bun-tls and go-utls are level: bun-tls is 2.4% ahead, which is inside the
+run-to-run spread. go-utls gets there on 3.6 cores, bun-tls on ~1.5. Upload is the row where
+bun-tls trails: its rounds were 1,007, 335 and 415 MB/s (a dedicated `bench/crypto/ab.ts` run
+gives ~1,165 MB/s), and the cost is the socket write path rather than the crypto (1.04 ms
+CPU/MB vs curl_cffi's 0.77). The remote rows have no winner. They are bound by round-trip time,
+and each client's spread between rounds is wider than the gaps between clients: impers (node)
+measured 31.1, 22.8 and 25.1 ms on reused connections. CPU and memory tables:
 [bench/compare/out.md](bench/compare/out.md). Run the scripts on your own machine.
 
 ## How it compares
