@@ -390,10 +390,10 @@ export class TlsClient {
 	 *  encrypt batch k+1 — overlaps CPU with I/O and paces to backpressure. */
 	async writeAppStream(data: Uint8Array): Promise<void> {
 		if (!this.appMode) throw new Error('handshake not finished');
-		const BATCH = 16383 * 16; // ~256 KB of plaintext per flush
+		const BATCH = 16383 * 16; // ~256 KB of plaintext per flush (16 records sealed in parallel)
 		for (let off = 0; off < data.length; off += BATCH) {
 			const chunk = data.subarray(off, off + BATCH);
-			await this.t.writeAsync(this.appWrite.encryptMany(ContentType.applicationData, chunk, 16384 - 1));
+			await this.t.writeAsync(await this.appWrite.encryptManyAsync(ContentType.applicationData, chunk, 16384 - 1));
 		}
 	}
 
@@ -404,7 +404,7 @@ export class TlsClient {
 			const rec = await this.pullRecord();
 			if (rec === null) return null;
 			if (rec.type === ContentType.changeCipherSpec) continue;
-			const d = this.appRead.decrypt(rec);
+			const d = this.appRead.hasAsync ? await this.appRead.decryptAsync(rec) : this.appRead.decrypt(rec);
 			if (d.innerType === ContentType.applicationData) return d.content;
 			if (d.innerType === ContentType.alert) {
 				if (d.content[1] === 0) return null; // close_notify

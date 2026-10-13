@@ -75,17 +75,66 @@ export class AeadDir {
 		return out;
 	}
 
+	/** True when the cipher has a native async path (ChaCha20 on Bun). The bulk record paths
+	 *  (writeAppStream upload, readApp download) switch to the *Async methods then. */
+	get hasAsync(): boolean {
+		return !!this.aead.sealAsync;
+	}
+
+	/** Async form of encryptMany: fragment `data`, derive each record's nonce+header in order,
+	 *  then seal every fragment in PARALLEL via the native AEAD and assemble one buffer. One
+	 *  socket write for the caller, and the native crypto runs off-thread at ~1 GB/s. */
+	async encryptManyAsync(innerType: number, data: Uint8Array, maxFrag: number): Promise<Uint8Array> {
+		if (!this.aead.sealAsync) return this.encryptMany(innerType, data, maxFrag);
+		const type = Uint8Array.of(innerType);
+		const jobs: Promise<Uint8Array>[] = [];
+		const headers: Uint8Array[] = [];
+		for (let p = 0; p < data.length; p += maxFrag) {
+			const frag = data.subarray(p, p + maxFrag);
+			const len = frag.length + 1 + 16; // + type byte + tag
+			const header = Uint8Array.of(ContentType.applicationData, TLS12 >> 8, TLS12 & 0xff, (len >> 8) & 0xff, len & 0xff);
+			headers.push(header);
+			jobs.push(this.aead.sealAsync(aeadNonce(this.iv, this.seq++), header, concat(frag, type)));
+		}
+		const cts = await Promise.all(jobs);
+		let total = 0;
+		for (const ct of cts) total += 5 + ct.length;
+		const out = new Uint8Array(total);
+		let off = 0;
+		for (let i = 0; i < cts.length; i++) {
+			out.set(headers[i]!, off);
+			out.set(cts[i]!, off + 5);
+			off += 5 + cts[i]!.length;
+		}
+		return out;
+	}
+
 	/** Open a TLSCiphertext → { innerType, content } (trailing zero padding removed). */
 	decrypt(rec: Record): { innerType: number; content: Uint8Array } {
-		const len = rec.fragment.length;
-		const header = Uint8Array.of(rec.type, TLS12 >> 8, TLS12 & 0xff, (len >> 8) & 0xff, len & 0xff);
-		const inner = this.aead.open(aeadNonce(this.iv, this.seq), header, rec.fragment);
+		const inner = this.aead.open(aeadNonce(this.iv, this.seq), this.aad(rec), rec.fragment);
 		this.seq++;
-		let end = inner.length - 1;
-		while (end >= 0 && inner[end] === 0) end--; // strip zero padding
-		if (end < 0) throw new Error('empty record after unpadding');
-		return { innerType: inner[end]!, content: inner.subarray(0, end) };
+		return unpad(inner);
 	}
+
+	/** Async form of decrypt (native AEAD). Used on the download hot path in readApp. */
+	async decryptAsync(rec: Record): Promise<{ innerType: number; content: Uint8Array }> {
+		if (!this.aead.openAsync) return this.decrypt(rec);
+		const inner = await this.aead.openAsync(aeadNonce(this.iv, this.seq), this.aad(rec), rec.fragment);
+		this.seq++;
+		return unpad(inner);
+	}
+
+	private aad(rec: Record): Uint8Array {
+		const len = rec.fragment.length;
+		return Uint8Array.of(rec.type, TLS12 >> 8, TLS12 & 0xff, (len >> 8) & 0xff, len & 0xff);
+	}
+}
+
+function unpad(inner: Uint8Array): { innerType: number; content: Uint8Array } {
+	let end = inner.length - 1;
+	while (end >= 0 && inner[end] === 0) end--; // strip zero padding
+	if (end < 0) throw new Error('empty record after unpadding');
+	return { innerType: inner[end]!, content: inner.subarray(0, end) };
 }
 
 /** TLSPlaintext (for ClientHello, before keys exist). */

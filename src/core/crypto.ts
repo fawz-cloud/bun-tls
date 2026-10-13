@@ -187,6 +187,13 @@ export type Aead = {
 	 *  ciphertext then tag, returning the new offset. Avoids building a joined input
 	 *  and a separate output per record. */
 	sealParts?: (nonce: Uint8Array, aad: Uint8Array, parts: Uint8Array[], out: Uint8Array, off: number) => number;
+	/** Optional async path for ciphers with no fast synchronous implementation (ChaCha20 on
+	 *  Bun, which exposes it only through async WebCrypto). When present, the bulk record
+	 *  paths (writeAppStream, readApp) use it — sealing many records with Promise.all runs
+	 *  them on the native crypto threads at ~100× the pure-TS speed. seal/open stay for the
+	 *  small, latency-sensitive handshake records. Output/input identical to seal/open. */
+	sealAsync?: (nonce: Uint8Array, aad: Uint8Array, pt: Uint8Array) => Promise<Uint8Array>;
+	openAsync?: (nonce: Uint8Array, aad: Uint8Array, ct: Uint8Array) => Promise<Uint8Array>;
 	keyLen: number;
 };
 
