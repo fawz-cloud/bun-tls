@@ -26,5 +26,7 @@ export type { H2Request, H2Profile } from './http/h2';
 export { publicSuffix, registrableDomain, isPublicSuffix } from './http/psl';
 export { tcpConnect, proxyConnect, socks5Connect } from './tls/transport';
 export type { Transport } from './tls/transport';
+export { startProxy } from './proxy';
+export type { ProxyOptions } from './proxy';
 export * as ext from './tls/extensions';
 export * as consts from './core/consts';

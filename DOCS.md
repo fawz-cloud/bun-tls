@@ -465,6 +465,33 @@ await request({ url, proxy: 'socks5://user:pass@host:1080' }); // SOCKS5 (RFC 19
 The proxy only tunnels bytes; the TLS handshake (and thus the fingerprint) is still ours,
 end to end to the origin.
 
+## Fingerprint proxy (any tool, any language)
+
+Run bun-tls as a local proxy so a tool in any language can borrow a persona by pointing its
+`HTTP_PROXY` at it — bun-tls makes the real HTTPS request with the persona's fingerprint and
+returns the response.
+
+```bash
+bun src/cli.ts proxy --port 8888 --persona chrome      # or --persona firefox, --no-verify
+
+HTTP_PROXY=http://127.0.0.1:8888 curl http://example.com/   # upgraded to https upstream
+curl 'http://127.0.0.1:8888/https://example.com/'           # or target in the path
+curl -H 'x-bt-url: https://example.com/' http://127.0.0.1:8888
+```
+
+The persona owns the identity headers (User-Agent, `Accept*`, `sec-*`), so the tool's own
+`User-Agent: curl/…` never leaks over the browser TLS fingerprint — the request is coherent
+end to end. App headers (authorization, cookie, content-type, custom `x-*`) are forwarded.
+
+```ts
+import { startProxy } from './src';
+const server = startProxy({ port: 8888, persona: 'chrome' }); // → Bun server; server.stop() to close
+```
+
+TLS is end to end, so this cannot *transparently* re-fingerprint a client's own HTTPS (that
+would need a MITM certificate authority the client trusts). Instead the tool requests the
+target through the proxy and bun-tls originates the HTTPS itself.
+
 ---
 
 ## Cookies
@@ -553,6 +580,7 @@ Everything below is re-exported from `./src` (`index.ts`):
 | `h2Request`, `H2Connection`, `CHROME_H2`, `FIREFOX_H2`, `SAFARI_H2` | fn/class/const | HTTP/2 + per-browser h2 profiles |
 | `publicSuffix`, `registrableDomain`, `isPublicSuffix` | fn | Public Suffix List |
 | `tcpConnect`, `proxyConnect`, `socks5Connect`, `Transport` | fn/type | transport |
+| `startProxy` | fn | local fingerprint proxy (use any tool via `HTTP_PROXY`) |
 | `ext` | namespace | extension builders |
 | `consts` | namespace | IANA numbers (below) |
 

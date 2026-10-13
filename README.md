@@ -72,6 +72,9 @@ s.close();
 - **Certificate verification** on by default (CA-constrained chain, hostname + IP SANs,
   path-building); optional **OCSP** revocation (stapling + AIA fetch); cookie jar with
   Public Suffix List; HTTP and SOCKS5 proxies; gzip / deflate / br / zstd.
+- **Fingerprint proxy** — `bun src/cli.ts proxy --persona chrome`, then point any tool's
+  `HTTP_PROXY` at it to borrow the persona from any language (the tool's own User-Agent never
+  leaks over the browser TLS). ([details](DOCS.md#fingerprint-proxy-any-tool-any-language))
 
 **No additional native dependency** — a TypeScript source tree on Bun. From-scratch TLS,
 **not audited**.
