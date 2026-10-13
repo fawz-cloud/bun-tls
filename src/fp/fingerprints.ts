@@ -5,10 +5,21 @@ import { Cipher, Cipher12, Group, SigAlg } from '../core/consts';
 import type { Fingerprint } from '../tls/clienthello';
 import * as E from '../tls/extensions';
 
-/** Clean modern TLS 1.3 (no GREASE) — meant to "just work like curl", not to
- *  impersonate anyone. Good enough for 200s against normal servers + JA3 echo. */
+/** Clean modern TLS 1.3 + 1.2 (no GREASE) — meant to "just work like curl", not to
+ *  impersonate anyone. The 1.2 suites are ECDHE + AEAD only, so a TLS 1.2-only server is
+ *  answered in 1.2 instead of failing the handshake. */
 export const modern = (): Fingerprint => ({
-	ciphers: [Cipher.TLS_AES_128_GCM_SHA256, Cipher.TLS_AES_256_GCM_SHA384, Cipher.TLS_CHACHA20_POLY1305_SHA256],
+	ciphers: [
+		Cipher.TLS_AES_128_GCM_SHA256,
+		Cipher.TLS_AES_256_GCM_SHA384,
+		Cipher.TLS_CHACHA20_POLY1305_SHA256,
+		Cipher12.ECDHE_ECDSA_AES128_GCM_SHA256,
+		Cipher12.ECDHE_RSA_AES128_GCM_SHA256,
+		Cipher12.ECDHE_ECDSA_AES256_GCM_SHA384,
+		Cipher12.ECDHE_RSA_AES256_GCM_SHA384,
+		Cipher12.ECDHE_ECDSA_CHACHA20_POLY1305,
+		Cipher12.ECDHE_RSA_CHACHA20_POLY1305
+	],
 	keyShareGroups: [Group.x25519],
 	extensions: [
 		E.serverName(),
@@ -40,9 +51,9 @@ export const modern = (): Fingerprint => ({
 //   ja3  = 771,4867-4865-4866-52393-52392-49195-49199-49196-49200-49161-49171-49162-49172-156-157-47-53,0-23-65281-10-11-35-13-51-45-43,29-23-24,0
 //   ja3_hash = 9225d95490794840d9d5f1f94d339285
 //   ja4  = t13d1710_5b57614c22b0_78e6aca7449b
-// No ALPN, no GREASE, no status_request/compress_cert. Cipher list includes
-// TLS 1.2 suites as fingerprint filler — we only speak 1.3, and supported_versions
-// = TLS 1.3 makes the server pick a 1.3 suite anyway. The sigalg ORDER matters (JA4_c).
+// No ALPN, no GREASE, no status_request/compress_cert. Cipher list includes TLS 1.2
+// suites: a 1.2-only server is answered in 1.2 (ECDHE + AEAD ones); the CBC / static-RSA
+// ones stay fingerprint filler we never negotiate. The sigalg ORDER matters (JA4_c).
 export const dart = (): Fingerprint => ({
 	ciphers: [
 		0x1303, 0x1301, 0x1302, // TLS 1.3: chacha, aes128-gcm, aes256-gcm
@@ -73,7 +84,7 @@ export const dart = (): Fingerprint => ({
 		]),
 		E.keyShare(),
 		E.pskKeyExchangeModes([1]),
-		E.supportedVersions() // [TLS13] — values aren't in JA3/JA4, only ext presence
+		E.supportedVersions() // 1.3 + 1.2 like dart:io (BoringSSL); values aren't in JA3/JA4, only ext presence
 	]
 });
 

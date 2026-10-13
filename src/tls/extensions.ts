@@ -3,7 +3,7 @@
 // reordering an extension = edit the array; the assembler never changes.
 import crypto from 'node:crypto';
 import { Writer } from '../core/bytes';
-import { Ext, TLS13 } from '../core/consts';
+import { Ext, TLS12, TLS13 } from '../core/consts';
 
 /** Dynamic context at assembly time (host + freshly generated key_share). */
 export interface ExtCtx {
@@ -58,7 +58,9 @@ export const alpn = (protocols: string[]): Extension => ({
 });
 
 /** supported_versions, ClientHello variant: list prefixed by 1 byte. */
-export const supportedVersions = (versions = [TLS13]): Extension => ({
+/** supported_versions — TLS 1.3 and 1.2 by default, as every browser and BoringSSL client offers
+ *  (1.3-only would make a 1.2-only server that parses this extension answer protocol_version). */
+export const supportedVersions = (versions = [TLS13, TLS12]): Extension => ({
 	type: Ext.supported_versions,
 	body: (ctx) =>
 		new Writer()

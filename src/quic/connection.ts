@@ -5,7 +5,7 @@
 import crypto from 'node:crypto';
 import { lookup } from 'node:dns/promises';
 import { Reader, concat, hex } from '../core/bytes';
-import { Cipher, Group, SigAlg, HandshakeType, Ext } from '../core/consts';
+import { Cipher, Group, SigAlg, HandshakeType, Ext, TLS13 } from '../core/consts';
 import {
 	deriveHandshake,
 	appSecrets,
@@ -24,6 +24,14 @@ import { writeVarint } from './varint';
 import { initialKeys, packetKeys, type PacketKeys } from './crypto';
 import { buildPacket, parsePacket, buildShort, parseShort, PKT, longPacketType, longPacketEnd } from './packet';
 import { parseFrames, cryptoFrame, PnRanges, Reassembler, type Frame } from './frames';
+
+/** The peer's CONNECTION_CLOSE as an Error. Codes 0x100–0x1ff carry a TLS alert (RFC 9001
+ *  §20.1); a handshake_failure there usually means the host does not offer HTTP/3 at all. */
+function closeError(code: number, reason: string): Error {
+	const alert = code >= 0x100 && code < 0x200 ? code - 0x100 : -1;
+	const hint = alert === 40 ? ' — the server refused the handshake; check that this host offers HTTP/3 (alt-svc: h3)' : '';
+	return new Error(`QUIC CONNECTION_CLOSE code=${code}${alert >= 0 ? ` (TLS alert ${alert})` : ''}${reason ? ': ' + reason : ''}${hint}`);
+}
 
 /** Flow-control credit we grant the peer (also our transport parameters): per request stream,
  *  and for the whole connection. h3.ts extends both as it consumes the response. */
@@ -135,7 +143,7 @@ export class QuicConnection {
 				E.supportedGroups([Group.x25519, Group.secp256r1, Group.secp384r1]),
 				E.ecPointFormats([0]),
 				E.signatureAlgorithms([SigAlg.ecdsa_secp256r1_sha256, SigAlg.rsa_pss_rsae_sha256, SigAlg.rsa_pkcs1_sha256, SigAlg.ecdsa_secp384r1_sha384, SigAlg.rsa_pss_rsae_sha384]),
-				E.supportedVersions(),
+				E.supportedVersions([TLS13]), // QUIC is TLS 1.3 only (RFC 9001 §4.2)
 				E.pskKeyExchangeModes([1]),
 				E.keyShare(),
 				E.alpn(['h3']),
@@ -240,7 +248,7 @@ export class QuicConnection {
 	private onFrame(sp: Space, f: Frame): void {
 		if (f.type === 'crypto') this.cryptoBuf[sp].push(f.offset, f.data);
 		else if (f.type === 'handshake_done') this.handshakeDone = true;
-		else if (f.type === 'close') this.closeError ??= new Error(`QUIC CONNECTION_CLOSE code=${f.code} ${f.reason}`);
+		else if (f.type === 'close') this.closeError ??= closeError(f.code, f.reason);
 	}
 
 	/** Contiguous CRYPTO bytes available from `consumed` onward in a space. */
@@ -362,7 +370,7 @@ export class QuicConnection {
 		if (!this.recv.app.add(p.pn)) return; // a duplicate (the peer resent it): already processed
 		for (const f of parseFrames(p.payload)) {
 			if (f.type === 'handshake_done') this.handshakeDone = true;
-			else if (f.type === 'close') this.closeError ??= new Error(`QUIC CONNECTION_CLOSE code=${f.code} ${f.reason}`);
+			else if (f.type === 'close') this.closeError ??= closeError(f.code, f.reason);
 			else this.app1rttFrames.push(f);
 		}
 	}

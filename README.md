@@ -64,7 +64,8 @@ s.close();
   presets whose JA3/JA3N match published Chrome 131 / Firefox 148 / dart:io, `fromJa3()` for
   a JA3 string, and **`fromClientHello()` to replay a captured ClientHello byte-for-byte**
   (exact extension order + bodies, not just the JA3) — capture a real client once, replay it.
-- **TLS 1.3** (default) and **TLS 1.2** (`tls12: true`, ECDHE + AEAD) — keep-alive, 1-RTT
+- **TLS 1.3** (default) and **TLS 1.2** (ECDHE + AEAD; a 1.2-only server is answered in 1.2
+  automatically, as browsers do, with downgrade protection) — keep-alive, 1-RTT
   resumption, opt-in 0-RTT, HelloRetryRequest, KeyUpdate, X25519 / P-256 / P-384 and the
   post-quantum **X25519MLKEM768** hybrid, RFC 8879 cert decompression, optional mTLS.
 - **HTTP/1.1 and HTTP/2** — h2 with HPACK, flow control, Chrome's h2 fingerprint, and

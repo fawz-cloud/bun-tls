@@ -87,7 +87,7 @@ One request over one fresh connection (`Connection: close`). For connection reus
 | `persona` | `string \| Persona` | — | coherent browser identity (TLS + h2 + headers), see [Personas](#personas) |
 | `verify` | `boolean` | `true` | `false` skips certificate verification (like curl `-k`) |
 | `ocsp` | `'off' \| 'soft' \| 'hard'` | `'off'` | revocation check, see [OCSP](#certificate-verification--ocsp) |
-| `tls12` | `boolean` | `false` | speak TLS 1.2 instead of 1.3 |
+| `tls12` | `boolean` | `false` | send a 1.2-only ClientHello (the default one falls back to 1.2 by itself) |
 | `http2` | `boolean` | `false` | negotiate ALPN h2 (falls back to h1) |
 | `proxy` | `string` | — | `http://…` or `socks5://…`, see [Proxies](#proxies) |
 | `timeoutMs` | `number` | — | total timeout; closes the socket on expiry |
@@ -405,10 +405,14 @@ ClientHello. See [Scope](#scope--caveats).
 
 - **TLS 1.3** (RFC 8446) by default. Full handshake, hand-written on a raw `Bun.connect`
   socket.
-- **TLS 1.2** (RFC 5246) opt-in with `tls12: true` — ECDHE + AEAD only (AES-GCM,
-  ChaCha20-Poly1305), extended master secret (RFC 7627), ServerKeyExchange-signature
-  verification. No CBC, no static-RSA key exchange. Use the `tls12()` preset (default when
-  `tls12: true` and no fingerprint is given), or any 1.2 fingerprint.
+- **TLS 1.2** (RFC 5246): ECDHE + AEAD only (AES-GCM, ChaCha20-Poly1305), extended master
+  secret (RFC 7627), ServerKeyExchange-signature verification. No CBC, no static-RSA key
+  exchange.
+  - The default ClientHello offers 1.3 and 1.2, as every browser does. A 1.2-only server
+    answers in 1.2 and the handshake finishes as 1.2 on the same connection.
+  - If the server random carries the RFC 8446 downgrade marker, the handshake aborts.
+  - `tls12: true` sends a dedicated 1.2-only ClientHello instead. It uses the `tls12()` preset
+    unless a fingerprint is given.
 
 ### Key exchange
 

@@ -4,7 +4,7 @@
 // client Finished → app keys. Then writeApp/readApp use the app traffic keys.
 // Certificate verification is on by default (verify.ts); pass verify:false to skip.
 import { Reader, Writer, concat, hex } from '../core/bytes';
-import { Cipher, ContentType, HandshakeType, Ext, Group } from '../core/consts';
+import { Cipher, ContentType, HandshakeType, Ext, Group, TLS12, TLS13 } from '../core/consts';
 import {
 	Aead,
 	aesGcm,
@@ -27,7 +27,7 @@ import {
 } from '../core/crypto';
 import { takeEcShare, takeMlkem768 } from '../core/keypool';
 import { chacha20Poly1305 } from '../core/chacha';
-import type { Fingerprint, ResumeSpec } from './clienthello';
+import type { BuiltHello, Fingerprint, ResumeSpec } from './clienthello';
 import { buildClientHello } from './clienthello';
 import { AeadDir, plaintextRecord, RecordReader } from './record';
 import type { Transport } from './transport';
@@ -52,6 +52,23 @@ const SUITES: Record<number, Suite> = {
 
 /** HelloRetryRequest reuses this fixed SH.random (RFC 8446 §4.1.3). */
 const HRR_RANDOM = 'cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c';
+/** Last 8 bytes of a TLS 1.3-capable server's random when it negotiates TLS 1.2 (RFC 8446 §4.1.3). */
+const DOWNGRADE_TLS12 = Buffer.from('444f574e47524401', 'hex'); // "DOWNGRD\x01"
+
+/** Where a TLS 1.3 ClientHello was answered with a TLS 1.2 ServerHello: the hello we sent, the
+ *  ServerHello message, and whatever already arrived after it. openConnection catches this and
+ *  finishes the handshake as TLS 1.2 on the same connection (Tls12Client continueFrom). */
+export interface Tls12Continuation {
+	ch: BuiltHello;
+	sh: Uint8Array;
+	rr: RecordReader;
+	hsbuf: Uint8Array;
+}
+export class Negotiated12 extends Error {
+	constructor(readonly state: Tls12Continuation) {
+		super('server negotiated TLS 1.2 (finish with Tls12Client continueFrom)');
+	}
+}
 
 export interface TlsOptions {
 	host: string;
@@ -234,6 +251,16 @@ export class TlsClient {
 		let sh = await this.nextHandshakeMsg(false);
 		if (!sh || sh.type !== HandshakeType.serverHello) throw new Error('expected ServerHello, got type ' + sh?.type);
 		let server = parseServerHello(sh.body);
+		if (server.version === TLS12) {
+			// A TLS 1.2-only server: legal, since we offer 1.2 as every browser does. RFC 8446
+			// §4.1.3: a 1.3-capable server answering with 1.2 marks its random, so seeing the mark
+			// means someone stripped 1.3 out of the handshake — abort rather than downgrade.
+			if (Buffer.from(server.random.subarray(24)).equals(DOWNGRADE_TLS12)) throw new Error('TLS downgrade detected: a TLS 1.3 server answered with TLS 1.2');
+			if (sentEarly) throw new Error('server answered 0-RTT early data with TLS 1.2');
+			hybrid?.mlkem.destroy?.();
+			throw new Negotiated12({ ch, sh: sh.raw, rr: this.rr, hsbuf: this.hsbuf });
+		}
+		if (server.version !== TLS13) throw new Error('server negotiated an unsupported TLS version 0x' + server.version.toString(16));
 		if (server.isHRR) {
 			const retry = await this.doHelloRetry(ch, sh, server, resume);
 			ch = retry.ch;
@@ -241,6 +268,7 @@ export class TlsClient {
 			server = retry.server;
 			sentEarly = false; // early data (if any was sent) is dropped across a retry
 			earlyWrite = null;
+			if (server.version !== TLS13) throw new Error('server answered a HelloRetryRequest round with TLS 0x' + server.version.toString(16));
 		}
 		this.suite = SUITES[server.cipher] ?? (() => { throw new Error('unsupported cipher: 0x' + server.cipher.toString(16)); })();
 		this.thash = crypto.createHash(this.suite.hash); // the suite fixes the transcript hash
@@ -554,6 +582,8 @@ function timingEqual(a: Uint8Array, b: Uint8Array): boolean {
 }
 
 interface ParsedSH {
+	version: number; // negotiated: supported_versions when present (TLS 1.3), else legacy_version
+	random: Uint8Array;
 	cipher: number;
 	isHRR: boolean;
 	keyShare: { group: number; pub: Uint8Array } | null;
@@ -562,7 +592,7 @@ interface ParsedSH {
 	cookie?: Uint8Array; // HRR: to echo in the next ClientHello
 }
 function parseServerHello(r: Reader): ParsedSH {
-	r.u16(); // legacy_version
+	let version = r.u16(); // legacy_version (the real version for TLS ≤ 1.2)
 	const random = r.bytes(32);
 	r.block(1); // session_id echo
 	const cipher = r.u16();
@@ -572,11 +602,13 @@ function parseServerHello(r: Reader): ParsedSH {
 	let selectedIdentity: number | null = null;
 	let selectedGroup: number | null = null;
 	let cookie: Uint8Array | undefined;
+	if (r.rem < 2) return { version, random, cipher, isHRR, keyShare, selectedIdentity, selectedGroup }; // a TLS 1.2 SH may carry no extensions
 	const exts = r.block(2);
 	while (exts.rem >= 4) {
 		const t = exts.u16();
 		const eb = exts.block(2);
-		if (t === Ext.key_share) {
+		if (t === Ext.supported_versions) version = eb.u16();
+		else if (t === Ext.key_share) {
 			if (isHRR) selectedGroup = eb.u16(); // HRR key_share = selected_group only (no pub)
 			else {
 				const group = eb.u16();
@@ -589,7 +621,7 @@ function parseServerHello(r: Reader): ParsedSH {
 			cookie = new Uint8Array(eb.block(2).buf);
 		}
 	}
-	return { cipher, isHRR, keyShare, selectedIdentity, selectedGroup, cookie };
+	return { version, random, cipher, isHRR, keyShare, selectedIdentity, selectedGroup, cookie };
 }
 
 /** Parse a NewSessionTicket → a resumption Ticket (PSK derived from the resumption

@@ -6,7 +6,7 @@ import { modern, tls12 as tls12Fp } from '../fp/fingerprints';
 import { resolvePersona, personaHeaders, type Persona } from '../fp/personas';
 import { alpn as alpnExt } from '../tls/extensions';
 import { Ext } from '../core/consts';
-import { TlsClient, type TlsConn } from '../tls/handshake';
+import { TlsClient, Negotiated12, type TlsConn } from '../tls/handshake';
 import { Tls12Client } from '../tls/handshake12';
 import type { OcspMode } from '../tls/verify';
 import type { Ticket } from '../tls/resumption';
@@ -37,8 +37,10 @@ export interface RequestOptions {
 	/** Negotiate and use HTTP/2 (ALPN h2). Falls back to HTTP/1.1 if the server declines.
 	 *  One-shot only — Session keep-alive is HTTP/1.1. */
 	http2?: boolean;
-	/** Speak TLS 1.2 (ECDHE + AEAD) instead of 1.3 — for 1.2-only servers. Default false
-	 *  (TLS 1.3). Uses the `tls12` preset unless a fingerprint is given. */
+	/** Send a TLS 1.2-only ClientHello (ECDHE + AEAD) instead of the default 1.3 + 1.2 one.
+	 *  Not needed for 1.2-only servers — the default hello already falls back to 1.2 with
+	 *  them, as browsers do; use it to present a 1.2 client's fingerprint. Uses the `tls12`
+	 *  preset unless a fingerprint is given. */
 	tls12?: boolean;
 }
 
@@ -74,7 +76,7 @@ export interface OpenOptions {
 	fingerprint?: Fingerprint;
 	verify?: boolean;
 	ocsp?: OcspMode;
-	/** Speak TLS 1.2 instead of 1.3 (ECDHE + AEAD). */
+	/** Send a TLS 1.2-only ClientHello (the default one offers 1.3 + 1.2 and falls back). */
 	tls12?: boolean;
 	timeoutMs?: number;
 	/** Resume from a stored ticket (pre_shared_key); set resume.earlyData for 0-RTT. */
@@ -116,6 +118,19 @@ export async function openConnection(o: OpenOptions): Promise<TlsConn> {
 		try {
 			await tls.handshake();
 		} catch (e) {
+			if (e instanceof Negotiated12) {
+				// A TLS 1.2-only server answered our (1.3 + 1.2) hello with 1.2: finish the handshake
+				// as TLS 1.2 on the same connection, as a browser would.
+				const t12 = new Tls12Client(t, { host: o.host, fingerprint: o.fingerprint ?? modern(), verify: o.verify, ocsp: o.ocsp, continueFrom: e.state });
+				try {
+					await t12.handshake();
+				} catch (e2) {
+					t12.close();
+					throw e2;
+				}
+				ac.signal.throwIfAborted();
+				return t12;
+			}
 			tls.close(); // a failed handshake must not leak the socket
 			throw e;
 		}

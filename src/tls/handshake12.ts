@@ -11,6 +11,7 @@ import { Aead, aesGcm, prf12, sha, ecdheShared } from '../core/crypto';
 import { takeEcShare } from '../core/keypool';
 import { chacha20Poly1305 } from '../core/chacha';
 import type { Fingerprint } from './clienthello';
+import type { Tls12Continuation } from './handshake';
 import { buildClientHello } from './clienthello';
 import { RecordReader, plaintextRecord } from './record';
 import type { Transport } from './transport';
@@ -39,6 +40,9 @@ export interface Tls12Options {
 	verify?: boolean;
 	ocsp?: OcspMode;
 	onAlpn?: (proto: string | null) => void;
+	/** Finish a handshake a TLS 1.3 ClientHello began, after the server answered with a TLS 1.2
+	 *  ServerHello (the hello is not sent again; the ServerHello is processed from here). */
+	continueFrom?: Tls12Continuation;
 }
 
 /** 8-byte big-endian. */
@@ -164,10 +168,16 @@ export class Tls12Client {
 	async handshake(): Promise<void> {
 		// 1) ClientHello (reuse the builder; the tls12 preset carries no key_share /
 		//    supported_versions, so the server negotiates TLS 1.2 from legacy_version).
-		const ch = buildClientHello(this.opts.fingerprint, this.opts.host);
+		const from = this.opts.continueFrom;
+		const ch = from?.ch ?? buildClientHello(this.opts.fingerprint, this.opts.host);
 		const clientRandom = ch.random;
 		this.transcript.push(ch.bytes);
-		this.t.write(plaintextRecord(ContentType.handshake, ch.bytes));
+		if (from) {
+			// The TLS 1.3 client already sent this hello and read the 1.2 ServerHello: put that
+			// message back in front of whatever arrived after it, and read on from there.
+			this.rr = from.rr;
+			this.hsbuf = concat(from.sh, from.hsbuf);
+		} else this.t.write(plaintextRecord(ContentType.handshake, ch.bytes));
 		this.ja3 = ch.ja3; // computed while the server answers
 		this.ja3Hash = ch.ja3Hash;
 		this.ja3n = ch.ja3n;
