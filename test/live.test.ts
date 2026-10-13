@@ -236,6 +236,20 @@ assert.ok(ja3nSet.size >= 5, 'client fingerprints distinct (edge==chrome collaps
 	console.log(`http/3 → ${r.status} ${body.length}B ctype=${r.headers.get('content-type')} server=${r.headers.get('server')}`);
 	assert.equal(r.status, 200, 'HTTP/3 GET returns 200');
 	assert.ok(body.length > 0, 'HTTP/3 response has a body');
+	// past the 256 KiB stream / 1 MiB connection windows: flow-control credit must flow
+	const big = await fetch('https://www.cloudflare.com/', { http3: true, timeoutMs: 20000, headers: { 'accept-encoding': 'identity' } });
+	const bigLen = (await big.arrayBuffer()).byteLength;
+	console.log(`http/3 large → ${big.status} ${bigLen}B`);
+	assert.ok(bigLen > 1_000_000, 'HTTP/3 body larger than the flow-control windows arrives whole');
+}
+
+// 17) ALPS: Google negotiates application_settings for h2, so the chrome persona must send its
+//     client EncryptedExtensions (else Google answers the Finished with unexpected_message).
+{
+	const g = await request({ url: 'https://www.google.com/', persona: 'chrome', timeoutMs: 20000 });
+	console.log(`alps google → ${g.status} alpn=${g.alpn}`);
+	assert.equal(g.status, 200, 'chrome persona over h2 to Google (ALPS)');
+	assert.equal(g.alpn, 'h2', 'Google selected h2');
 }
 
 console.log('live: OK');

@@ -279,6 +279,7 @@ export class TlsClient {
 		let cv: { alg: number; sig: Uint8Array } | null = null;
 		let thBeforeCV: Uint8Array = new Uint8Array(0);
 		let eeEarly = false;
+		let alps: number | null = null; // ALPS codepoint the server negotiated, if any
 		let certReqContext: Uint8Array | null = null; // set if the server asks for a client cert
 		for (;;) {
 			const msg = await this.nextHandshakeMsg(true);
@@ -294,6 +295,7 @@ export class TlsClient {
 				const ee = parseEE(msg.body);
 				this.alpn = ee.alpn;
 				eeEarly = ee.earlyData;
+				alps = ee.alps;
 				this.opts.onAlpn?.(this.alpn);
 			} else if (msg.type === HandshakeType.certificate) {
 				({ certs, ocsp: staple } = parseCertificate(msg.body));
@@ -333,6 +335,18 @@ export class TlsClient {
 			const eoed = new Writer().u8(HandshakeType.endOfEarlyData).block(3, () => {}).build();
 			this.t.write(earlyWrite!.encrypt(ContentType.handshake, eoed));
 			this.addTranscript(eoed);
+		}
+		// ALPS (draft-vvv-tls-alps): the server sent its application settings, so the client must
+		// answer with its own in an EncryptedExtensions message before Certificate/Finished — a
+		// server like Google rejects the Finished with unexpected_message otherwise. Empty
+		// settings, as curl-impersonate and utls send for their Chrome profiles.
+		if (alps !== null) {
+			const cee = new Writer()
+				.u8(HandshakeType.encryptedExtensions)
+				.block(3, (w) => w.block(2, (x) => x.u16(alps!).block(2, () => {})))
+				.build();
+			this.t.write(this.writeDir!.encrypt(ContentType.handshake, cee));
+			this.addTranscript(cee);
 		}
 		// Client Certificate when asked (RFC 8446 §4.4.2). We hold no client cert, so send an
 		// empty list: servers doing optional mTLS proceed; ones that require a cert fail cleanly
@@ -633,11 +647,13 @@ function parseCompressedCertificate(r: Reader): { certs: Uint8Array[]; ocsp: Uin
 	return parseCertificate(new Reader(new Uint8Array(raw)));
 }
 
-/** EncryptedExtensions: negotiated ALPN + whether the server accepted 0-RTT (early_data).
+/** EncryptedExtensions: negotiated ALPN, whether the server accepted 0-RTT (early_data), and
+ *  whether it negotiated ALPS (application_settings — the codepoint it used, else null).
  *  The EE body is `Extension extensions<0..2^16-1>` — a 2-byte length prefix then the list. */
-function parseEE(r: Reader): { alpn: string | null; earlyData: boolean } {
+function parseEE(r: Reader): { alpn: string | null; earlyData: boolean; alps: number | null } {
 	let alpn: string | null = null;
 	let earlyData = false;
+	let alps: number | null = null;
 	const exts = r.block(2);
 	while (exts.rem >= 4) {
 		const t = exts.u16();
@@ -647,7 +663,9 @@ function parseEE(r: Reader): { alpn: string | null; earlyData: boolean } {
 			alpn = Buffer.from(list.block(1).buf).toString();
 		} else if (t === Ext.early_data) {
 			earlyData = true;
+		} else if (t === Ext.application_settings || t === Ext.application_settings_new) {
+			alps = t;
 		}
 	}
-	return { alpn, earlyData };
+	return { alpn, earlyData, alps };
 }
