@@ -37,5 +37,10 @@ assert.ok(!/Skip to|Home|Arabic|\[1\]|Specs#|Logo|doi:|Retrieved|Archived|\]\(/.
 assert.equal(llm.match(/Same line here/g)?.length, 1, 'consecutive duplicate line dropped');
 assert.equal(llm.match(/Contributing/g)?.length, 1, 'line repeating its heading dropped');
 assert.ok(!/^- ?$/m.test(r.markdown), 'no empty bullet left by a removed link');
-assert.ok(r.markdown.includes('[bun](/t/bun) [zig](/t/zig)'), 'Markdown keeps links');
+assert.ok(r.markdown.includes('[bun](https://x.test/t/bun) [zig](https://x.test/t/zig)'), 'Markdown keeps links, absolute');
+assert.deepEqual(r.links.find((l) => l.href === 'https://x.test/t/bun'), { href: 'https://x.test/t/bun', text: 'bun' }, 'links carry their anchor text');
+const nested = await scrapeHtml('<a href="/a"><span>Deep</span> <b>text</b></a>', 'https://x.test/');
+assert.equal(nested.links[0]?.text, 'Deep text', 'anchor text includes nested elements');
+const frag = await scrapeHtml('<title>Hi</title><main><h1>Hello</h1></main>', 'https://x.test/', { formats: ['llm'] });
+assert.equal(frag.llm, '# Hi\n\n# Hello', 'a fragment without <head> does not repeat its <title> in the text');
 console.log('scrape: llm view + Markdown rendering OK');

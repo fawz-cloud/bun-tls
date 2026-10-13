@@ -125,18 +125,20 @@ export async function map(url: string, opts: MapOptions = {}): Promise<{ links: 
 	return { links: links.slice(0, limit) };
 }
 
-/** Scrape many URLs concurrently (default 5 at a time). */
+/** Scrape many URLs concurrently (default 5 at a time). Results come back in input order;
+ *  a URL that fails yields status 0 and empty fields. */
 export async function batch(urls: string[], opts: ScrapeOptions & { concurrency?: number } = {}): Promise<ScrapeResult[]> {
 	const conc = opts.concurrency ?? 5;
-	const out: ScrapeResult[] = [];
+	const out: ScrapeResult[] = new Array(urls.length);
 	let i = 0;
 	const worker = async () => {
 		while (i < urls.length) {
-			const u = urls[i++]!;
+			const n = i++;
+			const u = urls[n]!;
 			try {
-				out.push(await scrape(u, opts));
-			} catch (e) {
-				out.push({ url: u, status: 0, title: '', description: '', canonical: '', og: {}, twitter: {}, meta: {}, jsonld: [], markdown: '', links: [], images: [] });
+				out[n] = await scrape(u, opts);
+			} catch {
+				out[n] = { url: u, status: 0, title: '', description: '', canonical: '', og: {}, twitter: {}, meta: {}, jsonld: [], markdown: '', links: [], images: [] };
 			}
 		}
 	};

@@ -43,8 +43,10 @@ export interface CssSchema {
 export type Format = 'markdown' | 'readable' | 'html' | 'links' | 'json' | 'text' | 'llm';
 
 export interface ScrapeOptions extends Omit<FetchInit, 'method' | 'body'> {
-	/** Firecrawl-style output selection. Default ['markdown']. 'json' = the structured data
-	 *  (jsonld/og/meta), 'html' = cleaned HTML, 'readable' = main-content Markdown. */
+	/** Firecrawl-style output selection; default from `as` ('auto' = ['markdown', 'json',
+	 *  'links']). 'markdown' (or 'text') = Markdown, 'readable' = main-content Markdown,
+	 *  'html' = cleaned HTML, 'llm' = the LLM view. The structured data and links are always
+	 *  extracted (one cheap pass), so 'json' and 'links' only name what you want back. */
 	formats?: Format[];
 	/** Shorthand: 'llm' = the token-cheapest full-context view (recommended for LLMs);
 	 *  'data' = structured only; 'markdown'/'readable'; 'auto' = everything. */
@@ -102,6 +104,7 @@ async function extractData(html: string, base: string): Promise<Omit<ScrapeResul
 	let titles = 0;
 	let inLd = false;
 	let ld = '';
+	let link: { href: string; text: string } | null = null;
 
 	const rw = new HTMLRewriter()
 		// Only the document <title>: inline SVG icons carry <title> elements of their own.
@@ -140,18 +143,24 @@ async function extractData(html: string, base: string): Promise<Omit<ScrapeResul
 		.on('a[href]', {
 			element(e) {
 				const href = abs(e.getAttribute('href'), base);
-				if (href && !href.startsWith('javascript:')) links.push({ href, text: '' });
+				link = href && !href.startsWith('javascript:') ? { href, text: '' } : null;
+				if (link) links.push(link);
+			},
+			text(t) {
+				if (link) link.text += t.text;
 			}
 		})
 		.on('img[src]', { element: (e) => void images.push({ src: abs(e.getAttribute('src'), base), alt: e.getAttribute('alt') || '' }) });
 
 	await rw.transform(new Response(html)).arrayBuffer();
+	for (const l of links) l.text = squash(decode(l.text));
 	return { title: decode(title).trim(), description, canonical, og, twitter, meta, jsonld, links, images };
 }
 
 const BLOCK = 'p,div,section,article,main,ul,ol,dl,dt,tr,table,figure,figcaption,header,footer,blockquote,details,summary';
-// No <form>: ASP.NET-style pages wrap the whole body in one.
-const DROP = 'script,style,noscript,svg,iframe,head,template,link,meta,button,input,select,textarea';
+// No <form>: ASP.NET-style pages wrap the whole body in one. <title> is listed for fragments
+// with no <head> (the title is read separately).
+const DROP = 'script,style,noscript,svg,iframe,head,title,template,link,meta,button,input,select,textarea';
 // Page chrome dropped in readable mode — Firecrawl's onlyMainContent set minus <header>,
 // which often holds the article title — plus language-switcher links (hreflang) and
 // MediaWiki "[edit]" section links.
@@ -183,7 +192,7 @@ function tidy(s: string): string {
  *  markers, in-page anchor junk dropped. Boilerplate elements are REMOVED (their content
  *  leaves the stream) and every other tag is unwrapped by the rewriter itself, so attribute
  *  values containing '>' can't leak the way a tag-stripping regex lets them. */
-async function toMarkdown(html: string, readable: boolean, plain = false): Promise<string> {
+async function toMarkdown(html: string, base: string, readable: boolean, plain = false): Promise<string> {
 	const text = { html: false };
 	const emphasis: Record<string, string> = plain ? {} : { strong: '**', b: '**', em: '_', i: '_' };
 	let pre = 0;
@@ -219,7 +228,7 @@ async function toMarkdown(html: string, readable: boolean, plain = false): Promi
 					code++;
 				} else if (href !== null) {
 					// plain: no URLs, but in-page anchors are marked so their junk text can go
-					if (!plain) [open, close] = ['[', `](${href})`];
+					if (!plain) [open, close] = ['[', `](${abs(href, base)})`];
 					else if (href.startsWith('#')) [open, close] = [ANCHOR, ANCHOR_END];
 				} else if (emphasis[tag]) open = close = emphasis[tag];
 				open = lead + open;
@@ -411,7 +420,8 @@ const AS_FORMATS: Record<string, Format[]> = { llm: ['llm'], data: ['json'], mar
 
 /** Fetch a URL via bun-tls and return LLM-ready output (Firecrawl-style `formats`). */
 export async function scrape(url: string, opts: ScrapeOptions = {}): Promise<ScrapeResult> {
-	const r = await btFetch(url, { persona: opts.persona ?? 'chrome', http2: opts.http2, fingerprint: opts.fingerprint, proxy: opts.proxy, verify: opts.verify, tls12: opts.tls12, http3: opts.http3, headers: opts.headers, timeoutMs: opts.timeoutMs });
+	// Every fetch() option applies (ocsp, signal, redirect too); fetch ignores the scrape-only ones.
+	const r = await btFetch(url, { ...opts, persona: opts.persona ?? 'chrome' });
 	return scrapeHtml(await r.text(), url, opts, r.status);
 }
 
@@ -423,7 +433,7 @@ export async function scrapeHtml(html: string, url: string, opts: ScrapeOptions 
 
 	let markdown = '';
 	if (formats.has('markdown') || formats.has('readable') || formats.has('text')) {
-		markdown = await toMarkdown(html, readable);
+		markdown = await toMarkdown(html, url, readable);
 		if (opts.fit) markdown = fitMarkdown(markdown);
 		if (opts.maxChars && markdown.length > opts.maxChars) markdown = markdown.slice(0, opts.maxChars) + '\n…[truncated]';
 	}
@@ -431,7 +441,7 @@ export async function scrapeHtml(html: string, url: string, opts: ScrapeOptions 
 	if (formats.has('html')) result.html = await cleanHtml(html, readable);
 	if (opts.extract) result.extracted = await extractSchema(html, opts.extract);
 	if (formats.has('llm')) {
-		let llm = buildLlm(result, await toMarkdown(html, true, true));
+		let llm = buildLlm(result, await toMarkdown(html, url, true, true));
 		if (opts.maxChars && llm.length > opts.maxChars) llm = llm.slice(0, opts.maxChars) + '\n…[truncated]';
 		result.llm = llm;
 	}
