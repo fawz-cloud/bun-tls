@@ -69,6 +69,12 @@ s.close();
   post-quantum **X25519MLKEM768** hybrid, RFC 8879 cert decompression, optional mTLS.
 - **HTTP/1.1 and HTTP/2** — h2 with HPACK, flow control, Chrome's h2 fingerprint, and
   request multiplexing over one connection via `new Session({ http2: true })`.
+- **HTTP/3 over QUIC** — a from-scratch QUIC v1 client (RFC 9000/9001/9114 + QPACK):
+  `fetch(url, { http3: true })`. Verified against Cloudflare and nginx; QUIC crypto is
+  byte-exact vs the RFC 9001 test vectors.
+- **`fetch()` + streaming + WebSocket** — a Web-standard `fetch()` with a `ReadableStream`
+  body and `persona`/`fingerprint` control, and `connectWebSocket()` (RFC 6455) over the
+  same fingerprinted TLS.
 - **Certificate verification** on by default (CA-constrained chain, hostname + IP SANs,
   path-building); optional **OCSP** revocation (stapling + AIA fetch); cookie jar with
   Public Suffix List; HTTP and SOCKS5 proxies; gzip / deflate / br / zstd.

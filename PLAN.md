@@ -49,6 +49,8 @@ via a patched libcurl (C); we do it in TS.
 | `http/client.ts` | `request()` single-shot |
 | `http/fetchlike.ts` | `fetch()` — Web-standard API, streaming Response body |
 | `http/ws.ts` | WebSocket (RFC 6455) over the fingerprinted TLS |
+| `http/h3.ts` | HTTP/3 (RFC 9114) + QPACK over QUIC |
+| `quic/frames.ts` · `quic/connection.ts` | QUIC frames + connection (handshake→1-RTT, Retry, ACK) |
 | `quic/varint.ts` · `quic/crypto.ts` · `quic/packet.ts` | QUIC core: varints + RFC 9001 Initial packet protection (HTTP/3 foundation) |
 | `http/session.ts` | `Session` = cookie jar + redirects + persistent opts |
 | `index.ts` | public re-exports |
