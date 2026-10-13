@@ -9,7 +9,7 @@ import { crawl, map } from './http/crawl';
 const TOOLS = [
 	{
 		name: 'scrape',
-		description: 'Fetch a web page through a browser TLS fingerprint (clears many bot walls) and return LLM-ready content: Markdown, structured data (JSON-LD/OpenGraph/meta), links. Prefer formats ["json"] for the cheapest structured answer, add "markdown" for the readable body.',
+		description: 'Fetch a web page through a browser TLS fingerprint (clears many bot walls) and return LLM-ready content. The default "llm" view is the token-cheapest full-context text: title, structured data (JSON-LD), main content without URLs. Ask for ["markdown"] when you need the links, ["json"] for structured data only.',
 		inputSchema: {
 			type: 'object',
 			properties: {
@@ -25,7 +25,7 @@ const TOOLS = [
 	},
 	{
 		name: 'crawl',
-		description: 'Breadth-first crawl of same-origin links from a start URL. Returns a list of pages with their structured data + Markdown.',
+		description: 'Breadth-first crawl of same-origin links from a start URL. Returns each page in the token-cheap "llm" view, separated by "---".',
 		inputSchema: {
 			type: 'object',
 			properties: {
@@ -69,11 +69,11 @@ async function runTool(name: string, a: Args): Promise<unknown> {
 	const persona = (a.persona as string) ?? 'chrome';
 	if (name === 'scrape') {
 		const r = await scrape(a.url as string, { formats: (a.formats as Format[]) ?? ['llm'], onlyMainContent: a.onlyMainContent as boolean, fit: a.fit as boolean, persona, maxChars: a.maxChars as number });
-		return slim(r);
+		return r.llm !== undefined ? page(r) : slim(r);
 	}
 	if (name === 'crawl') {
-		const { pages, count } = await crawl(a.url as string, { limit: (a.limit as number) ?? 15, depth: (a.depth as number) ?? 2, persona });
-		return { count, pages: pages.map(slim) };
+		const { pages } = await crawl(a.url as string, { limit: (a.limit as number) ?? 15, depth: (a.depth as number) ?? 2, persona, formats: ['llm'] });
+		return pages.map(page).join('\n\n---\n\n');
 	}
 	if (name === 'map') {
 		return await map(a.url as string, { limit: (a.limit as number) ?? 2000, search: a.search as string, persona });
@@ -85,15 +85,15 @@ async function runTool(name: string, a: Args): Promise<unknown> {
 	throw new Error('unknown tool: ' + name);
 }
 
+// The 'llm' view goes out as plain text: wrapped in a JSON string, every newline and quote
+// gets escaped, which costs ~8% more tokens (14% on code-heavy pages).
+function page(r: Awaited<ReturnType<typeof scrape>>): string {
+	return `${r.url} (${r.status})\n\n${r.llm ?? ''}` + (r.extracted?.length ? `\n\n<extracted>\n${JSON.stringify(r.extracted)}\n</extracted>` : '');
+}
+
 // Compact, token-cheap view of a scrape result (drop empty fields).
 function slim(r: Awaited<ReturnType<typeof scrape>>): Record<string, unknown> {
 	const o: Record<string, unknown> = { url: r.url, status: r.status };
-	// The 'llm' view already folds title + structured data + text into one cheap string.
-	if (r.llm) {
-		o.content = r.llm;
-		if (r.extracted?.length) o.extracted = r.extracted;
-		return o;
-	}
 	if (r.title) o.title = r.title;
 	const desc = r.description || r.og.description;
 	if (desc) o.description = desc;
@@ -120,7 +120,7 @@ async function handle(req: { id?: unknown; method: string; params?: Args }): Pro
 	} else if (method === 'tools/call') {
 		try {
 			const out = await runTool(params!.name as string, (params!.arguments as Args) ?? {});
-			send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify(out) }] } });
+			send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: typeof out === 'string' ? out : JSON.stringify(out) }] } });
 		} catch (e) {
 			send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'error: ' + (e as Error).message }], isError: true } });
 		}

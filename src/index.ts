@@ -35,7 +35,7 @@ export { connectWebSocket, BunTlsWebSocket } from './http/ws';
 export type { WsOptions, WsMessage } from './http/ws';
 export { fetch } from './http/fetchlike';
 export type { FetchInit } from './http/fetchlike';
-export { scrape, extractLLM, fitMarkdown } from './http/scrape';
+export { scrape, scrapeHtml, extractLLM, fitMarkdown } from './http/scrape';
 export type { ScrapeResult, ScrapeOptions, CssSchema, Format, LlmFn, LlmConfig, ExtractLLMOptions } from './http/scrape';
 export { crawl, map, batch } from './http/crawl';
 export type { CrawlOptions, MapOptions } from './http/crawl';
