@@ -148,28 +148,51 @@ export class Session {
 	/** In-flight h2 dials, so concurrent requests to a new host share one connection. */
 	private h2dial = new Map<string, Promise<H2Entry | null>>();
 	private closedFlag = false;
+	/** Per-name persona cache: resolve, fingerprint template and header set are all the same for
+	 *  every request to a named persona, so build them once. Only cached when the persona is given
+	 *  by name — a Persona object the caller supplies could differ per request. The fingerprint
+	 *  template is safe to share: all per-connection randomness (GREASE, permute) happens at dial. */
+	private personaCache = new Map<string, { P: Persona; fp: Fingerprint; hdrs: Record<string, string> }>();
 	constructor(private opts: SessionOptions = {}) {}
+
+	/** Resolve a persona and its cached fingerprint + headers. For a named persona the result is
+	 *  memoized; for a Persona object it is rebuilt (fp per-call to preserve any custom behavior). */
+	private persona(p: string | Persona | undefined): { P: Persona; fp: Fingerprint; hdrs: Record<string, string> } | null {
+		if (!p) return null;
+		if (typeof p !== 'string') {
+			const P = resolvePersona(p);
+			return { P, fp: P.fingerprint(), hdrs: personaHeaders(P) };
+		}
+		let c = this.personaCache.get(p);
+		if (!c) {
+			const P = resolvePersona(p);
+			c = { P, fp: P.fingerprint(), hdrs: personaHeaders(P) };
+			this.personaCache.set(p, c);
+		}
+		return c;
+	}
 
 	async request(req: RequestOptions): Promise<ClientResponse> {
 		const maxRedirects = this.opts.maxRedirects ?? 10;
 		const keepAlive = this.opts.keepAlive ?? true;
-		const persona = req.persona ?? this.opts.persona;
-		const P = persona ? resolvePersona(persona) : null;
+		const pc = this.persona(req.persona ?? this.opts.persona);
+		const P = pc?.P ?? null;
 		const useH2 = req.http2 ?? this.opts.http2 ?? P?.http2 ?? false;
 		let url = req.url;
 		let method = req.method ?? 'GET';
 		let body: Uint8Array | undefined = typeof req.body === 'string' ? new Uint8Array(Buffer.from(req.body)) : req.body;
-		const origin0 = new URL(req.url).origin; // auth headers belong to the ORIGINAL origin only
+		let first: URL | null = null; // the original request URL; auth headers belong to its origin only
 		for (let hop = 0; ; hop++) {
 			const u = new URL(url);
 			if (u.protocol !== 'https:') throw new Error('only https (TLS) is supported');
+			if (hop === 0) first = u;
 			const host = u.hostname;
 			const port = u.port ? Number(u.port) : 443;
 			const open: OpenOptions = {
 				host,
 				port,
 				proxy: req.proxy ?? this.opts.proxy,
-				fingerprint: req.fingerprint ?? this.opts.fingerprint ?? P?.fingerprint(),
+				fingerprint: req.fingerprint ?? this.opts.fingerprint ?? pc?.fp,
 				verify: req.verify ?? this.opts.verify,
 				ocsp: req.ocsp ?? this.opts.ocsp,
 				tls12: req.tls12 ?? this.opts.tls12,
@@ -179,13 +202,13 @@ export class Session {
 			const userHeaders: Record<string, string> = { ...(this.opts.headers ?? {}), ...(req.headers ?? {}), ...(cookieHeader ? { Cookie: cookieHeader } : {}) };
 			// Never forward credentials to a different origin across a redirect (the Cookie
 			// jar already scopes cookies per origin; this covers an explicit Authorization).
-			if (u.origin !== origin0) for (const k of Object.keys(userHeaders)) if (/^(authorization|proxy-authorization)$/i.test(k)) delete userHeaders[k];
+			if (first && u.origin !== first.origin) for (const k of Object.keys(userHeaders)) if (/^(authorization|proxy-authorization)$/i.test(k)) delete userHeaders[k];
 			const rt: RoundtripOptions = {
 				method,
 				host,
 				path: u.pathname + u.search,
 				headers: userHeaders,
-				baseHeaders: P ? { Host: host, ...personaHeaders(P) } : undefined,
+				baseHeaders: pc ? { Host: host, ...pc.hdrs } : undefined,
 				body,
 				keepAlive
 			};
@@ -198,7 +221,7 @@ export class Session {
 							method,
 							authority: port === 443 ? host : `${host}:${port}`,
 							path: rt.path,
-							headers: P ? { ...personaHeaders(P), ...userHeaders } : userHeaders,
+							headers: pc ? { ...pc.hdrs, ...userHeaders } : userHeaders,
 							body
 						},
 						P?.h2Profile
@@ -226,13 +249,13 @@ export class Session {
 	 *  that was already received by the server before the reset could be re-sent.) */
 	private async send(key: string, open: OpenOptions, rt: RoundtripOptions, keepAlive: boolean): Promise<ClientResponse> {
 		const idempotent = rt.method === 'GET' || rt.method === 'HEAD';
-		const tkey = `${open.host}|${policyOf(open)}`; // tickets scoped to the same policy as the pool
-		// 1) Reuse a live pooled connection — no handshake at all (fastest).
+		// 1) Reuse a live pooled connection — no handshake at all (fastest, the common path).
 		const idle = this.pool.get(key);
 		while (idle && idle.length) {
 			const tls = idle.pop()!;
 			try {
-				return this.recycle(key, tls, await this.timed(open.timeoutMs, tls, roundtrip(tls, rt)), keepAlive);
+				const rtp = roundtrip(tls, rt);
+				return this.recycle(key, tls, await (open.timeoutMs ? this.timed(open.timeoutMs, tls, rtp) : rtp), keepAlive);
 			} catch (e) {
 				try {
 					tls.close();
@@ -246,12 +269,14 @@ export class Session {
 		}
 		// 2) New connection: resume from a stored ticket if we have one. With zeroRtt opted
 		//    in, a GET/HEAD also rides in the ClientHello as early data when allowed.
+		const tkey = `${open.host}|${policyOf(open)}`; // tickets scoped to the same policy as the pool (only needed when dialing)
 		const ticket = this.tickets.take(tkey);
 		const use0rtt = !!ticket && ticket.maxEarlyData > 0 && idempotent && (this.opts.zeroRtt ?? false);
 		const resume = ticket ? { ticket, earlyData: use0rtt } : undefined;
 		const earlyData = use0rtt ? serializeForEarly(rt) : undefined;
 		const tls = await openConnection({ ...open, resume, earlyData, onTicket: (t) => this.tickets.add(tkey, t) });
-		return this.recycle(key, tls, await this.timed(open.timeoutMs, tls, roundtrip(tls, rt, tls.earlyAccepted)), keepAlive);
+		const rtp = roundtrip(tls, rt, tls.earlyAccepted);
+		return this.recycle(key, tls, await (open.timeoutMs ? this.timed(open.timeoutMs, tls, rtp) : rtp), keepAlive);
 	}
 
 	private recycle(key: string, tls: TlsConn, res: ClientResponse, keepAlive: boolean): ClientResponse {
