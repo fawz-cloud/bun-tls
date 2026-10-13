@@ -2,6 +2,7 @@
 // cipher. Used when the server picks TLS_CHACHA20_POLY1305_SHA256. Validated
 // against the RFC 8439 §2.8.2 vector in test/chacha.test.ts.
 import type { Aead } from './crypto';
+import { cngChaCha20Poly1305 } from './cng';
 
 const rotl = (x: number, n: number): number => ((x << n) | (x >>> (32 - n))) >>> 0;
 
@@ -243,26 +244,12 @@ function tagOf(key: Uint8Array, nonce: Uint8Array, aad: Uint8Array, ciphertext: 
 const NATIVE_CHACHA = typeof crypto !== 'undefined' && !!crypto.subtle;
 const ALG = 'ChaCha20-Poly1305';
 
-/** AEAD factory for ChaCha20-Poly1305 (keyLen 32). seal/open are the pure-TS path (used for
- *  the small handshake records); sealAsync/openAsync use native WebCrypto for bulk data. */
+/** AEAD factory for ChaCha20-Poly1305 (keyLen 32). The synchronous paths (handshake records,
+ *  small writes) use Windows CNG in place when available (~5× the pure-TS speed), else the
+ *  pure-TS code; sealAsync/openAsync use native WebCrypto for bulk data (parallel batches). */
 export function chacha20Poly1305(key: Uint8Array): Aead {
-	const sealSync = (nonce: Uint8Array, aad: Uint8Array, pt: Uint8Array): Uint8Array => {
-		const ct = chacha20(key, 1, nonce, pt);
-		const tag = tagOf(key, nonce, aad, ct);
-		const r = new Uint8Array(ct.length + 16);
-		r.set(ct); r.set(tag, ct.length);
-		return r;
-	};
-	const openSync = (nonce: Uint8Array, aad: Uint8Array, sealed: Uint8Array): Uint8Array => {
-		const body = sealed.subarray(0, sealed.length - 16);
-		const tag = sealed.subarray(sealed.length - 16);
-		const want = tagOf(key, nonce, aad, body);
-		let diff = 0;
-		for (let i = 0; i < 16; i++) diff |= tag[i]! ^ want[i]!;
-		if (diff !== 0) throw new Error('chacha20-poly1305 tag mismatch');
-		return chacha20(key, 1, nonce, body);
-	};
-	const aead: Aead = { keyLen: 32, seal: sealSync, open: openSync };
+	const native = cngChaCha20Poly1305();
+	const aead: Aead = native ? native(key) : { keyLen: 32, seal: pureSeal(key), open: pureOpen(key) };
 	if (NATIVE_CHACHA) {
 		// TS 6 splits Uint8Array<ArrayBuffer|ArrayBufferLike>; WebCrypto wants a plain BufferSource.
 		const bs = (u: Uint8Array) => u as unknown as Uint8Array<ArrayBuffer>;
@@ -281,4 +268,28 @@ export function chacha20Poly1305(key: Uint8Array): Aead {
 	return aead;
 }
 
-export { chacha20 };
+/** Pure-TS seal (ciphertext || tag). */
+function pureSeal(key: Uint8Array) {
+	return (nonce: Uint8Array, aad: Uint8Array, pt: Uint8Array): Uint8Array => {
+		const ct = chacha20(key, 1, nonce, pt);
+		const tag = tagOf(key, nonce, aad, ct);
+		const r = new Uint8Array(ct.length + 16);
+		r.set(ct); r.set(tag, ct.length);
+		return r;
+	};
+}
+
+/** Pure-TS open: verify the tag (constant-time compare) before decrypting. */
+function pureOpen(key: Uint8Array) {
+	return (nonce: Uint8Array, aad: Uint8Array, sealed: Uint8Array): Uint8Array => {
+		const body = sealed.subarray(0, sealed.length - 16);
+		const tag = sealed.subarray(sealed.length - 16);
+		const want = tagOf(key, nonce, aad, body);
+		let diff = 0;
+		for (let i = 0; i < 16; i++) diff |= tag[i]! ^ want[i]!;
+		if (diff !== 0) throw new Error('chacha20-poly1305 tag mismatch');
+		return chacha20(key, 1, nonce, body);
+	};
+}
+
+export { chacha20, pureSeal, pureOpen };

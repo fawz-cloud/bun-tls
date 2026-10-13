@@ -109,40 +109,43 @@ export class AeadDir {
 	/** Wrap `plaintext` as a TLSCiphertext (app_data 0x17). innerType = the real
 	 *  ContentType (handshake/app/alert), appended to the plaintext. */
 	encrypt(innerType: number, plaintext: Uint8Array): Uint8Array {
-		const inner = concat(plaintext, typeByte(innerType));
-		const len = inner.length + 16; // + tag
-		const header = Uint8Array.of(ContentType.applicationData, TLS12 >> 8, TLS12 & 0xff, (len >> 8) & 0xff, len & 0xff);
-		const ct = this.aead.seal(this.nextNonce(), header, inner);
-		return concat(header, ct);
+		const out = new Uint8Array(5 + plaintext.length + 1 + 16);
+		this.sealRecord(innerType, plaintext, out, 0);
+		return out;
 	}
 
 	/** Fragment `data` into ≤maxFrag-byte records and encrypt them all into ONE buffer:
-	 *  one allocation, headers written in place, one socket write for the caller. With
-	 *  a sealParts-capable AEAD each record costs a single copy (cipher output → out). */
+	 *  one allocation, headers written in place, one socket write for the caller. */
 	encryptMany(innerType: number, data: Uint8Array, maxFrag: number): Uint8Array {
 		const n = Math.ceil(data.length / maxFrag);
 		const out = new Uint8Array(data.length + n * (5 + 1 + 16)); // header + type byte + tag
-		const type = typeByte(innerType);
 		let off = 0;
-		for (let p = 0; p < data.length; p += maxFrag) {
-			const frag = data.subarray(p, p + maxFrag);
-			const len = frag.length + 1 + 16;
-			out[off] = ContentType.applicationData;
-			out[off + 1] = TLS12 >> 8;
-			out[off + 2] = TLS12 & 0xff;
-			out[off + 3] = (len >> 8) & 0xff;
-			out[off + 4] = len & 0xff;
-			const header = out.subarray(off, off + 5);
-			const nonce = this.nextNonce();
-			if (this.aead.sealParts) {
-				off = this.aead.sealParts(nonce, header, [frag, type], out, off + 5);
-			} else {
-				const ct = this.aead.seal(nonce, header, concat(frag, type));
-				out.set(ct, off + 5);
-				off += 5 + ct.length;
-			}
-		}
+		for (let p = 0; p < data.length; p += maxFrag) off = this.sealRecord(innerType, data.subarray(p, p + maxFrag), out, off);
 		return out;
+	}
+
+	/** Write one record (header, then frag||innerType sealed, then tag) into `out` at `off`;
+	 *  returns the offset after it. In-place AEAD (CNG): one copy of the plaintext into `out`,
+	 *  sealed where it lies. sealParts (node): one copy of the cipher output into `out`. */
+	private sealRecord(innerType: number, frag: Uint8Array, out: Uint8Array, off: number): number {
+		const len = frag.length + 1 + 16;
+		out[off] = ContentType.applicationData;
+		out[off + 1] = TLS12 >> 8;
+		out[off + 2] = TLS12 & 0xff;
+		out[off + 3] = (len >> 8) & 0xff;
+		out[off + 4] = len & 0xff;
+		const header = out.subarray(off, off + 5);
+		const nonce = this.nextNonce();
+		if (this.aead.sealInPlace) {
+			out.set(frag, off + 5);
+			out[off + 5 + frag.length] = innerType;
+			this.aead.sealInPlace(nonce, header, out, off + 5, frag.length + 1);
+		} else if (this.aead.sealParts) {
+			this.aead.sealParts(nonce, header, [frag, typeByte(innerType)], out, off + 5);
+		} else {
+			out.set(this.aead.seal(nonce, header, concat(frag, typeByte(innerType))), off + 5);
+		}
+		return off + 5 + len;
 	}
 
 	/** True when the cipher has a native async path (ChaCha20 on Bun). The bulk record paths
@@ -179,9 +182,19 @@ export class AeadDir {
 		return out;
 	}
 
-	/** Open a TLSCiphertext → { innerType, content } (trailing zero padding removed). */
+	/** Open a TLSCiphertext → { innerType, content } (trailing zero padding removed). With an
+	 *  in-place AEAD the plaintext overwrites the ciphertext inside rec.fragment: records come
+	 *  from RecordReader (views of socket chunks Bun never reuses, or fresh copies), are opened
+	 *  exactly once, in order, and a failure ends the connection — so the buffer is ours. */
 	decrypt(rec: Record): { innerType: number; content: Uint8Array } {
-		return unpad(this.aead.open(this.nextNonce(), this.aad(rec), rec.fragment));
+		const nonce = this.nextNonce();
+		const aad = this.aad(rec);
+		return unpad(this.aead.openInPlace ? this.aead.openInPlace(nonce, aad, rec.fragment) : this.aead.open(nonce, aad, rec.fragment));
+	}
+
+	/** Release the key's native resources (CNG handle) once this direction is done. */
+	destroy(): void {
+		this.aead.destroy?.();
 	}
 
 	/** Async form of decrypt (native AEAD). The nonce and seq++ happen BEFORE the await, so

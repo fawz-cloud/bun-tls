@@ -70,6 +70,18 @@ class Dir12 {
 	seal(type: number, pt: Uint8Array): Uint8Array {
 		const explicit = u64(this.seq);
 		const aad = this.aad(type, pt.length);
+		if (this.aead.sealInPlace) {
+			// One buffer: header || [explicit nonce] || plaintext sealed in place || tag.
+			const ex = this.suite.gcm ? 8 : 0;
+			const len = ex + pt.length + 16;
+			const out = new Uint8Array(5 + len);
+			out.set([type, TLS12 >> 8, TLS12 & 0xff, (len >> 8) & 0xff, len & 0xff]);
+			if (ex) out.set(explicit, 5);
+			out.set(pt, 5 + ex);
+			this.aead.sealInPlace(this.nonce(explicit), aad, out, 5 + ex, pt.length);
+			this.seq++;
+			return out;
+		}
 		const ct = this.aead.seal(this.nonce(explicit), aad, pt);
 		this.seq++;
 		return plaintextRecord(type, this.suite.gcm ? concat(explicit, ct) : ct);
@@ -78,9 +90,14 @@ class Dir12 {
 		const explicit = this.suite.gcm ? fragment.subarray(0, 8) : u64(this.seq);
 		const body = this.suite.gcm ? fragment.subarray(8) : fragment;
 		const aad = this.aad(type, body.length - 16);
-		const pt = this.aead.open(this.nonce(explicit), aad, body);
+		const nonce = this.nonce(explicit);
+		// In place when native (the record is ours, opened once, in order — see AeadDir.decrypt).
+		const pt = this.aead.openInPlace ? this.aead.openInPlace(nonce, aad, body) : this.aead.open(nonce, aad, body);
 		this.seq++;
 		return pt;
+	}
+	destroy(): void {
+		this.aead.destroy?.();
 	}
 }
 
@@ -325,6 +342,8 @@ export class Tls12Client {
 
 	close(): void {
 		this.t.close();
+		this.write?.destroy(); // native key handles go now, not at the next GC
+		this.read?.destroy();
 	}
 }
 

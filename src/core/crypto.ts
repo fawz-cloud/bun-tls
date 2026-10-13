@@ -3,6 +3,7 @@
 // if the server picks it). All validated against RFC 8448 vectors in test/.
 import crypto from 'node:crypto';
 import { concat } from './bytes';
+import { cngAesGcm } from './cng';
 
 export type HashAlg = 'sha256' | 'sha384';
 export const hashLen = (h: HashAlg): number => (h === 'sha256' ? 32 : 48);
@@ -222,14 +223,27 @@ export type Aead = {
 	 *  small, latency-sensitive handshake records. Output/input identical to seal/open. */
 	sealAsync?: (nonce: Uint8Array, aad: Uint8Array, pt: Uint8Array) => Promise<Uint8Array>;
 	openAsync?: (nonce: Uint8Array, aad: Uint8Array, ct: Uint8Array) => Promise<Uint8Array>;
+	/** Native in-place paths (CNG). sealInPlace encrypts buf[off..off+len) where it lies and
+	 *  writes the tag at buf[off+len..+16]; openInPlace decrypts ct (ciphertext||tag) inside its
+	 *  own buffer and returns the plaintext view. openInPlace CLOBBERS the buffer even when the
+	 *  tag check fails, so use it only on bytes the caller owns and never re-reads after an
+	 *  error (the in-order record path, never a speculative/retried decrypt). */
+	sealInPlace?: (nonce: Uint8Array, aad: Uint8Array, buf: Uint8Array, off: number, len: number) => void;
+	openInPlace?: (nonce: Uint8Array, aad: Uint8Array, ct: Uint8Array) => Uint8Array;
+	/** Release native key material now (CNG key handle); later calls throw. Idempotent. */
+	destroy?: () => void;
 	keyLen: number;
 };
 
 const TAG16 = { authTagLength: 16 }; // reused per record instead of a fresh options object
 
+/** AES-GCM: Windows CNG when available (one key handle per traffic key, in place — ~5× the
+ *  per-record speed), else node:crypto. The provider is picked on the first key, not at import. */
 export function aesGcm(keyLen: 16 | 32): (key: Uint8Array) => Aead {
 	const algo = keyLen === 16 ? 'aes-128-gcm' : 'aes-256-gcm';
 	return (raw: Uint8Array): Aead => {
+		const native = cngAesGcm();
+		if (native) return native(raw);
 		const key = crypto.createSecretKey(raw); // import once per traffic key, not per record
 		// node:crypto AES-GCM stays SYNC: a WebCrypto async path was tried, but routing AES
 		// through it made every small request pay async-dispatch overhead (tp 38.9k -> 25k) while

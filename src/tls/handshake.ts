@@ -362,6 +362,10 @@ export class TlsClient {
 		this.resMaster = resumptionMaster(this.suite.hash, this.sched.master, this.th());
 		this.resHash = this.suite.hash;
 		this.resCipher = server.cipher;
+		// Handshake (and early) traffic keys are finished with: release their native handles now.
+		this.readDir.destroy();
+		this.writeDir!.destroy();
+		earlyWrite?.destroy();
 	}
 
 	/** HelloRetryRequest (RFC 8446 §4.1.4): the server advertised a group we listed but
@@ -507,18 +511,27 @@ export class TlsClient {
 		const h = this.suite.hash;
 		this.sApSecret = updateTraffic(h, this.sApSecret);
 		const sk = trafficKey(h, this.sApSecret, this.suite.keyLen);
+		const oldRead = this.appRead;
 		this.appRead = new AeadDir(this.suite.aead(sk.key), sk.iv);
+		oldRead.destroy(); // in-flight async (WebCrypto) decrypts hold their own key, not this handle
 		if (requested === 1) {
 			const msg = new Writer().u8(HandshakeType.keyUpdate).block(3, (w) => w.u8(0)).build();
 			this.t.write(this.appWrite.encrypt(ContentType.handshake, msg));
 			this.cApSecret = updateTraffic(h, this.cApSecret);
 			const ck = trafficKey(h, this.cApSecret, this.suite.keyLen);
+			const oldWrite = this.appWrite;
 			this.appWrite = new AeadDir(this.suite.aead(ck.key), ck.iv);
+			oldWrite.destroy();
 		}
 	}
 
 	close(): void {
 		this.t.close();
+		// Native key handles go now, not at the next GC. Reading after close() throws.
+		this.appRead?.destroy();
+		this.appWrite?.destroy();
+		this.readDir?.destroy();
+		this.writeDir?.destroy();
 	}
 }
 
