@@ -37,6 +37,9 @@ import { verifyCertificateVerify, verifyChain, checkRevocation, type OcspMode } 
 import crypto from 'node:crypto';
 import zlib from 'node:zlib';
 
+// Sentinel from routeApp meaning "record handled, keep reading" (vs. app bytes or null = EOF).
+const CONTINUE: unique symbol = Symbol('continue');
+
 interface Suite {
 	hash: HashAlg;
 	aead: (key: Uint8Array) => Aead;
@@ -125,6 +128,9 @@ export class TlsClient {
 		private t: Transport,
 		private opts: TlsOptions
 	) {}
+
+	/** In-flight record decrypts for the native-AEAD download path (ChaCha), oldest first. */
+	private inflight: { rec: { type: number; fragment: Uint8Array }; dir: AeadDir; p: Promise<{ innerType: number; content: Uint8Array }> }[] = [];
 
 	private async pullRecord() {
 		for (;;) {
@@ -397,21 +403,72 @@ export class TlsClient {
 		}
 	}
 
-	/** Decrypted application data. NewSessionTicket → onTicket; KeyUpdate ignored. null = EOF. */
+	/** Decrypted application data. NewSessionTicket → onTicket; KeyUpdate rotates keys. null = EOF. */
 	async readApp(): Promise<Uint8Array | null> {
 		if (!this.appMode) throw new Error('handshake not finished');
+		return this.appRead.hasAsync ? this.readAppAsync() : this.readAppSync();
+	}
+
+	private async readAppSync(): Promise<Uint8Array | null> {
 		for (;;) {
 			const rec = await this.pullRecord();
 			if (rec === null) return null;
 			if (rec.type === ContentType.changeCipherSpec) continue;
-			const d = this.appRead.hasAsync ? await this.appRead.decryptAsync(rec) : this.appRead.decrypt(rec);
-			if (d.innerType === ContentType.applicationData) return d.content;
-			if (d.innerType === ContentType.alert) {
-				if (d.content[1] === 0) return null; // close_notify
-				throw new Error('TLS alert desc=' + d.content[1]);
-			}
-			if (d.innerType === ContentType.handshake) this.onPostHandshake(d.content);
+			const d = this.appRead.decrypt(rec);
+			const out = this.routeApp(d);
+			if (out !== CONTINUE) return out;
 		}
+	}
+
+	/** Native-AEAD (ChaCha) path: decrypt every buffered record in PARALLEL and keep a FIFO of
+	 *  in-flight decrypts, returning them in wire order. The native crypto runs off-thread, so
+	 *  N records in one socket chunk decrypt concurrently (~1 GB/s) instead of one at a time. */
+	private async readAppAsync(): Promise<Uint8Array | null> {
+		for (;;) {
+			if (this.inflight.length === 0) {
+				const rec = await this.pullRecord();
+				if (rec === null) return null;
+				this.dispatch(rec);
+				for (let r = this.rr.next(); r; r = this.rr.next()) this.dispatch(r); // drain the chunk
+				if (this.inflight.length === 0) continue; // only CCS seen → pull more
+			}
+			const h = this.inflight.shift()!;
+			const d = await h.p; // wire order; a decrypt failure rejects here, after earlier records returned
+			const out = this.routeApp(d); // a KeyUpdate record rotates appRead inside here
+			if (this.appRead !== h.dir) this.redispatch(); // …so re-decrypt the queued records with the new key
+			if (out !== CONTINUE) return out;
+		}
+	}
+
+	/** Queue one record's async decrypt (seq is assigned now, in wire order). CCS carries no seq. */
+	private dispatch(rec: { type: number; fragment: Uint8Array }): void {
+		if (rec.type === ContentType.changeCipherSpec) return;
+		const dir = this.appRead;
+		const p = dir.decryptAsync(rec);
+		p.catch(() => {}); // a discarded record's later rejection must not be an unhandledRejection
+		this.inflight.push({ rec, dir, p });
+	}
+
+	/** After a KeyUpdate, re-decrypt the records still queued (dispatched under the old key) with
+	 *  the new key, starting at its seq 0 — in queue order, which is wire order. */
+	private redispatch(): void {
+		for (const e of this.inflight) {
+			e.dir = this.appRead;
+			e.p = e.dir.decryptAsync(e.rec);
+			e.p.catch(() => {});
+		}
+	}
+
+	/** Route one decrypted record. Returns the app bytes to hand out, null on EOF/close_notify,
+	 *  or the CONTINUE sentinel to keep reading (CCS already filtered; handshake handled inline). */
+	private routeApp(d: { innerType: number; content: Uint8Array }): Uint8Array | null | typeof CONTINUE {
+		if (d.innerType === ContentType.applicationData) return d.content;
+		if (d.innerType === ContentType.alert) {
+			if (d.content[1] === 0) return null; // close_notify
+			throw new Error('TLS alert desc=' + d.content[1]);
+		}
+		if (d.innerType === ContentType.handshake) this.onPostHandshake(d.content);
+		return CONTINUE;
 	}
 
 	/** Post-handshake messages: capture NewSessionTicket (resumption) and honor KeyUpdate

@@ -4,8 +4,9 @@
 // decrypt round-trips across the seq 255/256 boundary for AES-128/256 and ChaCha.
 import assert from 'node:assert';
 import { RecordReader, AeadDir } from '../src/tls/record';
-import { aesGcm } from '../src/core/crypto';
+import { aesGcm, trafficKey, updateTraffic } from '../src/core/crypto';
 import { chacha20Poly1305 } from '../src/core/chacha';
+import { TlsClient } from '../src/tls/handshake';
 
 // Small seeded PRNG so a failure is reproducible by its seed.
 function mulberry32(seed: number) {
@@ -113,6 +114,120 @@ for (const mk of [() => aesGcm(16), () => aesGcm(32), () => chacha20Poly1305]) {
 		}
 	}
 	assert.equal(idx, 1000, 'all records decrypted');
+}
+
+// ── readApp ChaCha async queue: 80 records across a KeyUpdate, close_notify, corrupt record ──
+// Drives TlsClient.readApp over a mock Transport with injected app state, so the native-AEAD
+// parallel-decrypt path, the KeyUpdate re-dispatch and the in-order error are all exercised.
+{
+	let unhandled = false;
+	const onUnh = () => (unhandled = true);
+	process.on('unhandledRejection', onUnh);
+
+	const mkDir = (secret: Uint8Array) => {
+		const k = trafficKey('sha256', secret, 32);
+		return new AeadDir(chacha20Poly1305(k.key), k.iv);
+	};
+	// Build the server's wire: 40 app records (key0), KeyUpdate(update_requested) under key0,
+	// then 40 app records (key1), then close_notify. corruptAt flips a byte in that app record.
+	function serverWire(sAp: Uint8Array, corruptAt = -1): { wire: Uint8Array; payloads: Uint8Array[] } {
+		let sw = mkDir(sAp);
+		const recs: Uint8Array[] = [];
+		const payloads: Uint8Array[] = [];
+		const app = (i: number) => {
+			const p = crypto.getRandomValues(new Uint8Array(20 + (i % 50)));
+			payloads.push(p);
+			const r = sw.encrypt(23, p);
+			if (i === corruptAt) r[r.length - 1] ^= 0x40; // break this record's tag
+			recs.push(r);
+		};
+		for (let i = 0; i < 40; i++) app(i);
+		recs.push(sw.encrypt(22, Uint8Array.of(24, 0, 0, 1, 1))); // KeyUpdate, update_requested=1 (key0)
+		sw = mkDir(updateTraffic('sha256', sAp)); // server rotates its write key
+		for (let i = 40; i < 80; i++) app(i);
+		recs.push(sw.encrypt(21, Uint8Array.of(1, 0))); // close_notify (warning, desc 0)
+		const total = recs.reduce((s, r) => s + r.length, 0);
+		const wire = new Uint8Array(total);
+		let o = 0;
+		for (const r of recs) {
+			wire.set(r, o);
+			o += r.length;
+		}
+		return { wire, payloads };
+	}
+
+	// A mock Transport that yields `wire` in the given pieces, captures writes, then EOF.
+	function mockTransport(wire: Uint8Array, splits: number[]) {
+		const points = [0, ...splits.filter((p) => p > 0 && p < wire.length).sort((a, b) => a - b), wire.length];
+		let k = 0;
+		const writes: Uint8Array[] = [];
+		return {
+			writes,
+			t: {
+				write: (b: Uint8Array) => writes.push(b),
+				writeAsync: async (b: Uint8Array) => void writes.push(b),
+				read: async () => (k >= points.length - 1 ? null : wire.subarray(points[k]!, points[++k]!)),
+				close: () => {}
+			}
+		};
+	}
+
+	function makeClient(mock: ReturnType<typeof mockTransport>['t'], sAp: Uint8Array, cAp: Uint8Array): TlsClient {
+		const tls = new TlsClient(mock as never, { host: 'x' } as never);
+		Object.assign(tls, {
+			appMode: true,
+			suite: { hash: 'sha256', aead: chacha20Poly1305, keyLen: 32 },
+			sApSecret: sAp,
+			cApSecret: cAp,
+			appRead: mkDir(sAp),
+			appWrite: mkDir(cAp)
+		});
+		return tls;
+	}
+
+	// (1) clean run, fed as ONE chunk (KeyUpdate sits in the middle of a single decrypt batch).
+	for (const splitName of ['one chunk', 'random splits'] as const) {
+		const sAp = crypto.getRandomValues(new Uint8Array(32));
+		const cAp = crypto.getRandomValues(new Uint8Array(32));
+		const { wire, payloads } = serverWire(sAp);
+		const splits = splitName === 'one chunk' ? [] : Array.from({ length: 12 }, () => Math.floor(Math.random() * wire.length));
+		const mock = mockTransport(wire, splits);
+		const tls = makeClient(mock.t, sAp, cAp);
+		for (let i = 0; i < 80; i++) {
+			const got = await tls.readApp();
+			assert.deepEqual(got, payloads[i], `${splitName}: record ${i}`);
+		}
+		assert.equal(await tls.readApp(), null, `${splitName}: close_notify → null`);
+		// Exactly one write: our KeyUpdate reply, decryptable with client key0 as a handshake msg.
+		assert.equal(mock.writes.length, 1, `${splitName}: exactly one KeyUpdate reply written`);
+		const reply = mkDir(cAp).decrypt((() => {
+			const w = mock.writes[0]!;
+			const len = (w[3]! << 8) | w[4]!;
+			return { type: w[0]!, fragment: w.subarray(5, 5 + len) };
+		})());
+		assert.equal(reply.innerType, 22, `${splitName}: reply is a handshake record`);
+		assert.equal(reply.content[0], 24, `${splitName}: reply is a KeyUpdate`);
+	}
+
+	// (2) a corrupt record mid-batch: earlier records come out, then readApp throws, in order.
+	{
+		const sAp = crypto.getRandomValues(new Uint8Array(32));
+		const cAp = crypto.getRandomValues(new Uint8Array(32));
+		const { wire, payloads } = serverWire(sAp, 5); // break app record #5
+		const tls = makeClient(mockTransport(wire, []).t, sAp, cAp);
+		for (let i = 0; i < 5; i++) assert.deepEqual(await tls.readApp(), payloads[i], `corrupt: record ${i} before the bad one`);
+		let threw = false;
+		try {
+			await tls.readApp();
+		} catch {
+			threw = true;
+		}
+		assert.ok(threw, 'corrupt: readApp throws on the bad record');
+	}
+
+	await new Promise((r) => setTimeout(r, 10)); // let any stray rejection surface
+	process.off('unhandledRejection', onUnh);
+	assert.equal(unhandled, false, 'no unhandled rejection from discarded decrypts');
 }
 
 console.log(`record: OK (${fuzzChecks} fuzz fragments)`);
