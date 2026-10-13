@@ -17,7 +17,7 @@ export interface Transport {
 
 /** Settle with `p`, or reject with the signal's reason as soon as it aborts. A value that
  *  arrives after the abort goes to `onLate` (close it — nothing in flight may leak). */
-function abortable<T>(p: Promise<T>, signal: AbortSignal | undefined, onLate?: (v: T) => void): Promise<T> {
+export function abortable<T>(p: Promise<T>, signal: AbortSignal | undefined, onLate?: (v: T) => void): Promise<T> {
 	if (!signal) return p;
 	if (signal.aborted) {
 		p.then((v) => onLate?.(v), () => {});
