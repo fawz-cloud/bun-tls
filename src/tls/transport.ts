@@ -93,7 +93,10 @@ async function rawConnect(host: string, port: number): Promise<RawConn> {
 		socket: {
 			binaryType: 'uint8array',
 			data(_s, data: Uint8Array) {
-				q.push(new Uint8Array(data)); // Bun reuses the buffer → copy
+				// Bun hands each data() a fresh, exact-size buffer it never reuses (proven by
+				// test/transport.test.ts), so we adopt it directly — no copy. RecordReader holds
+				// views into these across awaits, which is safe exactly because they are not reused.
+				q.push(data);
 			},
 			drain() {
 				flush(); // socket writable again → push queued bytes, wake waiters
