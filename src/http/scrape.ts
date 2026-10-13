@@ -48,8 +48,19 @@ export interface ScrapeOptions extends Omit<FetchInit, 'method' | 'body'> {
 	onlyMainContent?: boolean;
 	/** CSS-schema extraction → ScrapeResult.extracted. */
 	extract?: CssSchema;
+	/** Prune low-value blocks (nav/menu residue, link-dense short blocks) from the Markdown. */
+	fit?: boolean;
 	/** Truncate the Markdown to this many characters (token budget). */
 	maxChars?: number;
+}
+
+/** An LLM call: a function you provide, or an OpenAI-compatible chat endpoint (OpenAI,
+ *  Ollama at http://localhost:11434/v1/chat/completions, any compatible gateway). */
+export type LlmFn = (prompt: string) => Promise<string>;
+export interface LlmConfig {
+	endpoint: string;
+	apiKey?: string;
+	model: string;
 }
 
 const abs = (href: string | null, base: string): string => {
@@ -194,6 +205,27 @@ async function extractSchema(html: string, schema: CssSchema): Promise<Record<st
 	return records.map((r) => Object.fromEntries(Object.entries(r).map(([k, v]) => [k, decode(v).trim()])));
 }
 
+/** Drop low-value Markdown blocks (nav/menu residue): link-dense short blocks and link-only
+ *  lists. Keeps headings and text-dense paragraphs (crawl4ai's "fit markdown" idea, heuristic). */
+export function fitMarkdown(md: string): string {
+	const linkRe = /\[[^\]]*\]\([^)]*\)/g;
+	return md
+		.split(/\n{2,}/)
+		.filter((raw) => {
+			const t = raw.trim();
+			if (!t) return false;
+			if (/^#{1,6}\s/.test(t)) return true; // keep headings
+			const linkChars = (t.match(linkRe) || []).join('').length;
+			const density = linkChars / t.length;
+			if (density > 0.6 && t.length < 400) return false; // nav / link list
+			if (t.length < 30 && density > 0.3) return false; // stray menu link
+			return true;
+		})
+		.join('\n\n')
+		.replace(/\n{3,}/g, '\n\n')
+		.trim();
+}
+
 const AS_FORMATS: Record<string, Format[]> = { data: ['json'], markdown: ['markdown', 'json'], readable: ['readable', 'json'], auto: ['markdown', 'json', 'links'] };
 
 /** Fetch a URL via bun-tls and return LLM-ready output (Firecrawl-style `formats`). */
@@ -207,10 +239,58 @@ export async function scrape(url: string, opts: ScrapeOptions = {}): Promise<Scr
 	let markdown = '';
 	if (formats.has('markdown') || formats.has('readable') || formats.has('text')) {
 		markdown = await toMarkdown(html, readable);
+		if (opts.fit) markdown = fitMarkdown(markdown);
 		if (opts.maxChars && markdown.length > opts.maxChars) markdown = markdown.slice(0, opts.maxChars) + '\n…[truncated]';
 	}
 	const result: ScrapeResult = { url, status: r.status, markdown, ...data };
 	if (formats.has('html')) result.html = await cleanHtml(html, readable);
 	if (opts.extract) result.extracted = await extractSchema(html, opts.extract);
 	return result;
+}
+
+async function callLlm(llm: LlmFn | LlmConfig, prompt: string): Promise<string> {
+	if (typeof llm === 'function') return llm(prompt);
+	const res = await globalThis.fetch(llm.endpoint, {
+		method: 'POST',
+		headers: { 'content-type': 'application/json', ...(llm.apiKey ? { authorization: `Bearer ${llm.apiKey}` } : {}) },
+		body: JSON.stringify({ model: llm.model, messages: [{ role: 'user', content: prompt }], temperature: 0, response_format: { type: 'json_object' } })
+	});
+	const j = (await res.json()) as { choices?: { message?: { content?: string } }[] };
+	return j.choices?.[0]?.message?.content ?? '';
+}
+
+export interface ExtractLLMOptions extends ScrapeOptions {
+	/** JSON Schema the output should match (sent to the model as a contract). */
+	schema?: object;
+	/** Extra instruction, e.g. "Extract the product name, price and rating." */
+	prompt?: string;
+	/** The LLM to call — a function, or an OpenAI-compatible endpoint config. */
+	llm: LlmFn | LlmConfig;
+	/** Feed the model Markdown (default) or cleaned HTML. */
+	from?: 'markdown' | 'html';
+}
+
+/**
+ * LLM-powered structured extraction (like Firecrawl's Agent / crawl4ai's LLMExtractionStrategy):
+ * scrape the page to Markdown (or HTML), hand it to your LLM with the schema + prompt, and
+ * return the parsed JSON. bun-tls does the fetch (clearing the WAF) and token-cheap Markdown;
+ * you bring any model (OpenAI, a local Ollama endpoint, or your own function).
+ */
+export async function extractLLM(url: string, opts: ExtractLLMOptions): Promise<unknown> {
+	const from = opts.from ?? 'markdown';
+	const r = await scrape(url, { ...opts, formats: from === 'html' ? ['html'] : ['markdown'], fit: opts.fit ?? true, maxChars: opts.maxChars ?? 16000 });
+	const content = (from === 'html' ? r.html : r.markdown) ?? '';
+	const prompt =
+		`${opts.prompt ?? 'Extract the structured data from the content below.'}\n\n` +
+		`Return ONLY a valid JSON object${opts.schema ? ' matching this JSON Schema:\n' + JSON.stringify(opts.schema) : ''}. No prose, no code fences.\n\n` +
+		`--- CONTENT (${url}) ---\n${content}`;
+	const raw = await callLlm(opts.llm, prompt);
+	const text = raw.trim().replace(/^```(?:json)?\s*/i, '').replace(/```$/i, '').trim();
+	try {
+		return JSON.parse(text);
+	} catch {
+		const m = text.match(/\{[\s\S]*\}/);
+		if (m) try { return JSON.parse(m[0]); } catch { /* fall through */ }
+		return { _raw: raw };
+	}
 }

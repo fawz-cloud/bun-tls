@@ -16,6 +16,7 @@ const TOOLS = [
 				url: { type: 'string', description: 'The https URL to fetch.' },
 				formats: { type: 'array', items: { type: 'string', enum: ['markdown', 'readable', 'html', 'links', 'json', 'text'] }, description: 'Default ["markdown","json"].' },
 				onlyMainContent: { type: 'boolean', description: 'Drop nav/header/footer/aside.' },
+				fit: { type: 'boolean', description: 'Prune nav/menu residue from the Markdown (token-cheaper).' },
 				persona: { type: 'string', enum: ['chrome', 'edge', 'firefox', 'safari'], description: 'Browser fingerprint (default chrome).' },
 				maxChars: { type: 'number', description: 'Truncate Markdown to this many characters.' }
 			},
@@ -67,7 +68,7 @@ interface Args {
 async function runTool(name: string, a: Args): Promise<unknown> {
 	const persona = (a.persona as string) ?? 'chrome';
 	if (name === 'scrape') {
-		const r = await scrape(a.url as string, { formats: (a.formats as Format[]) ?? ['markdown', 'json'], onlyMainContent: a.onlyMainContent as boolean, persona, maxChars: a.maxChars as number });
+		const r = await scrape(a.url as string, { formats: (a.formats as Format[]) ?? ['markdown', 'json'], onlyMainContent: a.onlyMainContent as boolean, fit: a.fit as boolean, persona, maxChars: a.maxChars as number });
 		return slim(r);
 	}
 	if (name === 'crawl') {
