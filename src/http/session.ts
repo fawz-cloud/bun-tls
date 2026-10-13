@@ -232,7 +232,7 @@ export class Session {
 		while (idle && idle.length) {
 			const tls = idle.pop()!;
 			try {
-				return this.recycle(key, tls, await roundtrip(tls, rt), keepAlive);
+				return this.recycle(key, tls, await this.timed(open.timeoutMs, tls, roundtrip(tls, rt)), keepAlive);
 			} catch (e) {
 				try {
 					tls.close();
@@ -251,7 +251,7 @@ export class Session {
 		const resume = ticket ? { ticket, earlyData: use0rtt } : undefined;
 		const earlyData = use0rtt ? serializeForEarly(rt) : undefined;
 		const tls = await openConnection({ ...open, resume, earlyData, onTicket: (t) => this.tickets.add(tkey, t) });
-		return this.recycle(key, tls, await roundtrip(tls, rt, tls.earlyAccepted), keepAlive);
+		return this.recycle(key, tls, await this.timed(open.timeoutMs, tls, roundtrip(tls, rt, tls.earlyAccepted)), keepAlive);
 	}
 
 	private recycle(key: string, tls: TlsConn, res: ClientResponse, keepAlive: boolean): ClientResponse {
@@ -291,8 +291,30 @@ export class Session {
 			}
 			entry = dialed;
 		}
-		const res = await entry.conn.request(req);
+		const res = await entry.conn.request(req, open.timeoutMs); // per-stream deadline, not the whole conn
 		return Object.assign(res, entry.fp);
+	}
+
+	/** Race a roundtrip against a deadline that closes the (single) connection on expiry. */
+	private async timed<T>(ms: number | undefined, tls: TlsConn, p: Promise<T>): Promise<T> {
+		if (!ms) return p;
+		p.catch(() => {}); // the loser's later rejection is expected — don't leave it unhandled
+		let timer!: ReturnType<typeof setTimeout>;
+		const deadline = new Promise<never>((_, rej) => {
+			timer = setTimeout(() => {
+				try {
+					tls.close();
+				} catch {
+					/* already gone */
+				}
+				rej(new Error('request timed out'));
+			}, ms);
+		});
+		try {
+			return await Promise.race([p, deadline]);
+		} finally {
+			clearTimeout(timer);
+		}
 	}
 
 	/** Dial one HTTP/2 connection for `key`, pool it, and return its entry — or null if the

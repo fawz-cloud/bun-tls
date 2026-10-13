@@ -300,6 +300,7 @@ interface H2Stream {
 	recv: number; // bytes received since our last WINDOW_UPDATE
 	sendWindow: number; // peer's flow window for our DATA on this stream
 	done: boolean;
+	timer?: ReturnType<typeof setTimeout>; // per-stream deadline (cleared on finish/cancel)
 	settle: (r: HttpResponse) => void;
 	fail: (e: Error) => void;
 }
@@ -339,7 +340,7 @@ export class H2Connection {
 
 	/** Open a new stream for one request; resolves when that stream ends. Safe to call
 	 *  many times concurrently — the requests multiplex over the one connection. */
-	async request(req: H2Request): Promise<HttpResponse> {
+	async request(req: H2Request, timeoutMs?: number): Promise<HttpResponse> {
 		// Respect the peer's SETTINGS_MAX_CONCURRENT_STREAMS: queue while at the limit.
 		while (!this.closed && this.streams.size >= this.peerMaxStreams) await new Promise<void>((r) => this.streamWaiters.push(r));
 		if (this.closed) throw new Error('h2: connection is closed');
@@ -366,6 +367,8 @@ export class H2Connection {
 			st.settle = res;
 			st.fail = rej;
 		});
+		// Per-stream deadline: cancel just this stream (RST_STREAM), not the shared connection.
+		if (timeoutMs) st.timer = setTimeout(() => this.cancelStream(id), timeoutMs);
 		if (hasBody) void this.sendBody(id, st, req.body!);
 		return p;
 	}
@@ -397,6 +400,22 @@ export class H2Connection {
 	/** A finished/reset stream frees a concurrency slot — wake one queued request. */
 	private wakeStream(): void {
 		this.streamWaiters.shift()?.();
+	}
+
+	/** Cancel one stream (its deadline fired): RST_STREAM(CANCEL) + reject, leaving the
+	 *  shared connection and its other streams untouched. */
+	private cancelStream(id: number): void {
+		const st = this.streams.get(id);
+		if (!st || st.done) return;
+		st.done = true;
+		this.streams.delete(id);
+		this.wakeStream();
+		try {
+			this.tls.writeApp(frame(FRAME.RST_STREAM, 0, id, u32(0x8))); // CANCEL
+		} catch {
+			/* connection already gone */
+		}
+		st.fail(new Error('h2: stream timed out'));
 	}
 
 	/** Write a header block, splitting into HEADERS + CONTINUATION when it exceeds the peer's
@@ -484,6 +503,7 @@ export class H2Connection {
 		} else if (f.type === FRAME.RST_STREAM) {
 			this.streams.delete(f.streamId);
 			this.wakeStream();
+			if (st.timer) clearTimeout(st.timer);
 			if (!st.done) {
 				st.done = true;
 				st.fail(new Error('h2: stream reset by server'));
@@ -513,6 +533,7 @@ export class H2Connection {
 	private finish(id: number, st: H2Stream): void {
 		if (st.done) return;
 		st.done = true;
+		if (st.timer) clearTimeout(st.timer);
 		this.streams.delete(id);
 		this.wakeStream(); // a concurrency slot freed
 		const headers: Record<string, string | string[]> = {};
@@ -543,6 +564,7 @@ export class H2Connection {
 		for (const st of this.streams.values())
 			if (!st.done) {
 				st.done = true;
+				if (st.timer) clearTimeout(st.timer);
 				st.fail(e);
 			}
 		this.streams.clear();

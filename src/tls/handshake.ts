@@ -362,7 +362,13 @@ export class TlsClient {
 		const g = server.selectedGroup;
 		if (g == null || !(g === Group.x25519 || g === Group.secp256r1 || g === Group.secp384r1))
 			throw new Error('HelloRetryRequest asked for a group we cannot negotiate: ' + g);
-		const ch2 = buildClientHello({ ...this.opts.fingerprint, keyShareGroups: [g] }, this.opts.host, resume ? { ...resume, earlyData: false } : undefined, server.cookie);
+		// CH2 keeps CH1's random + session_id, and (when resuming) binds its PSK over the full
+		// retry transcript — synthetic message_hash(CH1) || HRR || truncated CH2 (RFC 8446 §4.1.2).
+		const ch2 = buildClientHello({ ...this.opts.fingerprint, keyShareGroups: [g] }, this.opts.host, resume ? { ...resume, earlyData: false } : undefined, server.cookie, undefined, {
+			random: ch.random,
+			sessionId: ch.sessionId,
+			binderPrefix: concat(synthetic, hrr.raw)
+		});
 		this.addTranscript(ch2.bytes);
 		this.t.write(plaintextRecord(ContentType.handshake, ch2.bytes));
 		const sh = await this.nextHandshakeMsg(false);

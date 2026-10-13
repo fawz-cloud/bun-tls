@@ -1,7 +1,7 @@
 // Assemble a ClientHello from a Fingerprint, and compute JA3/JA4 by PARSING the
 // finished ClientHello (single source of truth: the hash == exactly what we send).
 import crypto from 'node:crypto';
-import { Reader, Writer } from '../core/bytes';
+import { Reader, Writer, concat } from '../core/bytes';
 import { Ext, GREASE, Group, TLS12, isGrease } from '../core/consts';
 import { grease as greaseExt, pskKeyExchangeModes, earlyData, cookie as cookieExt, type Extension, type ExtCtx } from './extensions';
 import { x25519Keypair, earlySecret, binderKey, pskBinder } from '../core/crypto';
@@ -97,7 +97,16 @@ function genShare(group: number): { priv: crypto.KeyObject; pub: Uint8Array } {
 	throw new Error(`group ${group} not supported for key_share`);
 }
 
-export function buildClientHello(fp: Fingerprint, host: string, resume?: ResumeSpec, cookie?: Uint8Array, prebuilt?: Map<number, Uint8Array>): BuiltHello {
+/** After a HelloRetryRequest the second ClientHello must keep CH1's random + session_id
+ *  (RFC 8446 §4.1.2), and its PSK binder is computed over the FULL retry transcript
+ *  (synthetic message_hash(CH1) || HelloRetryRequest || truncated CH2), passed as `binderPrefix`. */
+export interface RetrySpec {
+	random: Uint8Array;
+	sessionId: Uint8Array;
+	binderPrefix: Uint8Array;
+}
+
+export function buildClientHello(fp: Fingerprint, host: string, resume?: ResumeSpec, cookie?: Uint8Array, prebuilt?: Map<number, Uint8Array>, retry?: RetrySpec): BuiltHello {
 	const privs = new Map<number, crypto.KeyObject>();
 	const shares = fp.keyShareGroups.map((group) => {
 		const pre = prebuilt?.get(group);
@@ -109,8 +118,8 @@ export function buildClientHello(fp: Fingerprint, host: string, resume?: ResumeS
 	const greaseA = fp.grease ? pickGrease() : null;
 	const greaseB = fp.grease ? pickGrease(greaseA) : null;
 	const ctx: ExtCtx = { host, shares, grease: greaseA };
-	const random = new Uint8Array(crypto.randomBytes(32));
-	const sessionId = new Uint8Array(crypto.randomBytes(32)); // TLS1.3 middlebox-compat
+	const random = retry?.random ?? new Uint8Array(crypto.randomBytes(32));
+	const sessionId = retry?.sessionId ?? new Uint8Array(crypto.randomBytes(32)); // TLS1.3 middlebox-compat (kept across HRR)
 
 	const ciphers = greaseA != null ? [greaseA, ...fp.ciphers] : fp.ciphers;
 	// Resumption needs psk_key_exchange_modes present, plus early_data for 0-RTT. A
@@ -158,7 +167,9 @@ export function buildClientHello(fp: Fingerprint, host: string, resume?: ResumeS
 		// list (its last 3+hashLen bytes: 2-byte list len + 1-byte entry len + binder).
 		const hLen = resume.ticket.hash === 'sha256' ? 32 : 48;
 		early = earlySecret(resume.ticket.hash, resume.ticket.psk);
-		const binder = pskBinder(resume.ticket.hash, binderKey(resume.ticket.hash, early), bytes.subarray(0, bytes.length - (3 + hLen)));
+		// On a retry the binder transcript is (synthetic CH1 || HRR || truncated CH2).
+		const truncated = concat(retry?.binderPrefix ?? new Uint8Array(0), bytes.subarray(0, bytes.length - (3 + hLen)));
+		const binder = pskBinder(resume.ticket.hash, binderKey(resume.ticket.hash, early), truncated);
 		bytes.set(binder, bytes.length - hLen);
 	}
 
