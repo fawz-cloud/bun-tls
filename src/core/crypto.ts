@@ -203,6 +203,9 @@ export function aesGcm(keyLen: 16 | 32): (key: Uint8Array) => Aead {
 	const algo = keyLen === 16 ? 'aes-128-gcm' : 'aes-256-gcm';
 	return (raw: Uint8Array): Aead => {
 		const key = crypto.createSecretKey(raw); // import once per traffic key, not per record
+		// node:crypto AES-GCM stays SYNC: a WebCrypto async path was tried, but routing AES
+		// through it made every small request pay async-dispatch overhead (tp 38.9k -> 25k) while
+		// barely helping bulk download, since node's per-record Cipher is already ~1.8 GB/s.
 		return {
 			keyLen,
 			seal(nonce, aad, pt) {
