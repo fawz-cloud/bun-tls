@@ -145,6 +145,9 @@ export class Session {
 	private tickets = new TicketStore();
 	/** Live multiplexed HTTP/2 connections, keyed by proxy|host:port. */
 	private h2pool = new Map<string, H2Entry>();
+	/** In-flight h2 dials, so concurrent requests to a new host share one connection. */
+	private h2dial = new Map<string, Promise<H2Entry | null>>();
+	private closedFlag = false;
 	constructor(private opts: SessionOptions = {}) {}
 
 	async request(req: RequestOptions): Promise<ClientResponse> {
@@ -271,25 +274,46 @@ export class Session {
 			entry = undefined;
 		}
 		if (!entry) {
-			const tls = await openConnection({ ...open, fingerprint: withH2(open.fingerprint ?? modern()), onTicket: (t) => this.tickets.add(`${open.host}|${policyOf(open)}`, t) });
-			const fp = { ja3: tls.ja3, ja3Hash: tls.ja3Hash, ja3n: tls.ja3n, ja3nHash: tls.ja3nHash, ja4: tls.ja4, alpn: tls.alpn };
-			if (tls.alpn !== 'h2') {
-				// server declined h2 → serve this request over HTTP/1.1 and drop the socket
+			// Deduplicate the dial: a cold burst of N concurrent requests shares ONE connection
+			// (otherwise each opens its own, defeating multiplexing — audit A06).
+			let dial = this.h2dial.get(key);
+			if (!dial) {
+				dial = this.dialH2(key, open, profile).finally(() => this.h2dial.delete(key));
+				this.h2dial.set(key, dial);
+			}
+			const dialed = await dial;
+			if (dialed === null) {
+				// server declined h2 on this host → serve this request over HTTP/1.1
+				const tls = await openConnection({ ...open });
 				const res = await roundtrip(tls, { method: req.method, host: open.host, path: req.path, headers: req.headers, body: req.body, keepAlive: false });
 				tls.close();
 				return res;
 			}
-			const conn = new H2Connection(tls);
-			conn.init(profile);
-			entry = { conn, fp };
-			this.h2pool.set(key, entry);
+			entry = dialed;
 		}
 		const res = await entry.conn.request(req);
 		return Object.assign(res, entry.fp);
 	}
 
+	/** Dial one HTTP/2 connection for `key`, pool it, and return its entry — or null if the
+	 *  server declined ALPN h2 (the caller then falls back to HTTP/1.1). */
+	private async dialH2(key: string, open: OpenOptions, profile?: H2Profile): Promise<H2Entry | null> {
+		const tls = await openConnection({ ...open, fingerprint: withH2(open.fingerprint ?? modern()), onTicket: (t) => this.tickets.add(`${open.host}|${policyOf(open)}`, t) });
+		if (tls.alpn !== 'h2') {
+			tls.close();
+			return null;
+		}
+		const conn = new H2Connection(tls);
+		conn.init(profile);
+		const entry: H2Entry = { conn, fp: { ja3: tls.ja3, ja3Hash: tls.ja3Hash, ja3n: tls.ja3n, ja3nHash: tls.ja3nHash, ja4: tls.ja4, alpn: tls.alpn } };
+		if (this.closedFlag) conn.close(); // Session was closed while we dialed — don't leak it
+		else this.h2pool.set(key, entry);
+		return entry;
+	}
+
 	/** Close all pooled connections (keep-alive and HTTP/2). Call when done with the Session. */
 	close(): void {
+		this.closedFlag = true; // any dial still in flight closes itself on resolve
 		for (const list of this.pool.values())
 			for (const tls of list)
 				try {

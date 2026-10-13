@@ -316,6 +316,10 @@ export class H2Connection {
 	private windowWaiters: (() => void)[] = [];
 	private goawayLast = Infinity;
 	private profile: H2Profile = CHROME_H2;
+	private connRecv = 0; // connection-level bytes received since our last conn WINDOW_UPDATE
+	private peerMaxStreams = Infinity; // SETTINGS_MAX_CONCURRENT_STREAMS the peer advertises
+	private peerMaxFrame = 16384; // SETTINGS_MAX_FRAME_SIZE the peer accepts
+	private streamWaiters: (() => void)[] = []; // requests queued behind the concurrency limit
 	closed = false;
 
 	constructor(private tls: TlsConn) {}
@@ -335,11 +339,13 @@ export class H2Connection {
 
 	/** Open a new stream for one request; resolves when that stream ends. Safe to call
 	 *  many times concurrently — the requests multiplex over the one connection. */
-	request(req: H2Request): Promise<HttpResponse> {
-		if (this.closed) return Promise.reject(new Error('h2: connection is closed'));
+	async request(req: H2Request): Promise<HttpResponse> {
+		// Respect the peer's SETTINGS_MAX_CONCURRENT_STREAMS: queue while at the limit.
+		while (!this.closed && this.streams.size >= this.peerMaxStreams) await new Promise<void>((r) => this.streamWaiters.push(r));
+		if (this.closed) throw new Error('h2: connection is closed');
 		const id = this.nextId;
 		this.nextId += 2;
-		if (id > this.goawayLast) return Promise.reject(new Error('h2: server sent GOAWAY, open a new connection'));
+		if (id > this.goawayLast) throw new Error('h2: server sent GOAWAY, open a new connection');
 		const st: H2Stream = { headerBytes: new Uint8Array(0), bodyParts: [], status: 0, respHeaders: [], recv: 0, sendWindow: this.peerInitialWindow, done: false, settle: () => {}, fail: () => {} };
 		this.streams.set(id, st);
 		const pseudo: Record<string, [string, string]> = {
@@ -355,7 +361,7 @@ export class H2Connection {
 			hdrs.push([lk, v]);
 		}
 		const hasBody = !!(req.body && req.body.length);
-		this.tls.writeApp(frame(FRAME.HEADERS, F_END_HEADERS | (hasBody ? 0 : F_END_STREAM), id, encodeHeaders(hdrs)));
+		this.writeHeaders(id, encodeHeaders(hdrs), !hasBody);
 		const p = new Promise<HttpResponse>((res, rej) => {
 			st.settle = res;
 			st.fail = rej;
@@ -386,6 +392,27 @@ export class H2Connection {
 		const w = this.windowWaiters;
 		this.windowWaiters = [];
 		for (const f of w) f();
+	}
+
+	/** A finished/reset stream frees a concurrency slot — wake one queued request. */
+	private wakeStream(): void {
+		this.streamWaiters.shift()?.();
+	}
+
+	/** Write a header block, splitting into HEADERS + CONTINUATION when it exceeds the peer's
+	 *  MAX_FRAME_SIZE (RFC 9113 §4.3). END_STREAM rides the HEADERS; END_HEADERS the last frame. */
+	private writeHeaders(id: number, block: Uint8Array, endStream: boolean): void {
+		const max = this.peerMaxFrame;
+		if (block.length <= max) {
+			this.tls.writeApp(frame(FRAME.HEADERS, F_END_HEADERS | (endStream ? F_END_STREAM : 0), id, block));
+			return;
+		}
+		this.tls.writeApp(frame(FRAME.HEADERS, endStream ? F_END_STREAM : 0, id, block.subarray(0, max)));
+		for (let off = max; off < block.length; ) {
+			const end = Math.min(off + max, block.length);
+			this.tls.writeApp(frame(FRAME.CONTINUATION, end >= block.length ? F_END_HEADERS : 0, id, block.subarray(off, end)));
+			off = end;
+		}
 	}
 
 	private async readLoop(): Promise<void> {
@@ -437,9 +464,16 @@ export class H2Connection {
 			let padLen = 0;
 			if (f.flags & 0x8) padLen = pl[o++]!;
 			st.bodyParts.push(pl.subarray(o, pl.length - padLen));
+			// Flow control counts the whole DATA payload (incl. padding). Replenish the
+			// CONNECTION window independently of streams — otherwise the bytes of many small
+			// streams never credit it back and the connection stalls after ~total window.
+			this.connRecv += f.payload.length;
+			if (this.connRecv >= 1 << 16) {
+				this.tls.writeApp(frame(FRAME.WINDOW_UPDATE, 0, 0, u32(this.connRecv)));
+				this.connRecv = 0;
+			}
 			st.recv += f.payload.length;
-			if (st.recv >= 1 << 18) {
-				this.tls.writeApp(frame(FRAME.WINDOW_UPDATE, 0, 0, u32(st.recv)));
+			if (st.recv >= 1 << 16) {
 				this.tls.writeApp(frame(FRAME.WINDOW_UPDATE, 0, f.streamId, u32(st.recv)));
 				st.recv = 0;
 			}
@@ -449,6 +483,7 @@ export class H2Connection {
 			this.wakeWindow();
 		} else if (f.type === FRAME.RST_STREAM) {
 			this.streams.delete(f.streamId);
+			this.wakeStream();
 			if (!st.done) {
 				st.done = true;
 				st.fail(new Error('h2: stream reset by server'));
@@ -459,13 +494,18 @@ export class H2Connection {
 	private applySettings(payload: Uint8Array): void {
 		for (let i = 0; i + 6 <= payload.length; i += 6) {
 			const id = (payload[i]! << 8) | payload[i + 1]!;
+			const val = readU32(payload.subarray(i + 2));
 			if (id === 0x4) {
 				// INITIAL_WINDOW_SIZE: adjust every open stream's send window by the delta (RFC §6.9.2)
-				const val = readU32(payload.subarray(i + 2));
 				const delta = val - this.peerInitialWindow;
 				this.peerInitialWindow = val;
 				for (const s of this.streams.values()) s.sendWindow += delta;
 				this.wakeWindow();
+			} else if (id === 0x3) {
+				this.peerMaxStreams = val; // MAX_CONCURRENT_STREAMS
+				this.wakeStream();
+			} else if (id === 0x5) {
+				this.peerMaxFrame = val; // MAX_FRAME_SIZE the peer accepts for our frames
 			}
 		}
 	}
@@ -474,6 +514,7 @@ export class H2Connection {
 		if (st.done) return;
 		st.done = true;
 		this.streams.delete(id);
+		this.wakeStream(); // a concurrency slot freed
 		const headers: Record<string, string | string[]> = {};
 		for (const [k, v] of st.respHeaders) {
 			if (k.startsWith(':')) continue;
@@ -497,6 +538,8 @@ export class H2Connection {
 	private fatal(e: Error): void {
 		this.closed = true;
 		this.wakeWindow();
+		for (const f of this.streamWaiters) f(); // unblock queued requests → they see closed
+		this.streamWaiters = [];
 		for (const st of this.streams.values())
 			if (!st.done) {
 				st.done = true;
