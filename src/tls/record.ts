@@ -13,21 +13,81 @@ interface Record {
 	fragment: Uint8Array;
 }
 
-/** Buffer incoming bytes → emit complete records one at a time. */
+/** Buffer incoming bytes → emit complete records one at a time. Holds a queue of chunks and
+ *  reads across them, so a large socket chunk (Bun hands us ~400-512 KiB) is never copied: a
+ *  record wholly inside one chunk is a view; only a record that straddles two chunks is copied,
+ *  into a fresh exact-size buffer (never reused, so views handed out stay valid). */
 export class RecordReader {
-	private buf: Uint8Array = new Uint8Array(0);
+	private q: Uint8Array[] = []; // pending chunks; q[0] is read from `off`
+	private off = 0; // read position within q[0]
+	private n = 0; // total unread bytes across the queue
+
 	feed(b: Uint8Array): void {
-		this.buf = this.buf.length ? concat(this.buf, b) : b;
+		if (b.length) {
+			this.q.push(b);
+			this.n += b.length;
+		}
 	}
-	/** null = not enough bytes yet for a full record. */
+
+	/** null = not enough bytes yet for a full record (nothing is consumed in that case). */
 	next(): Record | null {
-		if (this.buf.length < 5) return null;
-		const len = (this.buf[3]! << 8) | this.buf[4]!;
-		if (this.buf.length < 5 + len) return null;
-		const type = this.buf[0]!;
-		const fragment = this.buf.subarray(5, 5 + len);
-		this.buf = this.buf.subarray(5 + len);
-		return { type, fragment };
+		if (this.n < 5) return null;
+		const len = (this.peek(3) << 8) | this.peek(4);
+		if (this.n < 5 + len) return null;
+		const type = this.peek(0);
+		this.drop(5);
+		return { type, fragment: this.take(len) };
+	}
+
+	/** Byte at offset `i` from the current read position, fast path when it is inside q[0]. */
+	private peek(i: number): number {
+		const c0 = this.q[0]!;
+		const p = this.off + i;
+		if (p < c0.length) return c0[p]!;
+		let rem = p - c0.length;
+		for (let k = 1; k < this.q.length; k++) {
+			const c = this.q[k]!;
+			if (rem < c.length) return c[rem]!;
+			rem -= c.length;
+		}
+		throw new Error('record peek past end'); // unreachable: callers check n first
+	}
+
+	/** Advance the read position by `len`, dropping fully-read chunks. */
+	private drop(len: number): void {
+		this.n -= len;
+		let need = len;
+		while (need > 0) {
+			const avail = this.q[0]!.length - this.off;
+			if (need < avail) {
+				this.off += need;
+				return;
+			}
+			need -= avail;
+			this.q.shift();
+			this.off = 0;
+		}
+	}
+
+	/** Take the next `len` bytes: a view when they sit inside q[0], else a fresh joined copy. */
+	private take(len: number): Uint8Array {
+		if (len === 0) return new Uint8Array(0); // empty record (e.g. a 0-length app-data record)
+		const c0 = this.q[0]!;
+		if (this.off + len <= c0.length) {
+			const v = c0.subarray(this.off, this.off + len);
+			this.drop(len);
+			return v;
+		}
+		const out = new Uint8Array(len);
+		let w = 0;
+		while (w < len) {
+			const c = this.q[0]!;
+			const take = Math.min(len - w, c.length - this.off);
+			out.set(c.subarray(this.off, this.off + take), w);
+			w += take;
+			this.drop(take);
+		}
+		return out;
 	}
 }
 
