@@ -23,6 +23,7 @@ intro see the [README](README.md); this file is the complete API.
 - [Compression](#compression)
 - [Scraping for LLMs](#scraping-for-llms)
 - [Crawling](#crawling)
+- [Web search](#web-search)
 - [MCP server](#mcp-server)
 - [Low-level API](#low-level-api)
 - [Exports](#exports)
@@ -781,6 +782,49 @@ order; a URL that fails yields `status: 0` with empty fields.
 
 ---
 
+## Web search
+
+`search()` returns `{ title, url, snippet }[]` with no API key and no browser, fetched through
+bun-tls so the request carries a real browser's fingerprint.
+
+```ts
+import { search } from './src';
+
+const hits = await search('site reliability engineering');       // DuckDuckGo
+for (const { title, url } of hits) console.log(title, url);
+```
+
+| `SearchOptions` | type | default | notes |
+|---|---|---|---|
+| `engine` | `'duckduckgo' \| 'bing' \| 'brave' \| 'startpage'` | `'duckduckgo'` | see the table below |
+| `limit` | `number` | `10` | |
+| `persona` | `string \| Persona` | `'chrome'` | |
+| `proxy` | `string` | — | `http://…` or `socks5://…`; required for brave/startpage |
+| `retries` | `number` | `2` | on a 429 / 503 / 202 throttle, with backoff |
+| `timeoutMs` | `number` | `20000` | |
+
+Which engine returns usable results natively depends on how the engine gates scrapers, not on
+the fingerprint — bun-tls clears the TLS/HTTP fingerprint check at all of them (each homepage
+loads), but some gate the **search endpoint** further:
+
+| engine | native (no proxy) | why |
+|---|---|---|
+| **duckduckgo** | ✅ reliable | server-rendered HTML/Lite endpoint, clean destination URLs + snippets. First hit may return a `202` throttle; `search()` retries it. |
+| bing | ⚠ inconsistent | 200, but serves plausible-looking **wrong** results for some queries from a flagged IP. Titles/URLs are decoded from its `/ck/a` redirect wrapper when results are real. |
+| brave | ✗ needs proxy | the query returns `429` from a datacenter IP (the homepage is fine). Pass a residential `proxy`. |
+| startpage | ✗ needs proxy | the query redirects to a CAPTCHA block for a flagged IP. Pass a residential `proxy`. |
+
+Google is deliberately absent: `https://www.google.com/search` returns `200` but a
+JavaScript-only shell with no results in the HTML, so there is nothing to parse without
+running the page's scripts.
+
+`search()` throws if the engine blocks the request after the retries. Brave and Startpage
+parse their results generically (external result links); DuckDuckGo and Bing have exact
+parsers. `parseSearchResults(engine, html)` is exported to parse result HTML you captured
+through your own proxy.
+
+---
+
 ## MCP server
 
 `src/mcp.ts` is a [Model Context Protocol](https://modelcontextprotocol.io) server on stdio
@@ -802,6 +846,7 @@ Other clients take the same command in their MCP config:
 | `scrape` | `url`, `formats` (default `['llm']`), `onlyMainContent`, `fit`, `persona` (`chrome` / `edge` / `firefox` / `safari`), `maxChars` | the `llm` view as plain text under a `url (status)` line; JSON for other formats |
 | `crawl` | `url`, `limit` (15), `depth` (2), `persona` | each page's `llm` view, separated by `---` |
 | `map` | `url`, `limit` (2000), `search` | JSON `{ links }` |
+| `search` | `query`, `engine` (duckduckgo), `limit` (10), `proxy` | JSON `{ title, url, snippet }[]` — [web search](#web-search) |
 | `extract` | `url`, `baseSelector`, `fields` | JSON `{ url, status, records }` — [CSS extraction](#css-extraction--extract) |
 
 The `llm` view goes out as plain text, not inside a JSON string: escaping its newlines and
@@ -864,6 +909,7 @@ Everything below is re-exported from `./src` (`index.ts`):
 | `QuicConnection`, `h3Request` | class/fn | QUIC v1 + HTTP/3 |
 | `scrape`, `scrapeHtml`, `extractLLM`, `fitMarkdown` | fn | [scraping for LLMs](#scraping-for-llms) |
 | `crawl`, `map`, `batch` | fn | [crawling](#crawling) |
+| `search`, `parseSearchResults` | fn | [web search](#web-search) |
 | `startMcp` | fn | [MCP server](#mcp-server) on stdio |
 | `clients`, `JA3` | const | named presets + reference JA3 strings |
 | `personas`, `resolvePersona`, `randomPersona`, `personaHeaders` | const/fn | coherent browser personas |
@@ -884,7 +930,7 @@ Types: `RequestOptions`, `ClientResponse`, `SessionOptions`, `PoolOptions`, `Poo
 `PoolResponse`, `Fingerprint`, `FromJa3Opts`, `Persona`, `OcspMode`, `OcspStatus`, `H2Request`,
 `H2Profile`, `H3Response`, `TlsConn`, `FetchInit`, `WsOptions`, `WsMessage`, `ProxyOptions`,
 `ScrapeResult`, `ScrapeOptions`, `CssSchema`, `Format`, `LlmFn`, `LlmConfig`,
-`ExtractLLMOptions`, `CrawlOptions`, `MapOptions`.
+`ExtractLLMOptions`, `CrawlOptions`, `MapOptions`, `SearchResult`, `SearchOptions`, `SearchEngine`.
 
 `consts` holds `ContentType`, `HandshakeType`, `Ext`, `Cipher`, `Cipher12`, `Group`,
 `SigAlg`, `TLS12`, `TLS13`, `GREASE`, `isGrease`.
@@ -954,6 +1000,7 @@ ClientHello, so what is reported always equals what is sent.
 | `http/ws.ts` | WebSocket |
 | `http/scrape.ts` | `scrape()`, `scrapeHtml()`, the LLM view, CSS + LLM extraction |
 | `http/crawl.ts` | `crawl()`, `map()`, `batch()` |
+| `http/search.ts` | `search()` over DuckDuckGo / Bing / Brave / Startpage |
 | `mcp.ts` | MCP server |
 | `proxy.ts`, `cli.ts` | fingerprint proxy + its command line |
 

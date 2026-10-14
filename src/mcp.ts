@@ -5,6 +5,7 @@
 //   claude mcp add bun-tls -- bun /abs/path/to/src/mcp.ts
 import { scrape, type Format } from './http/scrape';
 import { crawl, map } from './http/crawl';
+import { search, type SearchEngine } from './http/search';
 
 const TOOLS = [
 	{
@@ -47,6 +48,20 @@ const TOOLS = [
 		}
 	},
 	{
+		name: 'search',
+		description: 'Web search without an API key — returns {title, url, snippet}[]. "duckduckgo" (default) is reliable; "bing" can return inconsistent results; "brave"/"startpage" gate by IP and need a residential `proxy`.',
+		inputSchema: {
+			type: 'object',
+			properties: {
+				query: { type: 'string' },
+				engine: { type: 'string', enum: ['duckduckgo', 'bing', 'brave', 'startpage'], description: 'Default duckduckgo.' },
+				limit: { type: 'number', description: 'Max results (default 10).' },
+				proxy: { type: 'string', description: 'http://… or socks5://… — required for brave/startpage.' }
+			},
+			required: ['query']
+		}
+	},
+	{
 		name: 'extract',
 		description: 'Extract repeating records from a page with a CSS schema (like a product grid or a list): one record per baseSelector match, each field read from a descendant selector as text or an attribute.',
 		inputSchema: {
@@ -77,6 +92,9 @@ async function runTool(name: string, a: Args): Promise<unknown> {
 	}
 	if (name === 'map') {
 		return await map(a.url as string, { limit: (a.limit as number) ?? 2000, search: a.search as string, persona });
+	}
+	if (name === 'search') {
+		return await search(a.query as string, { engine: a.engine as SearchEngine, limit: a.limit as number, proxy: a.proxy as string, persona });
 	}
 	if (name === 'extract') {
 		const r = await scrape(a.url as string, { formats: [], persona, extract: { baseSelector: a.baseSelector as string, fields: a.fields as { name: string; selector?: string; attr?: string }[] } });

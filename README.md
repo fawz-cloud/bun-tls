@@ -84,7 +84,8 @@ s.close();
   leaks over the browser TLS). ([details](DOCS.md#fingerprint-proxy-any-tool-any-language))
 - **Scraping for LLMs** — `scrape(url, { as: 'llm' })` returns a page in the fewest tokens that
   keep its content: title, JSON-LD, and the main text with its headings, tables and code. Plus
-  CSS and LLM extraction, `crawl` / `map` / `batch`, and an MCP server for agents. No browser.
+  CSS and LLM extraction, `crawl` / `map` / `batch`, `search()` (web search → `{title, url,
+  snippet}[]`, no API key), and an MCP server for agents. No browser.
   ([details](DOCS.md#scraping-for-llms))
 
 **No additional native dependency** — a TypeScript source tree on Bun. From-scratch TLS,

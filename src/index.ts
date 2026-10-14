@@ -39,6 +39,8 @@ export { scrape, scrapeHtml, extractLLM, fitMarkdown } from './http/scrape';
 export type { ScrapeResult, ScrapeOptions, CssSchema, Format, LlmFn, LlmConfig, ExtractLLMOptions } from './http/scrape';
 export { crawl, map, batch } from './http/crawl';
 export type { CrawlOptions, MapOptions } from './http/crawl';
+export { search } from './http/search';
+export type { SearchResult, SearchOptions, SearchEngine } from './http/search';
 export { startMcp } from './mcp';
 export { startProxy } from './proxy';
 export type { ProxyOptions } from './proxy';
