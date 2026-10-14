@@ -1,6 +1,6 @@
 // HTML → 'llm' view / readable Markdown (offline): context kept, token junk dropped.
 import assert from 'node:assert';
-import { scrapeHtml } from '../src/http/scrape';
+import { scrapeHtml, coerceToSchema } from '../src/http/scrape';
 
 const page = `<!doctype html><html><head><title>T &amp; Co</title><meta name="description" content="Say &quot;hi&quot;"></head><body>
 <svg><title>Logo</title></svg><a href="#main">Skip to content</a>
@@ -43,4 +43,17 @@ const nested = await scrapeHtml('<a href="/a"><span>Deep</span> <b>text</b></a>'
 assert.equal(nested.links[0]?.text, 'Deep text', 'anchor text includes nested elements');
 const frag = await scrapeHtml('<title>Hi</title><main><h1>Hello</h1></main>', 'https://x.test/', { formats: ['llm'] });
 assert.equal(frag.llm, '# Hi\n\n# Hello', 'a fragment without <head> does not repeat its <title> in the text');
+
+// A code block with a blank line inside stays whole in the llm view — the opening fence and
+// the first line are not split off and dropped (MDN JS examples, Statements/for).
+const code = await scrapeHtml('<p>before</p><pre><code>let i = 0;\n\nwhile (i &lt;= 3) {\n  i++;\n}</code></pre><p>after</p>', 'https://x.test/', { formats: ['llm'] });
+assert.ok(code.llm!.includes('```\nlet i = 0;\n\nwhile (i <= 3) {\n  i++;\n}\n```'), 'a code block with an internal blank line is kept whole');
+
+// extractLLM coerces the model's reply (strings) to the schema's field types.
+const schema = { type: 'object', properties: { price: { type: 'number' }, qty: { type: 'integer' }, ok: { type: 'boolean' }, dims: { type: 'object', properties: { w: { type: 'number' } } }, tags: { type: 'array', items: { type: 'number' } } } };
+const out = coerceToSchema({ price: '4.50', qty: '3', ok: 'true', dims: { w: '46' }, tags: ['1', '2'] }, schema);
+assert.deepEqual(out, { price: 4.5, qty: 3, ok: true, dims: { w: 46 }, tags: [1, 2] }, 'coerces number/integer/boolean, nested objects and array items');
+assert.equal(coerceToSchema('keep', { type: 'string' }), 'keep', 'a string stays a string');
+assert.equal(coerceToSchema('n/a', { type: 'number' }), 'n/a', 'a non-numeric string is left for the caller to see');
+
 console.log('scrape: llm view + Markdown rendering OK');

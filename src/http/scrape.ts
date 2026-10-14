@@ -322,44 +322,42 @@ const CITE_DATES = new RegExp(String.raw`\s*(?:Archived(?: \(PDF\))? from the or
 const CITE_IDS = /\s*\b(?:doi|ISSN|eISSN|ISBN|S2CID|Bibcode|OCLC|PMID|PMC|arXiv|hdl|JSTOR|LCCN|OSTI|SSRN|Zbl|MR)\b:?\s?[\w.\-/():]+\.?/g;
 const REFS_HEADING = /^#{1,6} (references|notes|citations|sources|bibliography|works cited|footnotes)\b/i;
 
-/** Repeats and bookkeeping removed, outside code fences: consecutive duplicate lines (blank
- *  lines between don't count; a line repeating the heading above it neither), long lines
- *  seen before (a repeated 80+ char sentence is boilerplate, not a per-item value), whole
- *  repeated blocks, citation archive/access dates and IDs. A short line is never deduped on
- *  its own — "2 hrs ago" or "€4" repeat once per item, and dropping the copy would detach
- *  it from its item. */
+/** Remove repeats and bookkeeping from the prose, leaving fenced code blocks untouched: a
+ *  code block is atomic — never split on a blank line inside it, never deduped. In the prose
+ *  it drops consecutive duplicate lines (blank lines between don't count; a line repeating
+ *  the heading above it neither), lines seen before once they are 80+ chars (a repeated long
+ *  sentence is boilerplate, not a per-item value), whole repeated paragraphs, and citation
+ *  archive/access dates + IDs. A short line is never deduped on its own — "2 hrs ago" or "€4"
+ *  repeat once per item, and dropping the copy would detach it from its item. */
 function condense(s: string): string {
-	const lines: string[] = [];
-	const seen = new Set<string>();
-	let fence = false;
+	const seenLine = new Set<string>();
+	const seenBlock = new Set<string>();
+	const out: string[] = [];
 	let refs = false;
-	let prev = '';
-	for (let line of s.split('\n')) {
-		if (line.startsWith('```')) fence = !fence;
-		else if (!fence) {
+	// Split out fenced code blocks (the odd parts); condense only the prose between them.
+	for (const part of s.split(/(```\n[\s\S]*?\n```)/g)) {
+		if (!part) continue;
+		if (part.startsWith('```')) {
+			out.push(part);
+			continue;
+		}
+		const lines: string[] = [];
+		let prev = '';
+		for (let line of part.split('\n')) {
 			if (line.startsWith('#')) refs = REFS_HEADING.test(line);
 			const undated = line.replace(CITE_DATES, '');
 			if (undated !== line || (refs && line.startsWith('- '))) line = undated.replace(CITE_IDS, '');
-			if (line && (line === prev || line === prev.replace(/^#{1,6} /, '') || (line.length >= 80 && seen.has(line)))) continue;
-			if (line.length >= 80) seen.add(line);
+			if (line && (line === prev || line === prev.replace(/^#{1,6} /, '') || (line.length >= 80 && seenLine.has(line)))) continue;
+			if (line.length >= 80) seenLine.add(line);
+			lines.push(line);
+			if (line) prev = line;
 		}
-		lines.push(line);
-		if (line) prev = line;
+		for (const b of lines.join('\n').split(/\n\n+/)) {
+			if (b.length < 40 && !b.includes('\n')) out.push(b); // short line: a per-item value, keep
+			else if (!seenBlock.has(b)) { out.push(b); seenBlock.add(b); }
+		}
 	}
-	const blocks = new Set<string>();
-	let code = false;
-	return lines
-		.join('\n')
-		.split(/\n\n+/)
-		.filter((b) => {
-			const inCode = code;
-			if ((b.match(/^```/gm) ?? []).length % 2) code = !code;
-			if (inCode || b.startsWith('```') || (b.length < 40 && !b.includes('\n'))) return true;
-			if (blocks.has(b)) return false;
-			blocks.add(b);
-			return true;
-		})
-		.join('\n\n');
+	return out.join('\n\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 
 const squash = (s: string): string => s.replace(/\s+/g, ' ').trim();
@@ -422,7 +420,8 @@ const AS_FORMATS: Record<string, Format[]> = { llm: ['llm'], data: ['json'], mar
 export async function scrape(url: string, opts: ScrapeOptions = {}): Promise<ScrapeResult> {
 	// Every fetch() option applies (ocsp, signal, redirect too); fetch ignores the scrape-only ones.
 	const r = await btFetch(url, { ...opts, persona: opts.persona ?? 'chrome' });
-	return scrapeHtml(await r.text(), url, opts, r.status);
+	// r.url is the FINAL url after redirects — the base for resolving the page's relative links.
+	return scrapeHtml(await r.text(), r.url || url, opts, r.status);
 }
 
 /** The same LLM-ready output from HTML you already have (a cache, a browser, a file). */
@@ -471,11 +470,36 @@ export interface ExtractLLMOptions extends ScrapeOptions {
 	from?: 'llm' | 'markdown' | 'html';
 }
 
+/** Coerce a parsed object to a JSON Schema's declared field types: a numeric string where
+ *  the schema says number/integer becomes a number, "true"/"false" where it says boolean
+ *  becomes a boolean — models (and the response_format JSON mode) often return everything as
+ *  strings. Nested `type: object` is coerced recursively; arrays by their `items` schema.
+ *  ponytail: types + nested objects/arrays only — not a full validator (no required/enum/
+ *  pattern); the schema is primarily the model's contract. */
+export function coerceToSchema(value: unknown, schema: unknown): unknown {
+	if (!schema || typeof schema !== 'object') return value;
+	const s = schema as Record<string, unknown>;
+	const type = s.type;
+	if ((type === 'number' || type === 'integer') && typeof value === 'string' && value.trim() !== '' && Number.isFinite(Number(value))) {
+		const n = Number(value);
+		return type === 'integer' ? Math.trunc(n) : n;
+	}
+	if (type === 'boolean' && typeof value === 'string' && /^(true|false)$/i.test(value.trim())) return value.trim().toLowerCase() === 'true';
+	if (type === 'array' && Array.isArray(value) && s.items) return value.map((v) => coerceToSchema(v, s.items));
+	if (value && typeof value === 'object' && !Array.isArray(value) && s.properties && typeof s.properties === 'object') {
+		const props = s.properties as Record<string, unknown>;
+		const o = value as Record<string, unknown>;
+		for (const k of Object.keys(o)) if (k in props) o[k] = coerceToSchema(o[k], props[k]);
+	}
+	return value;
+}
+
 /**
  * LLM-powered structured extraction (like Firecrawl's Agent / crawl4ai's LLMExtractionStrategy):
  * scrape the page, hand it to your LLM with the schema + prompt, and return the parsed JSON.
  * bun-tls does the fetch (clearing the WAF) and the token-cheap rendering; you bring any
- * model (OpenAI, a local Ollama endpoint, or your own function).
+ * model (OpenAI, a local Ollama endpoint, or your own function). The result is coerced to the
+ * schema's field types (see `coerceToSchema`); it is not otherwise validated.
  */
 export async function extractLLM(url: string, opts: ExtractLLMOptions): Promise<unknown> {
 	const from = opts.from ?? (/url|link|href/i.test(JSON.stringify(opts.schema ?? {}) + (opts.prompt ?? '')) ? 'markdown' : 'llm');
@@ -487,11 +511,12 @@ export async function extractLLM(url: string, opts: ExtractLLMOptions): Promise<
 		`--- CONTENT (${url}) ---\n${content}`;
 	const raw = await callLlm(opts.llm, prompt);
 	const text = raw.trim().replace(/^```(?:json)?\s*/i, '').replace(/```$/i, '').trim();
+	const parse = (t: string): unknown => coerceToSchema(JSON.parse(t), opts.schema);
 	try {
-		return JSON.parse(text);
+		return parse(text);
 	} catch {
 		const m = text.match(/\{[\s\S]*\}/);
-		if (m) try { return JSON.parse(m[0]); } catch { /* fall through */ }
+		if (m) try { return parse(m[0]); } catch { /* fall through */ }
 		return { _raw: raw };
 	}
 }
