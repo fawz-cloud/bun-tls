@@ -799,29 +799,29 @@ for (const { title, url } of hits) console.log(title, url);
 | `engine` | `'duckduckgo' \| 'bing' \| 'brave' \| 'startpage'` | `'duckduckgo'` | see the table below |
 | `limit` | `number` | `10` | |
 | `persona` | `string \| Persona` | `'chrome'` | |
-| `proxy` | `string` | — | `http://…` or `socks5://…`; required for brave/startpage |
+| `proxy` | `string` | — | `http://…` or `socks5://…`; see the note below |
 | `retries` | `number` | `2` | on a 429 / 503 / 202 throttle, with backoff |
 | `timeoutMs` | `number` | `20000` | |
 
-Which engine returns usable results natively depends on how the engine gates scrapers, not on
-the fingerprint — bun-tls clears the TLS/HTTP fingerprint check at all of them (each homepage
-loads), but some gate the **search endpoint** further:
+The fingerprint clears every engine's TLS/HTTP check (each homepage loads), but they differ at
+the **search endpoint** — and the difference is the engine's anti-scraping, which a different
+fingerprint or IP does not change:
 
-| engine | native (no proxy) | why |
+| engine | usable natively | why |
 |---|---|---|
-| **duckduckgo** | ✅ reliable | server-rendered HTML/Lite endpoint, clean destination URLs + snippets. First hit may return a `202` throttle; `search()` retries it. |
-| bing | ⚠ inconsistent | 200, but serves plausible-looking **wrong** results for some queries from a flagged IP. Titles/URLs are decoded from its `/ck/a` redirect wrapper when results are real. |
-| brave | ✗ needs proxy | the query returns `429` from a datacenter IP (the homepage is fine). Pass a residential `proxy`. |
-| startpage | ✗ needs proxy | the query redirects to a CAPTCHA block for a flagged IP. Pass a residential `proxy`. |
+| **duckduckgo** | ✅ reliable | server-rendered HTML/Lite endpoint, clean destination URLs + snippets, sponsored rows filtered out. A first-hit `202` throttle is retried. |
+| bing | ⚠ unreliable | 200, but for some queries serves plausible-looking **wrong** results (anti-scrape poisoning) — reproduced with and without a residential proxy. Real results are decoded from its `/ck/a` wrapper. Best-effort only. |
+| brave | ✗ browser only | the query runs a JavaScript proof-of-work challenge and `429`s without it (the page is a `noscript` + proof-of-work wall). A residential proxy was tested and does not help. |
+| startpage | ✗ browser only | the query redirects to a CAPTCHA block. A residential proxy was tested and does not help. |
 
-Google is deliberately absent: `https://www.google.com/search` returns `200` but a
-JavaScript-only shell with no results in the HTML, so there is nothing to parse without
-running the page's scripts.
+Google is in the same browser-only bucket: `https://www.google.com/search` returns `200` but a
+JavaScript-only shell with no results in the HTML.
 
-`search()` throws if the engine blocks the request after the retries. Brave and Startpage
-parse their results generically (external result links); DuckDuckGo and Bing have exact
-parsers. `parseSearchResults(engine, html)` is exported to parse result HTML you captured
-through your own proxy.
+`search()` throws if the engine blocks the request after the retries — so a `brave`/`startpage`
+call throws, pointing you at `duckduckgo`. A `proxy` is threaded through the fetch, but note it
+does **not** unblock Brave/Startpage (they need a browser) and does not reliably fix Bing's
+poisoning — only DuckDuckGo is dependable. If you render a Brave/Startpage result page in a
+real browser, `parseSearchResults(engine, html)` (exported) extracts its results.
 
 ---
 

@@ -49,14 +49,14 @@ const TOOLS = [
 	},
 	{
 		name: 'search',
-		description: 'Web search without an API key — returns {title, url, snippet}[]. "duckduckgo" (default) is reliable; "bing" can return inconsistent results; "brave"/"startpage" gate by IP and need a residential `proxy`.',
+		description: 'Web search without an API key — returns {title, url, snippet}[]. "duckduckgo" (default) is the reliable engine. "bing" returns wrong results for some queries (anti-scrape). "brave"/"startpage" run a JS challenge and only work in a browser (the tool throws for them).',
 		inputSchema: {
 			type: 'object',
 			properties: {
 				query: { type: 'string' },
 				engine: { type: 'string', enum: ['duckduckgo', 'bing', 'brave', 'startpage'], description: 'Default duckduckgo.' },
 				limit: { type: 'number', description: 'Max results (default 10).' },
-				proxy: { type: 'string', description: 'http://… or socks5://… — required for brave/startpage.' }
+				proxy: { type: 'string', description: 'http://… or socks5://… (does not unblock brave/startpage).' }
 			},
 			required: ['query']
 		}

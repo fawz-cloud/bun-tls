@@ -1,9 +1,13 @@
 // Web search without an API key or a browser, through bun-tls (so each request carries a
-// real browser's fingerprint). Google and Bing now render results client-side or wrap them,
-// so the reliable server-rendered engines are DuckDuckGo's HTML/Lite endpoints and Bing;
-// Brave and Startpage gate their SEARCH endpoint on IP reputation (their homepage loads, the
-// query 429s / redirects to a CAPTCHA) — the TLS fingerprint already passes, so those two
-// need a clean IP via `proxy` (a residential/mobile proxy), not a different fingerprint.
+// real browser's fingerprint). The fingerprint clears every engine's TLS/HTTP check (each
+// homepage loads), but they differ at the SEARCH endpoint:
+//   - DuckDuckGo (lite): server-rendered, reliable — the default.
+//   - Bing: server-rendered, but serves plausible-but-WRONG results for some queries (its
+//     anti-scrape poisoning) — tested unreliable with and without a residential proxy. Best
+//     effort, not dependable.
+//   - Brave / Startpage: the query itself runs a JavaScript proof-of-work / anti-bot
+//     challenge (Brave 429s with a `noscript` + proof-of-work page, Startpage redirects to a
+//     CAPTCHA) — a browser is required; a residential proxy was tested and is NOT enough.
 import { fetch as btFetch } from './fetchlike';
 import type { Persona } from '../fp/personas';
 
@@ -20,7 +24,9 @@ export interface SearchOptions {
 	/** Max results (default 10). */
 	limit?: number;
 	persona?: string | Persona;
-	/** A proxy — required to reach Brave/Startpage from a flagged IP. `http://…` or `socks5://…`. */
+	/** Proxy (`http://…` or `socks5://…`), threaded through the fetch. Does not unblock
+	 *  Brave/Startpage (those need a browser for their JS challenge) and does not reliably fix
+	 *  Bing's result poisoning — only DuckDuckGo is dependable. */
 	proxy?: string;
 	timeoutMs?: number;
 	/** Retries on a 429/503 from the engine, with backoff (default 2). */
@@ -52,13 +58,13 @@ const PARSE: Record<SearchEngine, (html: string) => SearchResult[]> = {
 	// followed by a <td class="result-snippet">…</td> (or <a class="result-snippet">).
 	duckduckgo(html) {
 		const out: SearchResult[] = [];
-		const links = [...html.matchAll(/<a[^>]+href="([^"]*uddg=[^"]+)"[^>]*class=['"]result-link['"][^>]*>([\s\S]*?)<\/a>/gi)];
-		const snips = [...html.matchAll(/class=['"]result-snippet['"][^>]*>([\s\S]*?)<\/(?:td|a)>/gi)].map((m) => decode(m[1]!));
-		links.forEach((m, i) => {
+		// Each result is a result-link <a> followed by its result-snippet cell; pair them so
+		// skipping a sponsored row (href → duckduckgo.com/y.js ad redirect) can't misalign them.
+		for (const m of html.matchAll(/<a[^>]+href="([^"]*uddg=[^"]+)"[^>]*class=['"]result-link['"][^>]*>([\s\S]*?)<\/a>[\s\S]*?class=['"]result-snippet['"][^>]*>([\s\S]*?)<\/(?:td|a)>/gi)) {
+			if (/y\.js|ad_domain|ad_provider/.test(m[1]!)) continue;
 			const uddg = m[1]!.match(/uddg=([^&"]+)/);
-			const url = uddg ? decodeURIComponent(uddg[1]!) : '';
-			if (url) out.push({ title: decode(m[2]!), url, snippet: snips[i] ?? '' });
-		});
+			if (uddg) out.push({ title: decode(m[2]!), url: decodeURIComponent(uddg[1]!), snippet: decode(m[3]!) });
+		}
 		return out;
 	},
 	bing(html) {
@@ -69,10 +75,10 @@ const PARSE: Record<SearchEngine, (html: string) => SearchResult[]> = {
 		}
 		return out;
 	},
-	// Brave + Startpage gate their search endpoint by IP, so their result HTML can't be
-	// captured from a blocked IP to pin exact selectors against. Rather than guess class
-	// names, pull the organic links generically: external <a> whose anchor text reads like a
-	// title (several words), first occurrence wins. Reached only through a clean `proxy`.
+	// Brave + Startpage run a JS challenge on the search endpoint (see search()), so their
+	// result HTML can't be captured without a browser to pin exact selectors against. Rather
+	// than guess class names, pull organic links generically: external <a> whose anchor text
+	// reads like a title. For result HTML you render in a browser and pass to parseSearchResults.
 	brave: (html) => externalResults(html, 'brave.com'),
 	startpage: (html) => externalResults(html, 'startpage.com')
 };
@@ -118,9 +124,11 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms
 
 /**
  * Search the web and get back `{ title, url, snippet }[]` — no API key, no browser.
- * `duckduckgo` (default) and `bing` work from any IP; `brave` and `startpage` gate the query
- * on IP reputation, so pass a residential `proxy` for those. Throws if the engine blocks the
- * request (429 / CAPTCHA) after the retries.
+ * `duckduckgo` (default) is the reliable engine. `bing` returns real results for some queries
+ * and poisoned (unrelated) results for others, with or without a `proxy`. `brave` and
+ * `startpage` run a JavaScript challenge on their search endpoint and cannot be scraped
+ * without a browser — `search()` throws for them, as it does if an engine blocks the request
+ * after the retries.
  */
 export async function search(query: string, opts: SearchOptions = {}): Promise<SearchResult[]> {
 	const engine = opts.engine ?? 'duckduckgo';
@@ -143,7 +151,7 @@ export async function search(query: string, opts: SearchOptions = {}): Promise<S
 			continue;
 		}
 		if (throttled(r.status, r.url, html) && !results.length) {
-			const hint = engine === 'brave' || engine === 'startpage' ? ` — ${engine} gates its search endpoint by IP; pass a residential \`proxy\`` : '';
+			const hint = engine === 'brave' || engine === 'startpage' ? ` — ${engine} runs a JavaScript challenge on its search endpoint, which needs a browser (a residential proxy is not enough); use duckduckgo or bing, or render the page yourself and call parseSearchResults` : '';
 			throw new Error(`search: ${engine} blocked the request (status ${r.status})${hint}`);
 		}
 		return results.slice(0, opts.limit ?? 10);
